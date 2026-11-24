@@ -290,13 +290,16 @@ def wait_listening(host: str, port: int, secs: float = 8.0) -> bool:
 # ---- CLI --------------------------------------------------------------------
 
 def _probe_hosts(hosts, tailscale: bool = False) -> list[str]:
-    """Addresses the service would bind: explicit hosts, else LAN IPv4; plus tailnet IPv4."""
-    from .netinfo import lan_ipv4, parse_hosts, tailscale_ipv4
+    """Addresses the service would bind: explicit hosts, else LAN IPv4; plus tailnet IPv4,
+    plus loopback (always bound; mirrors cli.resolve_hosts)."""
+    from .netinfo import LOOPBACK, lan_ipv4, parse_hosts, tailscale_ipv4
     out = parse_hosts(hosts if not isinstance(hosts, str) else [hosts]) or [lan_ipv4()]
     if tailscale:
         ts = tailscale_ipv4()
         if ts and ts not in out:
             out.append(ts)
+    if LOOPBACK not in out:
+        out.append(LOOPBACK)
     return out
 
 
@@ -439,7 +442,7 @@ def add_service_parser(sub) -> None:
     def opts(p):
         p.add_argument("--port", type=int, default=DEFAULT_PORT)
         p.add_argument("--host", action="append", default=[], metavar="IP",
-                       help="bind address; repeatable or comma-separated (default: auto LAN IPv4, restarted if it changes)")
+                       help="bind address; repeatable or comma-separated (default: auto LAN IPv4, restarted if it changes; 127.0.0.1 is always added)")
         p.add_argument("--tailscale", action="store_true",
                        help="also bind this Mac's tailnet IPv4 (reaches your whole tailnet)")
         p.add_argument("--renders-root", help="renders directory (default: as `serve`)")

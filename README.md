@@ -120,7 +120,10 @@ label is `com.tulda.server`; the plist goes to `~/Library/LaunchAgents/`.
   with `--tailscale`) are re-derived every 30 s (`--watch-interval`) and the server
   exits with status 75 if one differs from what was bound (including Tailscale
   appearing after start), so launchd restarts it. Explicit `--host` values are
-  never watched.
+  never watched, and loopback (127.0.0.1) is never watched either.
+- Loopback: 127.0.0.1 is always bound as well, in addition to the LAN and tailnet
+  addresses (or the explicit `--host` values), so `curl http://127.0.0.1:<port>/`
+  works on the Mac itself. It is added automatically; you do not pass it.
 - Multiple addresses / Tailscale: one listening socket per address in one process.
   `tulda service install --host 192.168.1.50 --tailscale` (or `serve`) listens on
   the LAN IP and the tailnet IPv4 (`tailscale ip -4` from PATH or
@@ -172,7 +175,8 @@ supported; `func(ctx) -> Result`.
 - The server is read-only (GET/HEAD; everything else is 405), never runs
   adapters, and only serves the renders root.
 - Binds to the default interface's LAN IPv4, else 127.0.0.1; `--host` (repeatable)
-  replaces that and `--tailscale` adds the tailnet IPv4. There is no authentication:
+  replaces that and `--tailscale` adds the tailnet IPv4. Loopback 127.0.0.1 is always
+  bound too. Never 0.0.0.0: only the listed addresses. There is no authentication:
   anyone on the LAN can view the renders, and with `--tailscale` so can every device
   on your whole tailnet (not just the home LAN). Still read-only.
 - Host header must be one of: any bound address, 127.0.0.1, localhost, the

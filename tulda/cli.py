@@ -12,7 +12,7 @@ from pathlib import Path
 from . import __version__
 from .adapters import load_registry, parse_views, plan_jobs
 from .errors import TuldaError
-from .netinfo import bonjour_name, lan_ipv4, local_host_names, parse_hosts, tailscale_dnsname, tailscale_ipv4
+from .netinfo import LOOPBACK, bonjour_name, lan_ipv4, local_host_names, parse_hosts, tailscale_dnsname, tailscale_ipv4
 from .runner import make_group, run_chain, tool_version
 
 DEFAULT_PORT = 8765
@@ -156,7 +156,8 @@ def cmd_doctor(args) -> int:
 
 def resolve_hosts(explicit, tailscale: bool):
     """-> (hosts, auto) where auto maps 'lan'/'tailscale' to the auto-detected IP
-    (None when not found). Explicit hosts replace the LAN default; --tailscale adds."""
+    (None when not found). Explicit hosts replace the LAN default; --tailscale adds.
+    Loopback is always bound too; it is never in auto, so the watcher ignores it."""
     hosts = parse_hosts(explicit)
     auto: dict = {}
     if not hosts:
@@ -170,6 +171,8 @@ def resolve_hosts(explicit, tailscale: bool):
         else:
             print("warning: --tailscale: no tailnet IPv4 found (is Tailscale up?); "
                   "continuing without it", file=sys.stderr, flush=True)
+    if LOOPBACK not in hosts:
+        hosts.append(LOOPBACK)
     return hosts, auto
 
 
@@ -264,7 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.set_defaults(fn=cmd_adapters)
     s = sub.add_parser("serve", help="serve the renders root read-only")
     s.add_argument("--host", action="append", default=[], metavar="IP",
-                   help="bind address; repeatable or comma-separated (default: LAN IPv4, else 127.0.0.1)")
+                   help="bind address; repeatable or comma-separated (default: LAN IPv4; 127.0.0.1 is always added)")
     s.add_argument("--tailscale", action="store_true",
                    help="also bind this Mac's tailnet IPv4 (reaches your whole tailnet)")
     s.add_argument("--port", type=int)

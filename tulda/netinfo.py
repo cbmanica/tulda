@@ -66,6 +66,8 @@ def local_host_names(magic: str | None = None) -> list[str]:
     return host_aliases(local_label(), socket.gethostname(), magic)
 
 
+LOOPBACK = "127.0.0.1"   # always bound in addition to the LAN and tailnet addresses
+
 TAILSCALE_CLI = ("tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
 
 

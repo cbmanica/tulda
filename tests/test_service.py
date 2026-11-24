@@ -193,12 +193,26 @@ class StatusTests(unittest.TestCase):
         import tulda.cli as c
         with mock.patch.object(c, "lan_ipv4", lambda: "192.168.0.5"), \
                 mock.patch.object(c, "tailscale_ipv4", lambda: "100.1.1.1"):
-            self.assertEqual(c.resolve_hosts([], False), (["192.168.0.5"], {"lan": "192.168.0.5"}))
+            self.assertEqual(c.resolve_hosts([], False), (["192.168.0.5", "127.0.0.1"], {"lan": "192.168.0.5"}))
             self.assertEqual(c.resolve_hosts(["10.0.0.1,10.0.0.2"], True),
-                             (["10.0.0.1", "10.0.0.2", "100.1.1.1"], {"tailscale": "100.1.1.1"}))
-            self.assertEqual(c.resolve_hosts([], True)[0], ["192.168.0.5", "100.1.1.1"])
+                             (["10.0.0.1", "10.0.0.2", "100.1.1.1", "127.0.0.1"], {"tailscale": "100.1.1.1"}))
+            self.assertEqual(c.resolve_hosts([], True)[0], ["192.168.0.5", "100.1.1.1", "127.0.0.1"])
+            # loopback is never auto-detected, so the IP watcher cannot restart on it
+            self.assertNotIn("127.0.0.1", c.resolve_hosts([], True)[1].values())
         with mock.patch.object(c, "tailscale_ipv4", lambda: None):
-            self.assertEqual(c.resolve_hosts(["10.0.0.1"], True), (["10.0.0.1"], {"tailscale": None}))
+            self.assertEqual(c.resolve_hosts(["10.0.0.1"], True), (["10.0.0.1", "127.0.0.1"], {"tailscale": None}))
+        # an explicit loopback is not duplicated; a LAN fallback of 127.0.0.1 is not either
+        with mock.patch.object(c, "lan_ipv4", lambda: "127.0.0.1"), \
+                mock.patch.object(c, "tailscale_ipv4", lambda: None):
+            self.assertEqual(c.resolve_hosts([], False), (["127.0.0.1"], {"lan": "127.0.0.1"}))
+        self.assertEqual(c.resolve_hosts(["127.0.0.1", "10.0.0.1"], False)[0], ["127.0.0.1", "10.0.0.1"])
+
+    def test_probe_hosts_include_loopback(self):
+        with mock.patch("tulda.netinfo.lan_ipv4", lambda: "192.168.0.5"), \
+                mock.patch("tulda.netinfo.tailscale_ipv4", lambda: "100.1.1.1"):
+            self.assertEqual(service._probe_hosts([], True), ["192.168.0.5", "100.1.1.1", "127.0.0.1"])
+            self.assertEqual(service._probe_hosts(["10.0.0.2"], False), ["10.0.0.2", "127.0.0.1"])
+            self.assertEqual(service._probe_hosts(["127.0.0.1"], False), ["127.0.0.1"])
 
     def test_status_per_address(self):
         import argparse, io, contextlib
@@ -217,6 +231,7 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("listening : yes  (10.0.0.2:8765)", out)
         self.assertIn("listening : no  (100.1.1.1:8765)", out)
+        self.assertIn("listening : no  (127.0.0.1:8765)", out)
         self.assertIn("http://100.1.1.1:8765/", out)
         self.assertIn("tailscale : http://myhost.example.ts.net:8765/", out)
 
