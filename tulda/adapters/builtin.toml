@@ -1,0 +1,42 @@
+# Built-in adapters. Overridable by id from user/project/--config files.
+#
+# TODO(bambu-plate): embedded Metadata/plate_N.png extraction is NOT defined yet
+# (low-priority fallback only; see tulda/adapters/bambu.py).
+# TODO: `openscad-mesh` (.stl -> png fallback) is phase 4.
+
+[defaults]
+width = 1600
+height = 1200
+
+[adapter.openscad]
+accepts  = [".scad"]
+produces = "png"
+stage    = "source"
+requires = ["openscad"]
+version_cmd = ["openscad", "--version"]
+# {backend_args} expands to ["--backend=manifold"] when the installed openscad
+# supports --backend, else to nothing (see tulda/adapters/probes.py).
+cmd = ["openscad", "{backend_args}", "-o", "{out}",
+       "--imgsize={w},{h}", "--autocenter", "--viewall", "{in}"]
+timeout = 180
+
+[adapter.openscad.options]
+backend_args = "@probe:openscad_backend"
+
+# Verified 2026-11-24 with Bambu Studio 02.09.01.70: headless, ~0.3 s, writes
+# <outputdir>/plate_1_0.png (512x512 RGBA) plus result.json. --outputdir must
+# already exist (the runner creates {workdir}). --export-png must be the only
+# action. Do not kill a running GUI instance. Camera/all-plates variants are
+# untested (--export-png 0, --camera-view N).
+[adapter.bambu-export-png]
+accepts  = [".3mf"]
+produces = "png"
+stage    = "sliced"
+requires = ["/Applications/BambuStudio.app/Contents/MacOS/BambuStudio"]
+cmd = ["/Applications/BambuStudio.app/Contents/MacOS/BambuStudio",
+       "--export-png", "{plate}", "--outputdir", "{workdir}", "{in}"]
+out_glob = "plate_*.png"
+timeout = 120
+
+[adapter.bambu-export-png.options]
+plate = 1

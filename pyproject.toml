@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tulda"
+version = "0.1.0"
+description = "LAN-only gallery server and render adapter runner for CAD/print files"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+tulda = "tulda.cli:main"
+
+[tool.setuptools]
+packages = ["tulda", "tulda.adapters"]
+
+[tool.setuptools.package-data]
+"tulda.adapters" = ["builtin.toml"]
