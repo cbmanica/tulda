@@ -21,7 +21,7 @@ viewer (see the plan's phases).
 produces is ONE request ("group"): id `<UTC stamp>-<slug>` (slug from `--title`/`--group`,
 else the first file's name), optional human title, source list and the command, all stored
 in each sidecar (`group_id`, `group_title`, `group_sources`, `request_cmd`, `seq`, `view`).
-Sidecars without a `group_id` (older renders) are shown as ungrouped, one group per UTC day.
+Sidecars without a `group_id` (older renders) are shown as ungrouped, one group per UTC day (`legacy-YYYYMMDD`).
 
 Renders live under `$TULDA_RENDERS`, `--renders-root`, or `[defaults] renders_root`
 in config, default `~/.local/share/tulda/renders`, laid out as
@@ -50,6 +50,30 @@ in the sidecar and UI. Built-in views:
   renders the underside in real filament colours, so a bed-face inlay (the pizza on the
   NFC tag) is visible. If a future Studio drops those, point the `bottom` view at an
   OpenSCAD-based fallback; there is no 3mf-to-mesh converter yet.
+
+### Catalog, navigation and management
+
+A SQLite catalog at `<renders root>/.tulda/catalog.db` (never served over HTTP) indexes the
+renders so the pages stay fast with thousands of groups. PNGs and sidecars remain the source
+of truth; the DB is rebuilt automatically if missing or corrupt, and also holds your stars,
+tags, title edits, notes and trash flags. Design notes: [docs/PLAN.md](docs/PLAN.md).
+
+Web (read-only): group cards fold/unfold (newest open, state remembered per browser, "Expand
+all"/"Collapse all"); "Load more requests"; `/_d/2026-11/` and `/_d/2026-11-24/` (UTC dates,
+picker under "Browse by date"); `/search?q=`; chips filter by adapter, stage, view, tag,
+starred, "show trash". JSON: `/api/groups`, `/api/dates`, `/api/latest`. All changes happen in the CLI:
+
+    tulda ls [--project P] [--since 7d|DATE] [--until DATE] [--tag T] [--starred] [--trashed]
+    tulda group show|star|unstar|trash|restore <id or unique prefix>
+    tulda group rename <id> "title"; tulda group tag|untag <id> tag...; tulda group note <id> "text"
+    tulda group rm <id> [--yes]           # permanently deletes files + rows (asks first)
+    tulda prune --older-than 30d --keep-last 20 [--project P] [--no-keep-starred]   # lists only
+    tulda prune ... --yes                 # really deletes; starred groups are kept by default
+    tulda trash empty [--yes]
+    tulda db reindex|stats|vacuum|check   # reindex keeps all metadata
+
+`tulda serve --sync-interval SEC` (default 30) re-syncs the index with the disk so renders
+copied in from elsewhere show up.
 
 Useful flags: `--adapter ID` (or `a,b` chain or a named chain), `--stage
 source|built|sliced`, `--all`, `--opt w=800`, `--project`, `--keep`, `--config`.
