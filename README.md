@@ -182,6 +182,17 @@ supported; `func(ctx) -> Result`.
   refused. Only png, jpg, svg, json, stl files are served.
 - Config files execute commands as you; treat `tulda.toml` like a Makefile.
 
+## Bambu Studio and licensing
+
+tulda is independent; it is not affiliated with or endorsed by Bambu Lab. It does not
+bundle or redistribute Bambu Studio: install it yourself and accept its terms. tulda only runs
+your local Studio CLI (`--export-png`) and reads your own .3mf files; it never touches Bambu's
+cloud, networking plugin, login or printers. `--camera-view` values 4-7 are undocumented and
+may change. The Bambu Terms of Use could not be read in this review, so automation of the CLI
+is unverified. Use tulda only with your own models and your own licensed install; do not expose
+it publicly or run it as a service for others without checking the terms. Details:
+[docs/BAMBU-TERMS.md](docs/BAMBU-TERMS.md). Not legal advice.
+
 ## License
 
 Copyright 2026 Benson Manica
