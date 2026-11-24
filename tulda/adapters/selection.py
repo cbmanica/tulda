@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..errors import MissingRequirement, NoAdapter
@@ -84,3 +85,47 @@ def plan(reg: Registry, path: Path, adapter: str | None = None, stage: str | Non
     if skipped:
         msg += "; skipped (missing requirements): " + ", ".join(a.id for a in skipped)
     raise NoAdapter(msg)
+
+
+@dataclass
+class Job:
+    """One PNG to produce: an adapter chain plus an optional named view."""
+    chain: list[Adapter]
+    view: str | None = None
+    options: dict = field(default_factory=dict)
+
+    @property
+    def label(self) -> str:
+        return " -> ".join(a.id for a in self.chain) + (f" [{self.view}]" if self.view else "")
+
+
+def parse_views(*values) -> list[str]:
+    """--view / --views values (each may be comma separated) -> ordered unique names."""
+    out: list[str] = []
+    for v in values:
+        for part in (v if isinstance(v, (list, tuple)) else [v]):
+            for name in str(part or "").split(","):
+                name = name.strip().lower()
+                if name and name not in out:
+                    out.append(name)
+    return out
+
+
+def plan_jobs(reg: Registry, path: Path, adapter: str | None = None, stage: str | None = None,
+              all_: bool = False, views: list[str] | None = None) -> list[Job]:
+    """plan() plus view expansion. Requested views must exist on every chosen terminal
+    adapter; with none requested, the terminal adapter's default_views are used
+    (adapters without views give one job with no view)."""
+    jobs: list[Job] = []
+    for chain in plan(reg, path, adapter, stage, all_):
+        term = chain[-1]
+        names = views or term.default_views
+        if not names:
+            jobs.append(Job(chain))
+            continue
+        for n in names:
+            if n not in term.views:
+                known = ", ".join(term.views) or "none"
+                raise NoAdapter(f"adapter {term.id!r} has no view {n!r}; known views: {known}")
+            jobs.append(Job(chain, n, dict(term.views[n]["options"])))
+    return jobs

@@ -17,6 +17,7 @@ STAGES = ("source", "built", "sliced")
 BUILTIN_TOML = Path(__file__).with_name("builtin.toml")
 BASE_KEYS = {"in", "out", "name", "workdir", "w", "h"}
 _TOKEN = re.compile(r"\{\{|\}\}|\{(\w+)\}")
+VIEW_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _WHOLE = re.compile(r"^\{(\w+)\}$")
 
 
@@ -72,6 +73,8 @@ class Adapter:
     priority: int = 0
     out_glob: str | None = None
     enabled: bool = True
+    views: dict = field(default_factory=dict)
+    default_views: list = field(default_factory=list)
     base_dir: Path = field(default_factory=Path.cwd)
     source: str = "builtin"
 
@@ -94,8 +97,20 @@ class Adapter:
         for k in ("cmd", "version_cmd"):
             if k in d and not (isinstance(d[k], list) and all(isinstance(x, str) for x in d[k])):
                 raise err(f"'{k}' must be a list of strings")
+        views = d.get("views", {})
+        if not isinstance(views, dict) or not all(isinstance(v, dict) for v in views.values()):
+            raise err("'views' must be a table of tables")
+        for vn, v in views.items():
+            if not VIEW_NAME.match(vn):
+                raise err(f"bad view name {vn!r} (lowercase letters, digits, - and _)")
+            if not isinstance(v.get("options"), dict):
+                raise err(f"view {vn!r} needs an 'options' table")
+        dv = list(d.get("default_views", []))
+        bad = [x for x in dv if x not in views]
+        if bad:
+            raise err(f"default_views not declared in views: {', '.join(bad)}")
         return cls(
-            id=id, accepts=accepts, produces=produces, stage=stage,
+            id=id, views=views, default_views=dv, accepts=accepts, produces=produces, stage=stage,
             requires=list(d.get("requires", [])), version_cmd=d.get("version_cmd"),
             cmd=d.get("cmd"), python=d.get("python"), timeout=float(d.get("timeout", 120)),
             env={str(k): str(v) for k, v in d.get("env", {}).items()}, cwd=d.get("cwd"),

@@ -17,26 +17,59 @@ version_cmd = ["openscad", "--version"]
 # {backend_args} expands to ["--backend=manifold"] when the installed openscad
 # supports --backend, else to nothing (see tulda/adapters/probes.py).
 cmd = ["openscad", "{backend_args}", "-o", "{out}",
-       "--imgsize={w},{h}", "--autocenter", "--viewall", "{in}"]
+       "--imgsize={w},{h}", "{camera_args}", "{in}"]
 timeout = 180
+default_views = ["iso", "bottom"]
 
 [adapter.openscad.options]
 backend_args = "@probe:openscad_backend"
+camera_args = ["--autocenter", "--viewall"]
+
+# Views = camera overrides. --camera=tx,ty,tz,rx,ry,rz,dist (verified against OpenSCAD
+# 2026.10.11 --help); with --autocenter --viewall the translation and distance are
+# recomputed, so only the three rotation angles matter. The default OpenSCAD view is
+# rotation 55,0,25 (= iso here).
+[adapter.openscad.views]
+iso    = { options = { camera_args = ["--camera=0,0,0,55,0,25,0", "--autocenter", "--viewall"] } }
+top    = { options = { camera_args = ["--camera=0,0,0,0,0,0,0", "--autocenter", "--viewall"] } }
+bottom = { options = { camera_args = ["--camera=0,0,0,180,0,0,0", "--autocenter", "--viewall"] } }
+front  = { options = { camera_args = ["--camera=0,0,0,90,0,0,0", "--autocenter", "--viewall"] } }
+back   = { options = { camera_args = ["--camera=0,0,0,90,0,180,0", "--autocenter", "--viewall"] } }
+left   = { options = { camera_args = ["--camera=0,0,0,90,0,90,0", "--autocenter", "--viewall"] } }
+right  = { options = { camera_args = ["--camera=0,0,0,90,0,270,0", "--autocenter", "--viewall"] } }
 
 # Verified 2026-11-24 with Bambu Studio 02.09.01.70: headless, ~0.3 s, writes
 # <outputdir>/plate_1_0.png (512x512 RGBA) plus result.json. --outputdir must
-# already exist (the runner creates {workdir}). --export-png must be the only
-# action. Do not kill a running GUI instance. Camera/all-plates variants are
-# untested (--export-png 0, --camera-view N).
+# already exist AND be an absolute path (the runner passes one). --export-png must be
+# the only action. Do not kill a running GUI instance.
+# --camera-view: --help documents 0 Iso, 1 Top_Front, 2 Left, 3 Right, 10-12 Iso_1-3.
+# There is no documented bottom view, but UNDOCUMENTED values were probed on 02.09.01.70
+# (output plate_1_<N>.png): 4 = top, 5 = bottom (shows the underside in real filament
+# colours, so a bed-face inlay is visible), 6 = front, 7 = rear. 8 repeats 1 and 9 is a
+# tiny top view; neither is used. If a Bambu Studio update changes these, the bottom
+# view can be redirected via `via` to a chain that renders the underside with OpenSCAD.
 [adapter.bambu-export-png]
 accepts  = [".3mf"]
 produces = "png"
 stage    = "sliced"
 requires = ["/Applications/BambuStudio.app/Contents/MacOS/BambuStudio"]
 cmd = ["/Applications/BambuStudio.app/Contents/MacOS/BambuStudio",
-       "--export-png", "{plate}", "--outputdir", "{workdir}", "{in}"]
+       "--export-png", "{plate}", "--camera-view", "{camera_view}",
+       "--outputdir", "{workdir}", "{in}"]
 out_glob = "plate_*.png"
 timeout = 120
+default_views = ["iso", "bottom"]
 
 [adapter.bambu-export-png.options]
 plate = 1
+camera_view = 0
+
+[adapter.bambu-export-png.views]
+iso       = { options = { camera_view = 0 } }
+top-front = { options = { camera_view = 1 } }
+left      = { options = { camera_view = 2 } }
+right     = { options = { camera_view = 3 } }
+top       = { options = { camera_view = 4 } }
+bottom    = { options = { camera_view = 5 } }
+front     = { options = { camera_view = 6 } }
+rear      = { options = { camera_view = 7 } }
