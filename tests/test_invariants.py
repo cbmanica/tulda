@@ -93,6 +93,18 @@ class NoWildcardBind(unittest.TestCase):
         self.assertFalse(set(hosts) & WILDCARDS)
 
 
+class WildcardRejected(unittest.TestCase):
+    def test_every_wildcard_spelling_is_refused_by_cli(self):
+        from tulda import cli
+        from tulda.errors import TuldaError
+        for w in sorted(WILDCARDS) + ["0", "[::]", "::0"]:
+            with self.subTest(host=w), self.assertRaises(TuldaError):
+                cli.resolve_hosts([w], False)
+            with self.subTest(host=w, via="main"):
+                with mock.patch("sys.stderr"):
+                    self.assertNotEqual(cli.main(["serve", "--host", w]), 0)
+
+
 class VendorIntegrity(unittest.TestCase):
     def test_sha256sums_match_exactly(self):
         sums = VENDOR / "SHA256SUMS"

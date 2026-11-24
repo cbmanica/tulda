@@ -184,10 +184,28 @@ class StatusTests(unittest.TestCase):
 
     def test_parse_hosts(self):
         from tulda.netinfo import in_cgnat, parse_hosts
-        self.assertEqual(parse_hosts(["a, b", "", "a", "c"]), ["a", "b", "c"])
+        self.assertEqual(parse_hosts(["a, b", "a", "c"]), ["a", "b", "c"])
         self.assertTrue(in_cgnat("100.64.0.1"))
         self.assertFalse(in_cgnat("100.128.0.1"))
         self.assertFalse(in_cgnat("192.168.0.1"))
+
+    def test_parse_hosts_rejects_wildcards(self):
+        from tulda.errors import TuldaError
+        from tulda.netinfo import parse_hosts
+        for bad in ("0.0.0.0", "::", "0:0:0:0:0:0:0:0", "[::]", "0", "", "  ", "0.0.0.0,a",
+                    "a,", "::0"):
+            with self.subTest(bad=bad), self.assertRaises(TuldaError):
+                parse_hosts([bad])
+        self.assertEqual(parse_hosts(["::1", "192.0.2.5"]), ["::1", "192.0.2.5"])
+
+    def test_resolve_and_install_reject_wildcards(self):
+        from tulda import cli
+        from tulda.errors import TuldaError
+        with self.assertRaises(TuldaError):
+            cli.resolve_hosts(["0.0.0.0"], False)
+        with self.assertRaises(TuldaError):
+            service.build_plist(python="p", project=Path("/x"), host="::", port=1,
+                                renders_root=None, log_dir=Path("/x"))
 
     def test_resolve_hosts(self):
         import tulda.cli as c

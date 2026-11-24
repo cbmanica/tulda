@@ -182,7 +182,7 @@ supported; `func(ctx) -> Result`.
   adapters, and only serves the renders root.
 - Binds to the default interface's LAN IPv4, else 127.0.0.1; `--host` (repeatable)
   replaces that and `--tailscale` adds the tailnet IPv4. Loopback 127.0.0.1 is always
-  bound too. Never 0.0.0.0: only the listed addresses. There is no authentication:
+  bound too. Never 0.0.0.0: only the listed addresses; `--host` rejects wildcard/empty values (`0.0.0.0`, `::`, `0`, blank) with an error. There is no authentication:
   anyone on the LAN can view the renders, and with `--tailscale` so can every device
   on your whole tailnet (not just the home LAN). Still read-only.
 - Host header must be one of: any bound address, 127.0.0.1, localhost, the

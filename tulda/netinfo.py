@@ -71,13 +71,31 @@ LOOPBACK = "127.0.0.1"   # always bound in addition to the LAN and tailnet addre
 TAILSCALE_CLI = ("tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
 
 
+def is_wildcard_host(h: str) -> bool:
+    """True for anything that would bind every interface: empty, `0`, or any
+    unspecified address (IPv4 or IPv6, any spelling)."""
+    import ipaddress
+    h = h.strip().strip("[]").split("%")[0]
+    if not h or h == "0":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_unspecified
+    except ValueError:
+        return False
+
+
 def parse_hosts(items) -> list[str]:
-    """Flatten repeatable/comma-separated --host values, dropping blanks and duplicates."""
+    """Flatten repeatable/comma-separated --host values, dropping duplicates.
+    Wildcard/empty values are refused: tulda only binds the addresses it is given."""
+    from .errors import ConfigError
     out: list[str] = []
     for it in items or []:
         for h in str(it).split(","):
             h = h.strip()
-            if h and h not in out:
+            if is_wildcard_host(h):
+                raise ConfigError(f"refusing wildcard/empty --host {h!r}: tulda never binds all "
+                                  "interfaces; give a specific interface address")
+            if h not in out:
                 out.append(h)
     return out
 
