@@ -138,6 +138,7 @@ function buildParts() {
 
 function fallback(reason) {
   if (D.turntable && window.tuldaTurntable) { window.tuldaTurntable.show(reason); return true; }
+  if (D.turntable) { say(reason + ' The turntable script did not load.', true); return false; }
   say(reason + (D.turntable ? '' : ' No turntable was rendered for this model (use --views turntable).'), true);
   return false;
 }
@@ -145,6 +146,7 @@ function fallback(reason) {
 async function main() {
   applyThemeEarly();
   $('theme').onclick = () => { dark = !dark; store.set('tulda.viewer.dark', dark ? '1' : '0'); applyTheme(); };
+  if (!D.glb && D.turntable) { window.tuldaTurntable.show(''); return; }   // turntable-only render
   if (!hasWebGL()) { fallback('WebGL is not available in this browser.'); return; }
   say('Loading viewer...');
   let OrbitControls, GLTFLoader;

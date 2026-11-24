@@ -32,6 +32,7 @@ _JS = "application/javascript"
 THREE_DIR = f"vendor/three-{THREE_VERSION}/"
 STATIC_FILES = {
     "viewer.js": _JS,
+    "turntable.js": _JS,
     THREE_DIR + "build/three.module.js": _JS,
     THREE_DIR + "build/three.core.js": _JS,
     THREE_DIR + "examples/jsm/controls/OrbitControls.js": _JS,

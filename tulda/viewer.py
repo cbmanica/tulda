@@ -73,6 +73,7 @@ border:1px solid var(--line);border-radius:12px;padding:6px 10px;z-index:2;font-
 <div id="tt" hidden></div>
 </div>
 <script type="application/json" id="vdata">__DATA__</script>
+<script src="/_s/turntable.js"></script>
 <script type="module" src="/_s/viewer.js"></script>
 </body></html>
 """

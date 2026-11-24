@@ -11,5 +11,6 @@ entry (python = "builtin:bambu_plate", priority = -1) to builtin.toml.
 """
 
 from .meshes import MESH_PY
+from .turntable import TURNTABLE_PY
 
-BUILTIN_PY: dict = {**MESH_PY}  # name -> callable(ctx) -> Result
+BUILTIN_PY: dict = {**MESH_PY, **TURNTABLE_PY}  # name -> callable(ctx) -> Result

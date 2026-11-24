@@ -99,3 +99,19 @@ accepts  = [".stl"]
 produces = "glb"
 stage    = "mesh"
 python   = "builtin:stl_mesh"
+
+# ---- turntable stage: .scad -> 36 PNG frames (no-WebGL fallback + drag-to-rotate widget) ----
+# Selected by the `turntable` view only. OpenSCAD renders ~0.25 s per 800x600 frame (4 in
+# parallel). Bambu Studio only has fixed camera presets, so .3mf has no turntable.
+[adapter.turntable-scad]
+kind     = "turntable"
+accepts  = [".scad"]
+produces = "png"
+stage    = "source"
+requires = ["openscad"]
+version_cmd = ["openscad", "--version"]
+python   = "builtin:scad_turntable"
+timeout  = 600
+
+[adapter.turntable-scad.options]
+frames = 36
