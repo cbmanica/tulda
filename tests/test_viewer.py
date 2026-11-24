@@ -115,6 +115,7 @@ class ViewerServer(unittest.TestCase):
         self.assertNotIn("cdn", html.lower())
         self.assertIn('id="reset"', html)
         self.assertIn('data-preset="bottom"', html)
+        self.assertIn('id="plist"', html)                  # parts legend container
         data = json.loads(re.search(r'id="vdata">(.*?)</script>', html, re.S).group(1))
         self.assertEqual(data["glb"], "/proj/m.glb")
         self.assertEqual(data["info"]["triangles"], 12)

@@ -44,19 +44,53 @@ def run_openscad(args: list[str], timeout: float = OPENSCAD_TIMEOUT) -> subproce
                           text=True, errors="replace", timeout=timeout)
 
 
-def scad_mesh(ctx: Context) -> Result:
-    stl = ctx.workdir / "model.stl"
+OPENSCAD_DEFAULT = "#F9D72C"        # colour OpenSCAD gives uncoloured geometry in 3MF exports
+
+
+def _openscad(ctx: Context, out: Path, *extra: str) -> tuple[bool, str]:
     try:
-        p = run_openscad(["--export-format", "binstl", "-o", str(stl), str(ctx.in_path)],
+        p = run_openscad([*extra, "-o", str(out), str(ctx.in_path)],
                          float(ctx.options.get("mesh_timeout", OPENSCAD_TIMEOUT)))
     except subprocess.TimeoutExpired:
-        return Result(False, "openscad timed out")
+        return False, "openscad timed out"
     except OSError as e:
-        return Result(False, f"cannot run openscad: {e}")
-    if p.returncode != 0 or not stl.is_file():
-        return Result(False, "openscad failed:\n" + "\n".join((p.stderr or p.stdout).strip().splitlines()[-15:]))
-    scene = mesh.Scene([mesh.Part(ctx.in_path.stem, mesh.read_stl(stl.read_bytes()))])
-    return _publish(ctx, scene, {"openscad_export": "binstl"})
+        return False, f"cannot run openscad: {e}"
+    if p.returncode != 0 or not out.is_file():
+        return False, "openscad failed:\n" + "\n".join((p.stderr or p.stdout).strip().splitlines()[-15:])
+    return True, ""
+
+
+def scad_scene(ctx: Context) -> tuple[mesh.Scene | None, str, str]:
+    """-> (scene, export format used, error). Tries a 3MF export first (keeps color() as
+    per-part colours), then binary STL (single colour)."""
+    stem = ctx.in_path.stem
+    ok, err3 = _openscad(ctx, ctx.workdir / "model.3mf")
+    if ok:
+        try:
+            sc = threemf.load(ctx.workdir / "model.3mf")
+            sc.extras.pop("source", None)
+            if {p.color for p in sc.parts} == {OPENSCAD_DEFAULT}:
+                for p in sc.parts:
+                    p.color = mesh.DEFAULT_COLOR       # no color() calls: neutral grey, not yellow
+            for p in sc.parts:
+                p.name = stem if len(sc.parts) == 1 else f"{stem} {p.color}"
+                p.obj = stem
+            return sc, "3mf", ""
+        except mesh.MeshError as e:
+            err3 = str(e)
+    ok, err = _openscad(ctx, ctx.workdir / "model.stl", "--export-format", "binstl")
+    if not ok:
+        return None, "", err or err3
+    sc = mesh.Scene([mesh.Part(stem, mesh.read_stl((ctx.workdir / "model.stl").read_bytes()), obj=stem)])
+    sc.extras["colors"] = ["default"]
+    return sc, "binstl", ""
+
+
+def scad_mesh(ctx: Context) -> Result:
+    scene, fmt, err = scad_scene(ctx)
+    if scene is None:
+        return Result(False, err)
+    return _publish(ctx, scene, {"openscad_export": fmt})
 
 
 def threemf_mesh(ctx: Context) -> Result:

@@ -2,8 +2,20 @@
 
 Handles the core 3MF spec: meshes, `<components>` assemblies with transforms, the `<build>`
 item transforms (the plate placement in Bambu/Orca files), the unit attribute, and the
-production extension's `p:path` references to other model files. Colours: see `colors`
-section below (Bambu extruder -> filament colour, 3MF base materials)."""
+production extension's `p:path` references to other model files.
+
+Colours (verified against Bambu Studio 02.09.01.70 project files):
+  * Bambu: `Metadata/model_settings.config` (XML) names each top-level `<object id>` and its
+    `<part id>`s (the part id equals the component's object id) with `extruder` N and a
+    `subtype` (normal_part, modifier_part, support_blocker, ...); `Metadata/project_settings.config`
+    (JSON) has the `filament_colour` list, so part colour = filament_colour[extruder - 1].
+    Objects missing from model_settings.config (single-mesh objects often are) use extruder 1.
+    The unrelated `extruder_colour` key is NOT used (it was a stale one-entry list in the real file).
+  * Generic 3MF / OpenSCAD: `<basematerials>` displaycolor via `pid`/`pindex` (per object) or
+    `pid`/`p1` (per triangle). Triangles are split into one part per material.
+  * Neither: a default palette indexed by extruder.
+Not handled: Bambu paint-on colours (`paint_color` per triangle; absent in every file checked),
+multi-plate filtering, texture/colorgroup extensions."""
 
 from __future__ import annotations
 
@@ -204,8 +216,93 @@ def _tri_array(o: Obj, tri_idx: list[int], xf: tuple, scale: float) -> array:
     return out
 
 
-def load(path, config: bool = True) -> Scene:
-    """Read a .3mf into a Scene: one Part per mesh instance (per colour)."""
+PALETTE = ["#9AA0A6", "#F2994A", "#56CCF2", "#6FCF97", "#BB6BD9", "#EB5757", "#F2C94C", "#2D9CDB"]
+SUBTYPE_COLORS = {"modifier_part": "#4C8DFF", "negative_part": "#FF8A3D",
+                  "support_blocker": "#FF5050", "support_enforcer": "#3DDC84"}
+HEX = re.compile(r"#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?")
+
+
+@dataclass
+class Config:
+    objects: dict = field(default_factory=dict)     # id -> {"name", "extruder", "parts": {id: {...}}}
+    filaments: list = field(default_factory=list)   # ["#RRGGBB", ...] (project filament_colour)
+    bed: list | None = None                         # [x0, y0, x1, y1] mm
+    printer: str | None = None
+    found: bool = False
+
+
+def _opt_text(z, name: str, limit: int = 64 * 1024 * 1024) -> bytes | None:
+    try:
+        return _read(z, name, limit)
+    except MeshError:
+        return None
+
+
+def _meta(el) -> dict:
+    return {m.get("key"): m.get("value") for m in el if _local(m.tag) == "metadata"}
+
+
+def _int(v, default=None):
+    try:
+        n = int(v)
+        return n if n > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def read_config(z: zipfile.ZipFile) -> Config:
+    cfg = Config()
+    raw = _opt_text(z, "Metadata/model_settings.config")
+    if raw:
+        try:
+            for o in ET.fromstring(raw):
+                if _local(o.tag) != "object":
+                    continue
+                md = _meta(o)
+                parts = {}
+                for p in o:
+                    if _local(p.tag) == "part":
+                        pm = _meta(p)
+                        parts[p.get("id")] = {"name": pm.get("name"), "extruder": _int(pm.get("extruder")),
+                                              "subtype": p.get("subtype") or "normal_part"}
+                cfg.objects[o.get("id")] = {"name": md.get("name"), "extruder": _int(md.get("extruder")),
+                                            "parts": parts}
+            cfg.found = True
+        except ET.ParseError:
+            cfg.objects = {}
+    raw = _opt_text(z, "Metadata/project_settings.config")
+    if raw:
+        try:
+            import json
+            js = json.loads(raw)
+        except ValueError:
+            js = {}
+        fc = js.get("filament_colour") if isinstance(js, dict) else None
+        if isinstance(fc, list):
+            cfg.filaments = ["#" + c.lstrip("#")[:6].upper() if isinstance(c, str) and HEX.fullmatch(c) else None
+                             for c in fc]
+        pa = js.get("printable_area") if isinstance(js, dict) else None
+        if isinstance(pa, list):
+            try:
+                pts = [tuple(float(n) for n in str(x).split("x")) for x in pa]
+                xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+                cfg.bed = [min(xs), min(ys), max(xs), max(ys)]
+            except (ValueError, IndexError):
+                cfg.bed = None
+        pm = js.get("printer_model") if isinstance(js, dict) else None
+        cfg.printer = pm if isinstance(pm, str) else None
+    return cfg
+
+
+def filament_color(cfg: Config, extruder: int) -> tuple[str, str]:
+    """-> (colour, source) for a 1-based extruder number."""
+    if 0 < extruder <= len(cfg.filaments) and cfg.filaments[extruder - 1]:
+        return cfg.filaments[extruder - 1], "filament_colour"
+    return PALETTE[(extruder - 1) % len(PALETTE)], "palette"
+
+
+def load(path) -> Scene:
+    """Read a .3mf into a Scene: one Part per mesh instance (per material)."""
     try:
         z = zipfile.ZipFile(path)
     except (zipfile.BadZipFile, OSError) as e:
@@ -233,16 +330,66 @@ def load(path, config: bool = True) -> Scene:
             todo += [c[0] for o in model.objects.values() if o.file == f for c in o.components]
         if not model.build:
             raise MeshError("3mf has no printable build items")
+        cfg = read_config(z)
         leaves = _flatten(model)
-        scene = Scene()
-        scene.extras["source"] = {"title": model.title, "application": model.application}
-        scale = model.unit_scale
-        for n, lf in enumerate(leaves, 1):
-            o = lf.obj
-            if not o.tris:
-                continue
-            scene.parts.append(Part(
-                name=o.name or f"object {o.id}", obj=model.objects[lf.top].name or f"object {lf.top[1]}",
-                tris=_tri_array(o, list(range(len(o.tris))), lf.xf, scale)))
-        scene.check_size()
-        return scene
+    scene = Scene()
+    scene.extras["source"] = {"title": model.title, "application": model.application}
+    sources: set[str] = set()
+    scale = model.unit_scale
+    for lf in leaves:
+        o = lf.obj
+        if not o.tris:
+            continue
+        top = model.objects[lf.top]
+        ocfg = cfg.objects.get(top.id) or {}
+        pcfg = (ocfg.get("parts") or {}).get(lf.comp_id) if lf.comp_id else None
+        pcfg = pcfg or {}
+        obj_name = ocfg.get("name") or top.name or f"object {top.id}"
+        name = pcfg.get("name") or (ocfg.get("name") if not lf.comp_id else None) or o.name or f"object {o.id}"
+        subtype = pcfg.get("subtype") or "normal_part"
+        extruder = pcfg.get("extruder") or ocfg.get("extruder") or 1
+        groups = _material_groups(model, o)
+        if groups is not None:
+            # generic 3MF / OpenSCAD: colours come from base materials
+            multi = len(groups) > 1
+            sources.add("3mf-materials")
+            for (mname, col, alpha), idx in groups.items():
+                scene.parts.append(Part(
+                    name=f"{name} ({mname or col})" if multi else name, obj=obj_name, extruder=None,
+                    tris=_tri_array(o, idx, lf.xf, scale), color=col, alpha=alpha,
+                    subtype=subtype, visible=subtype == "normal_part"))
+            continue
+        if subtype != "normal_part":
+            col, alpha = SUBTYPE_COLORS.get(subtype, "#8888FF"), 0.4
+        else:
+            col, src = filament_color(cfg, extruder)
+            sources.add(src)
+            alpha = 1.0
+        scene.parts.append(Part(name=name, obj=obj_name, extruder=extruder, color=col, alpha=alpha,
+                                tris=_tri_array(o, list(range(len(o.tris))), lf.xf, scale),
+                                subtype=subtype, visible=subtype == "normal_part"))
+    scene.extras["colors"] = sorted(sources)
+    if "palette" in sources:
+        scene.warnings.append("no usable filament_colour for some extruders; used a default palette")
+    if cfg.filaments:
+        scene.extras["filament_colours"] = [c for c in cfg.filaments if c]
+    if cfg.bed:
+        scene.extras["bed"] = cfg.bed
+    if cfg.printer:
+        scene.extras["printer"] = cfg.printer
+    scene.check_size()
+    return scene
+
+
+def _material_groups(model: Model, o: Obj):
+    """{(name, colour, alpha): [triangle index]} when the object carries base materials, else None."""
+    if not (o.pid or any(t[3] for t in o.tris)):
+        return None
+    groups: dict = {}
+    for i, t in enumerate(o.tris):
+        pid = t[3] or o.pid
+        pidx = t[4] if t[4] is not None else o.pindex
+        mats = model.materials.get((o.file, pid)) if pid else None
+        key = mats[pidx] if mats and 0 <= pidx < len(mats) else ("", DEFAULT_COLOR, 1.0)
+        groups.setdefault(key, []).append(i)
+    return groups

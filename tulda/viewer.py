@@ -47,7 +47,7 @@ border:1px solid var(--line);border-radius:12px;padding:6px 10px;z-index:2;font-
 #parts summary{cursor:pointer;color:var(--mut);padding:4px 0}
 #parts label{display:flex;align-items:center;gap:7px;padding:4px 0;min-height:30px;overflow-wrap:anywhere}
 #parts .sw{width:14px;height:14px;border-radius:3px;border:1px solid #0005;flex:none}
-#parts .o{color:var(--mut);font-size:11px;margin-top:6px}
+#parts .o{color:var(--mut);font-size:11px;margin-top:6px;overflow-wrap:anywhere}
 #tt{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:var(--stage);z-index:4;padding:8px}
 #tt img{max-width:100%;max-height:calc(100% - 90px);object-fit:contain;touch-action:pan-y;user-select:none;-webkit-user-drag:none;cursor:grab;background:#fff}
 #tt img:active{cursor:grabbing}

@@ -100,9 +100,40 @@ function setWire(on) {
 
 function setGrid(on) {
   if (grid) grid.visible = on;
-  if (bedMesh) bedMesh.visible = on;
+  if (bedMesh) bedMesh.visible = on && camera.position.y > 0;
   $('grid').setAttribute('aria-pressed', on);
   render();
+}
+
+// ---- parts legend: one row per mesh node (colour swatch, name, visibility toggle)
+function partMeshes() { const out = []; root.traverse(o => { if (o.isMesh) out.push(o); }); return out; }
+function visibleBox() {
+  const b = new T.Box3();
+  partMeshes().forEach(m => { if (m.visible) b.union(new T.Box3().setFromObject(m)); });
+  return b.isEmpty() ? new T.Box3().setFromObject(root) : b;
+}
+function buildParts() {
+  const meshes = partMeshes();
+  meshes.forEach(m => { if (m.userData.visible === false) m.visible = false; });
+  const hidden = meshes.some(m => m.userData.visible === false);
+  if (meshes.length < 2 && !hidden) return;
+  const list = $('plist'), objs = new Map();
+  meshes.forEach(m => { const o = m.userData.object || ''; if (!objs.has(o)) objs.set(o, []); objs.get(o).push(m); });
+  const grouped = objs.size > 1;
+  objs.forEach((ms, oname) => {
+    if (grouped) { const h = document.createElement('div'); h.className = 'o'; h.textContent = oname; list.append(h); }
+    ms.forEach(m => {
+      const u = m.userData, lab = document.createElement('label'), cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.checked = m.visible;
+      const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = u.color || '#999';
+      const t = document.createElement('span');
+      t.textContent = (u.name || m.name) + (u.subtype ? ' (' + u.subtype.replace(/_/g, ' ') + ')' : '') +
+        (u.extruder ? '  \u00b7 filament ' + u.extruder : '');
+      lab.append(cb, sw, t); list.append(lab);
+      cb.onchange = () => { m.visible = cb.checked; render(); };
+    });
+  });
+  $('parts').hidden = false;
 }
 
 function fallback(reason) {
@@ -135,7 +166,10 @@ async function main() {
   controls.enableDamping = false;           // on-demand rendering: no animation loop
   controls.screenSpacePanning = true;
   controls.minPolarAngle = 0; controls.maxPolarAngle = Math.PI;   // all the way under
-  controls.addEventListener('change', render);
+  controls.addEventListener('change', () => {
+    if (bedMesh) bedMesh.visible = !!(grid && grid.visible) && camera.position.y > 0;   // do not veil the underside
+    render();
+  });
   applyTheme();
 
   let gltf;
@@ -146,12 +180,12 @@ async function main() {
   root = gltf.scene;
   scene.add(root);
   root.updateMatrixWorld(true);
-  bbox = new T.Box3().setFromObject(root);
+  buildParts();
+  bbox = visibleBox();
   if (bbox.isEmpty()) { say('The model is empty.', true); return; }
   center = bbox.getCenter(new T.Vector3());
   radius = bbox.getBoundingSphere(new T.Sphere()).radius || 1;
   buildGrid();
-  if (window.tuldaParts) window.tuldaParts(root, render);
   say('');
   new ResizeObserver(size).observe(stage);
   size();

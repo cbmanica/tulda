@@ -48,8 +48,8 @@ def tri_mesh(oid: str, pts, tris, attrs: str = "") -> str:
     return f'<object id="{oid}" type="model"><mesh><vertices>{v}</vertices><triangles>{t}</triangles></mesh></object>'
 
 
-UNIT_FOUR_PTS = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
-UNIT_FOUR_TRIS = [(0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7), (0, 1, 5), (0, 5, 4),
+UNIT_CUBE_PTS = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+UNIT_CUBE_TRIS = [(0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7), (0, 1, 5), (0, 5, 4),
                   (1, 2, 6), (1, 6, 5), (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7)]
 
 
@@ -157,12 +157,12 @@ class Glb(unittest.TestCase):
 class ThreeMF(unittest.TestCase):
     def test_build_transform_and_unit(self):
         d = tmpdir()
-        m = model_xml(tri_mesh("1", UNIT_FOUR_PTS, UNIT_FOUR_TRIS),
+        m = model_xml(tri_mesh("1", UNIT_CUBE_PTS, UNIT_CUBE_TRIS),
                       '<item objectid="1" transform="2 0 0 0 2 0 0 0 2 10 20 30"/>', unit="millimeter")
         sc = threemf.load(write_3mf(d / "a.3mf", m))
         self.assertEqual(sc.bbox(), [[10, 20, 30], [12, 22, 32]])
         self.assertEqual(sc.n_tris, 12)
-        m = model_xml(tri_mesh("1", UNIT_FOUR_PTS, UNIT_FOUR_TRIS), '<item objectid="1"/>', unit="centimeter")
+        m = model_xml(tri_mesh("1", UNIT_CUBE_PTS, UNIT_CUBE_TRIS), '<item objectid="1"/>', unit="centimeter")
         self.assertEqual(threemf.load(write_3mf(d / "b.3mf", m)).bbox(), [[0, 0, 0], [10, 10, 10]])
 
     def test_row_vector_rotation(self):
@@ -176,7 +176,7 @@ class ThreeMF(unittest.TestCase):
 
     def test_components_compose_with_item(self):
         d = tmpdir()
-        objs = (tri_mesh("1", UNIT_FOUR_PTS, UNIT_FOUR_TRIS) + tri_mesh("2", UNIT_FOUR_PTS, UNIT_FOUR_TRIS) +
+        objs = (tri_mesh("1", UNIT_CUBE_PTS, UNIT_CUBE_TRIS) + tri_mesh("2", UNIT_CUBE_PTS, UNIT_CUBE_TRIS) +
                 '<object id="3" type="model"><components><component objectid="1"/>'
                 '<component objectid="2" transform="1 0 0 0 1 0 0 0 1 5 0 0"/></components></object>')
         m = model_xml(objs, '<item objectid="3" transform="1 0 0 0 1 0 0 0 1 100 0 0"/>')
@@ -194,7 +194,7 @@ class ThreeMF(unittest.TestCase):
 
     def test_production_path_component(self):
         d = tmpdir()
-        sub = model_xml(tri_mesh("7", UNIT_FOUR_PTS, UNIT_FOUR_TRIS), "")
+        sub = model_xml(tri_mesh("7", UNIT_CUBE_PTS, UNIT_CUBE_TRIS), "")
         top = ('<?xml version="1.0"?><model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"'
                ' xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06"><resources>'
                '<object id="1" type="model"><components><component p:path="/3D/Objects/o.model" objectid="7"/>'
@@ -204,7 +204,7 @@ class ThreeMF(unittest.TestCase):
 
     def test_non_printable_item_skipped(self):
         d = tmpdir()
-        m = model_xml(tri_mesh("1", UNIT_FOUR_PTS, UNIT_FOUR_TRIS),
+        m = model_xml(tri_mesh("1", UNIT_CUBE_PTS, UNIT_CUBE_TRIS),
                       '<item objectid="1" printable="0"/><item objectid="1" transform="1 0 0 0 1 0 0 0 1 9 0 0"/>')
         self.assertEqual(threemf.load(write_3mf(d / "n.3mf", m)).bbox(), [[9, 0, 0], [10, 1, 1]])
 
@@ -214,7 +214,7 @@ class ThreeMF(unittest.TestCase):
         with self.assertRaises(mesh.MeshError):
             threemf.load(d / "bad.3mf")
         with self.assertRaises(mesh.MeshError):      # no build items
-            threemf.load(write_3mf(d / "e.3mf", model_xml(tri_mesh("1", UNIT_FOUR_PTS, UNIT_FOUR_TRIS), "")))
+            threemf.load(write_3mf(d / "e.3mf", model_xml(tri_mesh("1", UNIT_CUBE_PTS, UNIT_CUBE_TRIS), "")))
         with self.assertRaises(mesh.MeshError):      # unknown component target
             objs = '<object id="3"><components><component objectid="99"/></components></object>'
             threemf.load(write_3mf(d / "u.3mf", model_xml(objs, '<item objectid="3"/>')))
@@ -229,6 +229,125 @@ class ThreeMF(unittest.TestCase):
                                                           '<item objectid="1"/>')))
 
 
+BAMBU_MODEL_SETTINGS = (
+    '<?xml version="1.0"?><config><object id="4"><metadata key="name" value="plate+inlay"/>'
+    '<part id="2" subtype="normal_part"><metadata key="name" value="body"/><metadata key="extruder" value="1"/></part>'
+    '<part id="3" subtype="normal_part"><metadata key="name" value="pizza"/><metadata key="extruder" value="2"/></part>'
+    '<part id="5" subtype="support_blocker"><metadata key="name" value="blocker"/></part></object></config>')
+BAMBU_PROJECT = json.dumps({"filament_colour": ["#696969", "#FFB000"], "extruder_colour": ["#018001"],
+                            "printable_area": ["0x0", "256x0", "256x256", "0x256"], "printer_model": "Test Printer"})
+
+
+def bambu_like(d: Path, settings=BAMBU_MODEL_SETTINGS, project=BAMBU_PROJECT) -> Path:
+    cube = tri_mesh("2", UNIT_CUBE_PTS, UNIT_CUBE_TRIS) + tri_mesh("3", UNIT_CUBE_PTS, UNIT_CUBE_TRIS) \
+        + tri_mesh("5", UNIT_CUBE_PTS, UNIT_CUBE_TRIS) + tri_mesh("1", UNIT_CUBE_PTS, UNIT_CUBE_TRIS)
+    objs = cube + ('<object id="4" type="model"><components><component objectid="2"/><component objectid="3"/>'
+                   '<component objectid="5"/></components></object>')
+    m = model_xml(objs, '<item objectid="1" transform="1 0 0 0 1 0 0 0 1 50 0 0"/>'
+                        '<item objectid="4" transform="1 0 0 0 1 0 0 0 1 100 0 0"/>')
+    extra = {}
+    if settings:
+        extra["Metadata/model_settings.config"] = settings
+    if project:
+        extra["Metadata/project_settings.config"] = project
+    return write_3mf(d / "b.3mf", m, extra)
+
+
+class BambuColours(unittest.TestCase):
+    def test_extruder_to_filament_colour_and_names(self):
+        sc = threemf.load(bambu_like(tmpdir()))
+        by = {p.name: p for p in sc.parts}
+        self.assertEqual(by["body"].color, "#696969")
+        self.assertEqual(by["pizza"].color, "#FFB000")
+        self.assertEqual((by["body"].extruder, by["pizza"].extruder), (1, 2))
+        self.assertEqual(by["body"].obj, "plate+inlay")
+        # object 1 has no entry in model_settings.config: extruder 1, generic name
+        self.assertEqual((by["object 1"].color, by["object 1"].obj), ("#696969", "object 1"))
+        self.assertEqual(sc.extras["colors"], ["filament_colour"])
+        self.assertEqual(sc.extras["bed"], [0, 0, 256, 256])
+        self.assertEqual(sc.extras["printer"], "Test Printer")
+        self.assertEqual(sc.warnings, [])
+
+    def test_extruder_colour_key_is_not_used(self):
+        sc = threemf.load(bambu_like(tmpdir()))
+        self.assertNotIn("#018001", {p.color for p in sc.parts})
+
+    def test_modifier_parts_hidden_by_default(self):
+        sc = threemf.load(bambu_like(tmpdir()))
+        bl = next(p for p in sc.parts if p.name == "blocker")
+        self.assertEqual((bl.subtype, bl.visible, bl.alpha < 1), ("support_blocker", False, True))
+        self.assertEqual(len(sc.bbox()[0]), 3)
+        self.assertEqual(sc.bbox(), [[50, 0, 0], [101, 1, 1]])
+
+    def test_plate_placement_per_item(self):
+        sc = threemf.load(bambu_like(tmpdir()))
+        xs = {p.name: min(p.tris[0::3]) for p in sc.parts}
+        self.assertEqual((xs["object 1"], xs["body"]), (50, 100))
+
+    def test_missing_config_uses_palette(self):
+        sc = threemf.load(bambu_like(tmpdir(), settings=None, project=None))
+        self.assertEqual({p.color for p in sc.parts}, {threemf.PALETTE[0]})
+        self.assertIn("palette", sc.extras["colors"])
+        self.assertTrue(sc.warnings)
+        self.assertNotIn("bed", sc.extras)
+
+    def test_short_filament_list_falls_back_per_extruder(self):
+        proj = json.dumps({"filament_colour": ["#112233"]})
+        by = {p.name: p for p in threemf.load(bambu_like(tmpdir(), project=proj)).parts}
+        self.assertEqual(by["body"].color, "#112233")
+        self.assertEqual(by["pizza"].color, threemf.PALETTE[1])
+
+    def test_garbage_config_is_ignored(self):
+        sc = threemf.load(bambu_like(tmpdir(), settings="<config><oops", project="{not json"))
+        self.assertEqual(len(sc.parts), 4)
+        self.assertTrue(sc.warnings)
+
+    def test_colour_survives_into_glb(self):
+        sc = threemf.load(bambu_like(tmpdir()))
+        j, _ = glb_parts(mesh.write_glb(sc))
+        self.assertIn("#FFB000", {m["name"] for m in j["materials"]})
+        ex = {n["extras"]["name"]: n["extras"] for n in j["nodes"] if "extras" in n and "name" in n["extras"]}
+        self.assertEqual(ex["pizza"]["extruder"], 2)
+        self.assertEqual(ex["pizza"]["object"], "plate+inlay")
+        self.assertFalse(ex["blocker"]["visible"])
+        self.assertIn("bed", j["scenes"][0]["extras"])
+
+
+class BaseMaterials(unittest.TestCase):
+    def test_per_triangle_materials_split_into_parts(self):
+        mats = ('<basematerials id="9"><base name="Default" displaycolor="#F9D72CFF"/>'
+                '<base name="Color 1" displaycolor="#FF000080"/></basematerials>')
+        v = "".join(f'<vertex x="{x}" y="{y}" z="{z}"/>' for x, y, z in UNIT_CUBE_PTS)
+        tris = [f'<triangle v1="{a}" v2="{b}" v3="{c}"' + (' pid="9" p1="1"' if n >= 8 else "") + "/>"
+                for n, (a, b, c) in enumerate(UNIT_CUBE_TRIS[:10])]     # last two use material 1
+        t = (f'<object id="1" type="model" pid="9" pindex="0"><mesh><vertices>{v}</vertices>'
+             f'<triangles>{"".join(tris)}</triangles></mesh></object>')
+        sc = threemf.load(write_3mf(tmpdir() / "o.3mf", model_xml(mats + t, '<item objectid="1"/>')))
+        by = {p.color: p for p in sc.parts}
+        self.assertEqual(set(by), {"#F9D72C", "#FF0000"})
+        self.assertAlmostEqual(by["#FF0000"].alpha, 128 / 255, places=2)
+        self.assertEqual(sum(p.n_tris for p in sc.parts), 10)
+        self.assertEqual(sc.extras["colors"], ["3mf-materials"])
+
+    @unittest.skipUnless(shutil.which("openscad"), "openscad not installed")
+    def test_scad_color_roundtrip(self):
+        from tulda.adapters.meshes import scad_mesh
+        d = tmpdir()
+        (d / "c.scad").write_text('color("red") cube(1);\ntranslate([3,0,0]) color("#00ff88") cube(1);\n')
+        ctx = Context(d / "c.scad", d / "o.glb", {}, d)
+        res = scad_mesh(ctx)
+        self.assertEqual(res.meta["openscad_export"], "3mf")
+        self.assertEqual({p["color"] for p in res.meta["render_info"]["parts"]}, {"#FF0000", "#00FF88"})
+
+    @unittest.skipUnless(shutil.which("openscad"), "openscad not installed")
+    def test_uncoloured_scad_is_neutral_grey(self):
+        from tulda.adapters.meshes import scad_mesh
+        d = tmpdir()
+        (d / "c.scad").write_text("cube(1);\n")
+        res = scad_mesh(Context(d / "c.scad", d / "o.glb", {}, d))
+        self.assertEqual([p["color"] for p in res.meta["render_info"]["parts"]], [mesh.DEFAULT_COLOR])
+
+
 class Adapters(unittest.TestCase):
     def ctx(self, src: Path) -> Context:
         d = tmpdir()
@@ -236,7 +355,7 @@ class Adapters(unittest.TestCase):
 
     def test_threemf_mesh(self):
         d = tmpdir()
-        src = write_3mf(d / "a.3mf", model_xml(tri_mesh("1", UNIT_FOUR_PTS, UNIT_FOUR_TRIS), '<item objectid="1"/>'))
+        src = write_3mf(d / "a.3mf", model_xml(tri_mesh("1", UNIT_CUBE_PTS, UNIT_CUBE_TRIS), '<item objectid="1"/>'))
         ctx = self.ctx(src)
         res = threemf_mesh(ctx)
         self.assertTrue(res.ok)
@@ -244,6 +363,17 @@ class Adapters(unittest.TestCase):
         self.assertEqual(info["triangles"], 12)
         self.assertEqual(info["bbox"], [[0, 0, 0], [1, 1, 1]])
         self.assertEqual(ctx.out_path.read_bytes()[:4], b"glTF")
+
+    def test_size_warning_lands_in_sidecar_info(self):
+        d = tmpdir()
+        src = write_3mf(d / "a.3mf", model_xml(tri_mesh("1", UNIT_CUBE_PTS, UNIT_CUBE_TRIS), '<item objectid="1"/>'))
+        old = mesh.WARN_TRIANGLES
+        try:
+            mesh.WARN_TRIANGLES = 5
+            res = threemf_mesh(self.ctx(src))
+        finally:
+            mesh.WARN_TRIANGLES = old
+        self.assertTrue(any("large mesh" in w for w in res.meta["render_info"]["warnings"]))
 
     def test_stl_mesh(self):
         d = tmpdir()
@@ -306,7 +436,7 @@ class Planning(unittest.TestCase):
 class RunChain(unittest.TestCase):
     def test_mesh_render_published_and_indexed(self):
         d = tmpdir()
-        src = write_3mf(d / "a.3mf", model_xml(tri_mesh("1", UNIT_FOUR_PTS, UNIT_FOUR_TRIS), '<item objectid="1"/>'))
+        src = write_3mf(d / "a.3mf", model_xml(tri_mesh("1", UNIT_CUBE_PTS, UNIT_CUBE_TRIS), '<item objectid="1"/>'))
         reg = no_user_config()
         job = plan_jobs(reg, src, views=["interactive"])[0]
         root = d / "renders"

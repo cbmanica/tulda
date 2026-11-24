@@ -180,7 +180,9 @@ def write_glb(scene: Scene) -> bytes:
             materials.append(m)
         meshes.append({"name": p.name, "primitives": [
             {"attributes": {"POSITION": len(accessors) - 1}, "material": mat_index[key], "mode": 4}]})
-        extras = {"color": p.color.upper(), "triangles": p.n_tris, "visible": p.visible}
+        # glTF loaders sanitise node names (spaces, dots), so keep the real names in extras too
+        extras = {"name": p.name, "object": p.obj, "color": p.color.upper(), "triangles": p.n_tris,
+                  "visible": p.visible}
         if p.extruder is not None:
             extras["extruder"] = p.extruder
         if p.subtype != "normal_part":
