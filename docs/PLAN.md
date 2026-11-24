@@ -15,7 +15,7 @@
 
 ## Goal
 
-A LAN-only web server to view renders of CAD/print files being worked on, from any tool (OpenSCAD, CadQuery, build123d, slicers, mesh tools). The user SSHes into the Mac (host `myhost.local`, LAN IP `192.168.1.50`), generates renders from the CLI, and views them in a browser on a remote device. The first-party use case is OpenSCAD plus Bambu Studio, shipped as built-in adapters.
+A LAN-only web server to view renders of CAD/print files being worked on, from any tool (OpenSCAD, CadQuery, build123d, slicers, mesh tools). The user SSHes into the Mac (host `myhost.local`, LAN IP `192.0.2.10`), generates renders from the CLI, and views them in a browser on a remote device. The first-party use case is OpenSCAD plus Bambu Studio, shipped as built-in adapters.
 
 ## Findings
 

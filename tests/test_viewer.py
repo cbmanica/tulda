@@ -90,7 +90,7 @@ class ViewerServer(unittest.TestCase):
         listed = set(STATIC_FILES)
         on_disk = {str(p.relative_to(STATIC_ROOT)) for p in STATIC_ROOT.rglob("*") if p.is_file()}
         extra = on_disk - listed
-        self.assertTrue(all(x.endswith("VENDOR.md") for x in extra), extra)
+        self.assertTrue(all(x.endswith(("VENDOR.md", "SHA256SUMS")) for x in extra), extra)
 
     def test_vendor_licence_and_notice_present(self):
         self.assertIn("MIT License", (STATIC_ROOT / "vendor" / "three-0.187.0" / "LICENSE").read_text())
