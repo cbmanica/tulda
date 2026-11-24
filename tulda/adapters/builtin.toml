@@ -73,3 +73,29 @@ top       = { options = { camera_view = 4 } }
 bottom    = { options = { camera_view = 5 } }
 front     = { options = { camera_view = 6 } }
 rear      = { options = { camera_view = 7 } }
+
+# ---- mesh stage: sources -> .glb for the interactive viewer (/_v/<project>/<name>/) ----
+# These are selected by the `interactive` view (`tulda render --views interactive`), never by
+# normal PNG planning (kind = "mesh"). Python adapters: tulda/adapters/meshes.py.
+[adapter.mesh-scad]
+kind     = "mesh"
+accepts  = [".scad"]
+produces = "glb"
+stage    = "mesh"
+requires = ["openscad"]
+version_cmd = ["openscad", "--version"]
+python   = "builtin:scad_mesh"
+
+[adapter.mesh-3mf]
+kind     = "mesh"
+accepts  = [".3mf"]
+produces = "glb"
+stage    = "mesh"
+python   = "builtin:threemf_mesh"
+
+[adapter.mesh-stl]
+kind     = "mesh"
+accepts  = [".stl"]
+produces = "glb"
+stage    = "mesh"
+python   = "builtin:stl_mesh"

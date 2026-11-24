@@ -16,13 +16,30 @@ from pathlib import Path
 
 from .catalog import Catalog, CatalogError, Filters, valid_day
 from .gallery import render_index
-from .items import (DATE_PREFIX, GROUP_ID, GROUP_PREFIX, RESERVED_DIRS, group_fields,  # noqa: F401
+from .viewer import THREE_VERSION, render_viewer
+from .items import (DATE_PREFIX, STATIC_PREFIX, VIEWER_PREFIX, GROUP_ID, GROUP_PREFIX, RESERVED_DIRS, group_fields,  # noqa: F401
                     is_project_dir, read_item)
 
 
 ALLOWED_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".svg": "image/svg+xml", ".json": "application/json",
-               ".stl": "model/stl"}
+               ".stl": "model/stl", ".glb": "model/gltf-binary"}
+
+# /_s/<path>: files shipped inside the package (never the renders root), by explicit allowlist.
+# The vendored three.js lives in a version-named directory, so its URLs are immutable.
+STATIC_ROOT = Path(__file__).resolve().parent / "static"
+_JS = "application/javascript"
+THREE_DIR = f"vendor/three-{THREE_VERSION}/"
+STATIC_FILES = {
+    "viewer.js": _JS,
+    THREE_DIR + "build/three.module.js": _JS,
+    THREE_DIR + "build/three.core.js": _JS,
+    THREE_DIR + "examples/jsm/controls/OrbitControls.js": _JS,
+    THREE_DIR + "examples/jsm/loaders/GLTFLoader.js": _JS,
+    THREE_DIR + "examples/jsm/utils/BufferGeometryUtils.js": _JS,
+    THREE_DIR + "examples/jsm/utils/SkeletonUtils.js": _JS,
+    THREE_DIR + "LICENSE": "text/plain",
+}
 
 PAGE_SIZE = 20
 
@@ -121,11 +138,28 @@ class Handler(BaseHTTPRequestHandler):
         if not head:
             self.wfile.write(body)
 
-    def _send_page(self, html: str, head: bool):
+    def _send_page(self, html: str, head: bool, viewer: bool = False):
+        # The viewer page also loads same-origin ES modules (/_s/) and fetches the GLB.
+        csp = ("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
+               "script-src 'self' 'unsafe-inline'; connect-src 'self'" if viewer else
+               "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
+               "script-src 'unsafe-inline'; connect-src 'self'")
         return self._send(200, html.encode(), "text/html; charset=utf-8", head, {
             "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Content-Security-Policy": "default-src 'none'; img-src 'self'; "
-            "style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'"})
+            "Content-Security-Policy": csp})
+
+    def _static(self, rel: str, head: bool):
+        ctype = STATIC_FILES.get(rel)
+        if ctype is None:
+            return self._send(404, b"not found\n", head=head)
+        try:
+            data = (STATIC_ROOT / rel).read_bytes()
+        except OSError:
+            return self._send(404, b"not found\n", head=head)
+        # vendored files sit in a version-named directory: safe to cache forever. Our own
+        # scripts change with tulda, so they are revalidated on every load.
+        cache = "public, max-age=31536000, immutable" if rel.startswith("vendor/") else "no-cache"
+        return self._send(200, data, ctype, head, {"Cache-Control": cache})
 
     def _host_ok(self) -> bool:
         h = self.headers.get("Host")
@@ -176,6 +210,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(503, b"catalog unavailable; retry\n", head=head)
 
     def _route(self, route, gparts, q, path, root, cat, head):
+        if route == "/favicon.ico":      # no icon; 204 keeps browser consoles free of 404 noise
+            return self._send(204, head=head, extra={"Cache-Control": "public, max-age=86400"})
         cat.maybe_sync(self.server.sync_min_interval)
         if route == "/api/latest":
             return self._json(cat.latest(), head)
@@ -214,6 +250,15 @@ class Handler(BaseHTTPRequestHandler):
             if not g or not g["n_renders"]:
                 return self._send(404, b"no such group\n", head=head)
             return self._page({"kind": "group", "group": gparts[1]}, Filters(trash=True), head, [g], None)
+        if gparts and gparts[0] == STATIC_PREFIX:
+            return self._static("/".join(gparts[1:]), head)
+        if gparts and gparts[0] == VIEWER_PREFIX:
+            if len(gparts) != 3 or any(p.startswith(".") for p in gparts[1:]):
+                return self._send(404, b"not found\n", head=head)
+            r = cat.get_render(gparts[1], gparts[2])
+            if not r:
+                return self._send(404, b"no such render\n", head=head)
+            return self._send_page(render_viewer(r), head, viewer=True)
         try:
             target = safe_resolve(root, path)
         except PathError as e:
@@ -237,7 +282,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(size))
-            self.send_header("Cache-Control", "no-cache")
+            # meshes and turntable frames are named by timestamp and never rewritten
+            stable = target.suffix.lower() == ".glb" or target.parent.name.endswith(".frames")
+            self.send_header("Cache-Control", "public, max-age=3600" if stable else "no-cache")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
             self.end_headers()

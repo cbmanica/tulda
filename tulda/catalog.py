@@ -16,6 +16,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -26,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .errors import TuldaError
-from .items import GROUP_ID, is_project_dir, read_item, render_url
+from .items import GROUP_ID, RENDER_EXTS, is_project_dir, read_item, render_url, viewer_url
 
 TAG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 DAY_RE = re.compile(r"^(\d{4})-(\d{2})(?:-(\d{2}))?$")
@@ -65,6 +66,14 @@ def valid_day(s: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _load_info(text):
+    try:
+        v = json.loads(text) if text else None
+    except ValueError:
+        return None
+    return v if isinstance(v, dict) else None
 
 
 def iso(ts: float) -> str:
@@ -119,7 +128,16 @@ def _m3(c: sqlite3.Connection) -> None:
     c.execute("ALTER TABLE tags ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'")
 
 
-MIGRATIONS = [_m1, _m2, _m3]
+def _m4(c: sqlite3.Connection) -> None:
+    """Interactive views: `kind` is image (PNG), mesh (GLB for the 3D viewer) or turntable
+    (PNG poster + a frames directory); `info` is the sidecar's `info` object as JSON (triangle
+    count, parts, frame count...). Existing rows are plain images; the forced re-sync that
+    follows an upgrade backfills nothing else."""
+    c.execute("ALTER TABLE renders ADD COLUMN kind TEXT NOT NULL DEFAULT 'image'")
+    c.execute("ALTER TABLE renders ADD COLUMN info TEXT")
+
+
+MIGRATIONS = [_m1, _m2, _m3, _m4]
 SCHEMA_VERSION = len(MIGRATIONS)
 
 
@@ -354,20 +372,22 @@ class Catalog:
                     affected.add(old[0])
                 c.execute("""INSERT INTO renders(path,project,file,group_id,seq,adapter,stage,view,source,
                     source_type,source_sha256,tool_version,git_sha,git_dirty,has_sidecar,size,mtime,
-                    sidecar_mtime,created_utc,missing) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
+                    sidecar_mtime,created_utc,kind,info,missing) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
                     ON CONFLICT(path) DO UPDATE SET group_id=excluded.group_id, seq=excluded.seq,
                     adapter=excluded.adapter, stage=excluded.stage, view=excluded.view,
                     source=excluded.source, source_type=excluded.source_type,
                     source_sha256=excluded.source_sha256, tool_version=excluded.tool_version,
                     git_sha=excluded.git_sha, git_dirty=excluded.git_dirty,
                     has_sidecar=excluded.has_sidecar, size=excluded.size, mtime=excluded.mtime,
-                    sidecar_mtime=excluded.sidecar_mtime, created_utc=excluded.created_utc, missing=0""",
+                    sidecar_mtime=excluded.sidecar_mtime, created_utc=excluded.created_utc,
+                    kind=excluded.kind, info=excluded.info, missing=0""",
                           (path, it["project"], it["file"], it["group_id"], it["seq"], it["adapter"],
                            it["stage"], it["view"], it["source"], it["source_type"], it["source_sha256"],
                            it["tool_version"], it["git_sha"],
                            None if it["git_dirty"] is None else int(it["git_dirty"]),
                            1 if it["json_url"] else 0, it["size"], it["mtime"], it["sidecar_mtime"],
-                           it["created_utc"]))
+                           it["created_utc"], it["kind"],
+                           json.dumps(it["info"], separators=(",", ":")) if it["info"] else None))
                 groups.setdefault(it["group_id"], it)
             for gid, it in groups.items():
                 created = it["group_created_utc"]
@@ -460,7 +480,7 @@ class Catalog:
                         continue
                     low = n.lower()
                     try:
-                        if low.endswith(".png"):
+                        if low.endswith(RENDER_EXTS):
                             s = e.stat()
                             disk[n] = (s.st_mtime, s.st_size)
                         elif low.endswith(".json") and not low.endswith(".fail.json"):
@@ -651,7 +671,28 @@ class Catalog:
                 "git_sha": r["git_sha"], "git_dirty": None if r["git_dirty"] is None else bool(r["git_dirty"]),
                 "tool_version": r["tool_version"], "source_sha256": r["source_sha256"],
                 "group_id": r["group_id"], "seq": r["seq"], "size": r["size"],
-                "tag": source_tag(r["source"])}
+                "tag": source_tag(r["source"]), "kind": r["kind"],
+                "info": _load_info(r["info"]),
+                "viewer_url": viewer_url(r["project"], r["file"]) if r["kind"] != "image" else None}
+
+    def get_render(self, project: str, stem: str) -> dict | None:
+        """A mesh or turntable render by project and file stem (the /_v/ page's id), plus the
+        sibling turntable of the same group and source (the viewer's no-WebGL fallback)."""
+        with self.conn() as c:
+            r = c.execute("""SELECT * FROM renders WHERE project=? AND missing=0 AND kind!='image'
+                AND file IN (?, ?)""", (project, stem + ".glb", stem + ".png")).fetchone()
+            if not r:
+                return None
+            d = self._render_dict(r)
+            d["group_title"] = (c.execute("SELECT COALESCE(user_title,title) FROM groups WHERE id=?",
+                                          (r["group_id"],)).fetchone() or [None])[0]
+            d["turntable"] = None
+            if r["kind"] == "mesh":
+                t = c.execute("""SELECT * FROM renders WHERE group_id=? AND missing=0 AND kind='turntable'
+                    AND source IS ? ORDER BY seq LIMIT 1""", (r["group_id"], r["source"])).fetchone()
+                if t:
+                    d["turntable"] = self._render_dict(t)
+            return d
 
     def all_items(self, limit: int = 1000) -> list[dict]:
         with self.conn() as c:
@@ -839,15 +880,22 @@ def safe_delete_render(root: Path, project: str, file: str) -> list[str]:
     that is a symlink resolving outside root. A symlink inside root is removed itself,
     never its target. Returns the root-relative paths removed."""
     root = root.resolve()
-    if not (_plain_name(project) and _plain_name(file) and file.lower().endswith(".png")):
+    if not (_plain_name(project) and _plain_name(file) and file.lower().endswith(RENDER_EXTS)):
         raise CatalogError(f"refusing unsafe path {project!r}/{file!r}")
     pdir = root / project
     if os.path.islink(pdir) or not pdir.is_dir() or pdir.resolve().parent != root:
         raise CatalogError(f"refusing: {project!r} is not a plain directory directly under the renders root")
     removed = []
-    for name in (file, file[:-4] + ".json"):
+    for name in (file, file[:-4] + ".json", file[:-4] + ".frames"):
         p = pdir / name
         if not os.path.lexists(p):
+            continue
+        if name.endswith(".frames"):
+            # turntable frames: a plain directory of PNGs directly inside the project dir
+            if os.path.islink(p) or not p.is_dir() or p.resolve().parent != pdir.resolve():
+                raise CatalogError(f"refusing: {project}/{name} is not a plain frames directory")
+            shutil.rmtree(p)
+            removed.append(f"{project}/{name}/")
             continue
         if os.path.islink(p) and not p.resolve().is_relative_to(root):
             raise CatalogError(f"refusing: {project}/{name} is a symlink that leaves the renders root")

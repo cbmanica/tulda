@@ -1,0 +1,13 @@
+tulda
+Copyright 2026 the tulda authors
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product bundles third-party software:
+
+three.js r187 (npm `three@0.187.0`) - https://threejs.org/ - MIT License
+  Copyright (c) 2010-2026 three.js authors
+  Vendored, unmodified, in tulda/static/vendor/three-0.187.0/ (build/three.module.js,
+  build/three.core.js, examples/jsm/controls/OrbitControls.js,
+  examples/jsm/loaders/GLTFLoader.js, examples/jsm/utils/BufferGeometryUtils.js,
+  examples/jsm/utils/SkeletonUtils.js). The licence text is in
+  tulda/static/vendor/three-0.187.0/LICENSE; provenance and checksums are in VENDOR.md there.

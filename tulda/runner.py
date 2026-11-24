@@ -17,26 +17,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
+from .adapters.api import Context, Result  # noqa: F401
 from .adapters.bambu import BUILTIN_PY
 from .adapters.registry import Adapter, Registry, option_values, render_argv
 from .errors import ConfigError, MissingRequirement, StepFailed, StepTimeout, TuldaError
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
-
-
-@dataclass
-class Context:
-    in_path: Path
-    out_path: Path
-    options: dict
-    workdir: Path
-
-
-@dataclass
-class Result:
-    ok: bool = True
-    message: str = ""
-    meta: dict = field(default_factory=dict)
 
 
 def sha256(path: Path) -> str:
@@ -109,7 +95,12 @@ def run_step(reg: Registry, a: Adapter, in_path: Path, scratch: Path, idx: int,
     start = time.monotonic()
     if a.python:
         fn = _load_python(a)
-        res = fn(Context(in_path, out, opts, workdir))
+        try:
+            res = fn(Context(in_path, out, opts, workdir))
+        except TuldaError:
+            raise
+        except Exception as e:  # noqa: BLE001 - adapter bugs and bad input become a failed step
+            raise StepFailed(f"{a.id}: {type(e).__name__}: {e}") from e
         info.update(cmd=None, exit=0 if res.ok else 1, **res.meta)
         if not res.ok:
             raise StepFailed(f"{a.id}: {res.message}")
@@ -149,6 +140,8 @@ def run_step(reg: Registry, a: Adapter, in_path: Path, scratch: Path, idx: int,
         raise StepFailed(f"{a.id}: no output produced")
     if a.produces == "png" and out.read_bytes()[:8] != PNG_MAGIC:
         raise StepFailed(f"{a.id}: output is not a PNG")
+    if a.produces == "glb" and out.read_bytes()[:4] != b"glTF":
+        raise StepFailed(f"{a.id}: output is not a GLB")
     return out, info
 
 
@@ -188,10 +181,11 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
     term = chain[-1]
     proj_dir = renders_root / project
     proj_dir.mkdir(parents=True, exist_ok=True)
+    ext = ".glb" if term.produces == "glb" else ".png"
     prefix = f"{stamp}-{term.id}" + (f"-{view}" if view else "")
     base = f"{prefix}-{src.stem}"
     n = 1
-    while (proj_dir / f"{base}.png").exists() or (proj_dir / f"{base}.fail.json").exists():
+    while (proj_dir / f"{base}{ext}").exists() or (proj_dir / f"{base}.fail.json").exists():
         n += 1
         base = f"{prefix}-{src.stem}-{n}"
     scratch = Path(tempfile.mkdtemp(prefix="tulda-"))
@@ -219,11 +213,22 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
         }
         if view:
             sidecar["view"] = view
+        if term.kind != "image":
+            sidecar["kind"] = term.kind
+            info = steps[-1].get("render_info")
+            if info:
+                sidecar["info"] = info
+        for st in steps:
+            st.pop("render_info", None)
         if group:
             sidecar.update(group_id=group["id"], group_title=group.get("title"),
                            group_sources=group.get("sources"), request_cmd=group.get("command"),
                            group_created_utc=group.get("created_utc"), seq=seq)
-        png = proj_dir / f"{base}.png"
+        png = proj_dir / f"{base}{ext}"
+        if term.kind == "turntable":
+            frames = scratch / f"step{len(chain) - 1}-work" / "frames"
+            fdir = publish_frames(frames, proj_dir / f"{base}.frames")
+            sidecar.setdefault("info", {}).update(frames_dir=fdir.name)
         _atomic_write(png, src=cur)
         _atomic_write(proj_dir / f"{base}.json", json.dumps(sidecar, indent=2).encode())
         _index(renders_root, png)
@@ -234,6 +239,18 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
         return png
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def publish_frames(src: Path, dest: Path) -> Path:
+    """Move a directory of turntable frames into place (all-or-nothing)."""
+    if not src.is_dir() or not any(src.glob("f*.png")):
+        raise StepFailed("turntable produced no frames")
+    tmp = dest.with_name(f".{dest.name}.tmp{os.getpid()}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.copytree(src, tmp)
+    shutil.rmtree(dest, ignore_errors=True)
+    os.replace(tmp, dest)
+    return dest
 
 
 def _index(renders_root: Path, png: Path) -> None:

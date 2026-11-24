@@ -14,7 +14,13 @@ GROUP_ID = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 # /_g/<group id>/ and /_d/<date>/ are routes; project directories of these names are not listed.
 GROUP_PREFIX = "_g"
 DATE_PREFIX = "_d"
-RESERVED_DIRS = {GROUP_PREFIX, DATE_PREFIX}
+VIEWER_PREFIX = "_v"       # /_v/<project>/<name>/ is the interactive viewer page
+STATIC_PREFIX = "_s"       # /_s/<path> is vendored viewer assets from the package
+RESERVED_DIRS = {GROUP_PREFIX, DATE_PREFIX, VIEWER_PREFIX, STATIC_PREFIX}
+# What a catalog row's primary file may be: a PNG (kind image / turntable poster) or a GLB (kind mesh).
+RENDER_EXTS = (".png", ".glb")
+KINDS = ("image", "mesh", "turntable")
+MAX_INFO = 24 * 1024
 
 
 def _strs(v, limit=50) -> list[str]:
@@ -50,6 +56,12 @@ def render_url(project: str, file: str) -> str:
     return f"/{q(project)}/{q(file)}"
 
 
+def viewer_url(project: str, file: str) -> str:
+    """Interactive viewer page for a mesh/turntable render: /_v/<project>/<file stem>/."""
+    q = urllib.parse.quote
+    return f"/{VIEWER_PREFIX}/{q(project)}/{q(file.rsplit('.', 1)[0])}/"
+
+
 def is_project_dir(root: Path, pdir: Path) -> bool:
     if pdir.name.startswith(".") or pdir.name in RESERVED_DIRS:
         return False
@@ -60,9 +72,9 @@ def is_project_dir(root: Path, pdir: Path) -> bool:
 
 
 def read_item(root: Path, pdir: Path, png: Path) -> dict | None:
-    """One render as a dict, or None if it must not be listed (dotfile, not a PNG, symlink
+    """One render as a dict, or None if it must not be listed (dotfile, not a PNG/GLB, symlink
     escaping root, unreadable). root must be resolved."""
-    if png.name.startswith(".") or png.suffix.lower() != ".png":
+    if png.name.startswith(".") or png.suffix.lower() not in RENDER_EXTS:
         return None
     try:
         rp = png.resolve(strict=True)
@@ -85,7 +97,14 @@ def read_item(root: Path, pdir: Path, png: Path) -> dict | None:
     except (OSError, ValueError):
         meta = {}
     steps = meta.get("steps")
+    kind = meta.get("kind") if meta.get("kind") in KINDS else "image"
+    if png.suffix.lower() == ".glb":
+        kind = "mesh"
+    info = meta.get("info")
+    if not isinstance(info, dict) or len(json.dumps(info)) > MAX_INFO:
+        info = None
     return {
+        "kind": kind, "info": info,
         "project": pdir.name, "file": png.name,
         "url": render_url(pdir.name, png.name),
         "json_url": render_url(pdir.name, side.name) if meta else None,

@@ -65,7 +65,7 @@ def plan(reg: Registry, path: Path, adapter: str | None = None, stage: str | Non
     if adapter:
         return [explicit_chain(reg, ext, adapter, stage)]
     order = _order(reg)
-    enabled = [a for a in reg.adapters.values() if a.enabled]
+    enabled = [a for a in reg.adapters.values() if a.enabled and a.kind == "image"]
     ok = [a for a in enabled if not a.missing()]
     direct = sorted(
         [a for a in ok if ext in a.accepts and a.produces == "png" and (not stage or a.stage == stage)],
@@ -93,6 +93,7 @@ class Job:
     chain: list[Adapter]
     view: str | None = None
     options: dict = field(default_factory=dict)
+    kind: str = "image"
 
     @property
     def label(self) -> str:
@@ -111,21 +112,51 @@ def parse_views(*values) -> list[str]:
     return out
 
 
+# Views that are not camera presets of a PNG adapter: they pick a `kind` of adapter instead.
+SPECIAL_VIEWS = {"interactive": "mesh", "turntable": "turntable"}
+
+
+def plan_special(reg: Registry, path: Path, view: str) -> list[Adapter]:
+    """The single adapter producing the special view (`interactive` -> mesh GLB,
+    `turntable` -> PNG frames) for this source type. Highest priority, then config order."""
+    kind = SPECIAL_VIEWS[view]
+    ext = Path(path).suffix.lower()
+    order = _order(reg)
+    cands = [a for a in reg.adapters.values() if a.enabled and a.kind == kind and ext in a.accepts]
+    usable = sorted([a for a in cands if not a.missing()], key=lambda a: (-a.priority, order[a.id]))
+    if usable:
+        return [usable[0]]
+    if cands:
+        raise MissingRequirement(f"view {view!r} for {ext!r}: " + "; ".join(
+            f"{a.id} needs {', '.join(a.missing())}" for a in cands))
+    have = sorted({e for a in reg.adapters.values() if a.kind == kind for e in a.accepts})
+    raise NoAdapter(f"view {view!r} is not available for {ext or '(no extension)'!r}; "
+                    f"supported extensions: {', '.join(have) or 'none'}")
+
+
 def plan_jobs(reg: Registry, path: Path, adapter: str | None = None, stage: str | None = None,
               all_: bool = False, views: list[str] | None = None) -> list[Job]:
     """plan() plus view expansion. Requested views must exist on every chosen terminal
     adapter; with none requested, the terminal adapter's default_views are used
-    (adapters without views give one job with no view)."""
+    (adapters without views give one job with no view). The special views `interactive`
+    and `turntable` are handled by mesh/turntable adapters instead (see plan_special)."""
     jobs: list[Job] = []
-    for chain in plan(reg, path, adapter, stage, all_):
-        term = chain[-1]
-        names = views or term.default_views
-        if not names:
-            jobs.append(Job(chain))
-            continue
-        for n in names:
-            if n not in term.views:
-                known = ", ".join(term.views) or "none"
-                raise NoAdapter(f"adapter {term.id!r} has no view {n!r}; known views: {known}")
-            jobs.append(Job(chain, n, dict(term.views[n]["options"])))
+    views = views or []
+    special = [v for v in views if v in SPECIAL_VIEWS]
+    named = [v for v in views if v not in SPECIAL_VIEWS]
+    if named or not special:
+        for chain in plan(reg, path, adapter, stage, all_):
+            term = chain[-1]
+            names = named or term.default_views
+            if not names:
+                jobs.append(Job(chain))
+                continue
+            for n in names:
+                if n not in term.views:
+                    known = ", ".join(term.views) or "none"
+                    raise NoAdapter(f"adapter {term.id!r} has no view {n!r}; known views: {known}")
+                jobs.append(Job(chain, n, dict(term.views[n]["options"])))
+    for v in special:
+        chain = plan_special(reg, path, v)
+        jobs.append(Job(chain, v, {}, chain[-1].kind))
     return jobs

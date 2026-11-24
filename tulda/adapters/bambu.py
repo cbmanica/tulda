@@ -10,4 +10,6 @@ Register it in BUILTIN_PY as "bambu_plate" and add an [adapter.bambu-plate]
 entry (python = "builtin:bambu_plate", priority = -1) to builtin.toml.
 """
 
-BUILTIN_PY: dict = {}  # name -> callable(ctx) -> Result; empty until implemented
+from .meshes import MESH_PY
+
+BUILTIN_PY: dict = {**MESH_PY}  # name -> callable(ctx) -> Result

@@ -1,5 +1,5 @@
 renders/
-build/
+/build/
 __pycache__/
 *.pyc
 .venv/

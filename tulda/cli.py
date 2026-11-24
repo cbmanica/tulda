@@ -248,7 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--views", metavar="A,B", help="comma separated views, e.g. iso,bottom "
                    "(default: the adapter's default_views)")
     r.add_argument("--adapter", help="adapter id, a,b chain, or named chain")
-    r.add_argument("--stage", choices=["source", "built", "sliced"])
+    r.add_argument("--stage", choices=["source", "built", "sliced", "mesh"])
     r.add_argument("--all", action="store_true", help="render with every satisfiable terminal adapter")
     r.add_argument("--opt", action="append", metavar="K=V", help="override option, e.g. w=800")
     r.add_argument("--project")

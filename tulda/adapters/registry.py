@@ -13,7 +13,8 @@ from pathlib import Path
 from ..errors import ConfigError
 from . import probes
 
-STAGES = ("source", "built", "sliced")
+STAGES = ("source", "built", "sliced", "mesh")
+KINDS = ("image", "mesh", "turntable")
 BUILTIN_TOML = Path(__file__).with_name("builtin.toml")
 BASE_KEYS = {"in", "out", "name", "workdir", "w", "h"}
 _TOKEN = re.compile(r"\{\{|\}\}|\{(\w+)\}")
@@ -73,6 +74,7 @@ class Adapter:
     priority: int = 0
     out_glob: str | None = None
     enabled: bool = True
+    kind: str = "image"       # image: one PNG per view; mesh: .glb (interactive); turntable: PNG frames
     views: dict = field(default_factory=dict)
     default_views: list = field(default_factory=list)
     base_dir: Path = field(default_factory=Path.cwd)
@@ -88,6 +90,13 @@ class Adapter:
         accepts = [("." + a.lstrip(".")).lower() for a in d["accepts"]]
         produces = str(d["produces"]).lstrip(".").lower()
         stage = d.get("stage")
+        kind = d.get("kind", "image")
+        if kind not in KINDS:
+            raise err(f"bad kind {kind!r} (one of {', '.join(KINDS)})")
+        if kind == "mesh" and produces != "glb":
+            raise err("kind 'mesh' adapters must produce glb")
+        if kind == "turntable" and produces != "png":
+            raise err("kind 'turntable' adapters must produce png (frame 0 is the poster)")
         if produces == "png" and stage not in STAGES:
             raise err(f"png adapters need stage in {STAGES}")
         if stage is not None and stage not in STAGES:
@@ -110,7 +119,7 @@ class Adapter:
         if bad:
             raise err(f"default_views not declared in views: {', '.join(bad)}")
         return cls(
-            id=id, views=views, default_views=dv, accepts=accepts, produces=produces, stage=stage,
+            id=id, kind=kind, views=views, default_views=dv, accepts=accepts, produces=produces, stage=stage,
             requires=list(d.get("requires", [])), version_cmd=d.get("version_cmd"),
             cmd=d.get("cmd"), python=d.get("python"), timeout=float(d.get("timeout", 120)),
             env={str(k): str(v) for k, v in d.get("env", {}).items()}, cwd=d.get("cwd"),

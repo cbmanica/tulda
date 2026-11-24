@@ -20,3 +20,4 @@ packages = ["tulda", "tulda.adapters"]
 
 [tool.setuptools.package-data]
 "tulda.adapters" = ["builtin.toml"]
+"tulda" = ["static/*.js", "static/vendor/*/LICENSE", "static/vendor/*/VENDOR.md", "static/vendor/*/build/*.js", "static/vendor/*/examples/jsm/*/*.js"]
