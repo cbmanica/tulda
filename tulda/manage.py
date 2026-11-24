@@ -199,7 +199,7 @@ def add_manage_parsers(sub, common) -> None:
     ls.add_argument("--project")
     ls.add_argument("--since", metavar="DATE|AGE", help="YYYY-MM-DD (UTC) or e.g. 7d")
     ls.add_argument("--until", metavar="DATE|AGE")
-    ls.add_argument("--tag", action="append")
+    ls.add_argument("--tag", action="append", help="group tag (source-file stem or user tag); repeat to AND")
     ls.add_argument("--starred", action="store_true")
     ls.add_argument("--trashed", action="store_true", help="list only trashed groups")
     ls.add_argument("--limit", type=int, default=50, help="0 = all (default 50)")
@@ -225,7 +225,7 @@ def add_manage_parsers(sub, common) -> None:
     sp.add_argument("text")
     common(sp)
     for name in ("tag", "untag"):
-        sp = gs.add_parser(name, help=f"{name} a group")
+        sp = gs.add_parser(name, help=f"{name} a group with user tags (source-name tags are automatic and cannot be removed)")
         sp.add_argument("id")
         sp.add_argument("tags", nargs="+")
         common(sp)

@@ -72,6 +72,16 @@ starred, "show trash". JSON: `/api/groups`, `/api/dates`, `/api/latest`. All cha
     tulda trash empty [--yes]
     tulda db reindex|stats|vacuum|check   # reindex keeps all metadata
 
+Tags: every group automatically gets one tag per distinct source file of its renders, the
+file stem lower-cased (`nfc_holder_body_pizza.scad` -> `nfc_holder_body_pizza`, `x.3mf` -> `x`). These
+"auto" tags are stored with `kind='auto'`, regenerated on every index and by `tulda db reindex`, shown
+prominently on group headers and under each image, and clickable (`/?tag=<name>`; the tag chips show
+group counts). User tags (`tulda group tag`) are kept separately and survive reindex. Auto tags cannot be
+removed with `untag` (they follow the render sources; trash or rename the group instead). The project name
+is deliberately not a tag (it is already a nav entry and filter). Tag filter, `/search?q=` and
+`tulda ls --tag` all match both kinds. Pagination is exact: the server reports `has_more` and the page
+only shows "Load more requests" when it is true.
+
 `tulda serve --sync-interval SEC` (default 30) re-syncs the index with the disk so renders
 copied in from elsewhere show up.
 

@@ -123,7 +123,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_page(self, html: str, head: bool):
         return self._send(200, html.encode(), "text/html; charset=utf-8", head, {
-            "Cache-Control": "no-store",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
             "Content-Security-Policy": "default-src 'none'; img-src 'self'; "
             "style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'"})
 
@@ -147,10 +147,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _page(self, ctx: dict, f: Filters, head: bool, groups=None, nxt=None):
         cat: Catalog = self.server.catalog
+        rev = cat.rev()     # read BEFORE the data: a write in between makes the page look stale, never fresh
         if groups is None:
             groups, nxt = cat.list_groups(f, PAGE_SIZE)
-        data = {"ctx": ctx, "groups": groups, "next": nxt, "facets": cat.facets(),
-                "dates": cat.dates(f.trash), "rev": cat.rev(), "qs": filters_qs(f),
+        data = {"ctx": ctx, "groups": groups, "next": nxt, "has_more": nxt is not None,
+                "page_size": PAGE_SIZE, "facets": cat.facets(),
+                "dates": cat.dates(f.trash), "rev": rev, "qs": filters_qs(f),
                 "filters": {"adapter": f.adapters, "stage": f.stages, "view": f.views, "tag": f.tags,
                             "starred": f.starred, "trash": f.trash}}
         return self._send_page(render_index(data), head)
@@ -196,7 +198,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 lim = PAGE_SIZE
             groups, nxt = cat.list_groups(f, lim, (q.get("cursor") or [None])[0])
-            return self._json({"groups": groups, "next": nxt}, head)
+            return self._json({"groups": groups, "next": nxt, "has_more": nxt is not None}, head)
         if route == "/search":
             f = parse_filters(q)
             return self._page({"kind": "search", "q": f.q or ""}, f, head)

@@ -41,6 +41,10 @@ def mk(root: Path, project: str, gid: str | None, created: str, name: str = "a",
     return d / f"{base}.png"
 
 
+def utags(g):
+    return [t for t in g["tags"] if t not in g["auto_tags"]]
+
+
 def fresh_root():
     return Path(tempfile.mkdtemp()).resolve() / "renders"
 
@@ -76,7 +80,7 @@ class Migrations(unittest.TestCase):
                     "'20261124T100000Z-pizza',1)")
         raw.close()
         cat, _ = quiet(root)
-        self.assertEqual(cat.stats()["schema_version"], 2)
+        self.assertEqual(cat.stats()["schema_version"], cm.SCHEMA_VERSION)
         g = cat.get_group("20261124T100000Z-pizza")
         self.assertTrue(g["starred"])          # v1 data survived
         self.assertTrue(cat.fts)
@@ -121,7 +125,7 @@ class Reindex(unittest.TestCase):
             self.cat.sync(force=True)
         self.assertEqual(self.snapshot(), before)
         g1 = self.cat.get_group(self.g1)
-        self.assertEqual((g1["starred"], g1["tags"], g1["notes"]), (True, ["keep", "nfc"], "hello"))
+        self.assertEqual((g1["starred"], utags(g1), g1["notes"]), (True, ["keep", "nfc"], "hello"))
         g2 = self.cat.get_group(self.g2)
         self.assertEqual(g2["title"], "My title")
         self.assertEqual(g2["auto_title"], "Two")
@@ -208,7 +212,7 @@ class Corruption(unittest.TestCase):
         cat2.stats()
         cat2._restore_meta(s)
         g = cat2.get_group(gid)
-        self.assertEqual((g["starred"], g["tags"]), (True, ["x"]))
+        self.assertEqual((g["starred"], utags(g)), (True, ["x"]))
 
 
 class Concurrency(unittest.TestCase):
@@ -662,3 +666,178 @@ class ServerCatalog(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def get(port, path):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request("GET", path)
+    r = c.getresponse()
+    return r.status, r.read(), r
+
+
+class Serving:
+    def start(self, root):
+        self.srv = make_server(root, "127.0.0.1", 0)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+    def page_data(self, path="/"):
+        s, b, r = get(self.port, path)
+        assert s == 200, s
+        txt = b.decode().split('id="data">', 1)[1].split("</script>", 1)[0]
+        return json.loads(txt), r
+
+    def api(self, path):
+        return json.loads(get(self.port, path)[1])
+
+
+class LatestStability(unittest.TestCase):
+    def setUp(self):
+        self.root = fresh_root()
+        mk(self.root, "p", "20261124T100000Z-a", "2026-11-24T10:00:00Z", "a", title="A")
+        self.s = Serving()
+        self.s.start(self.root)
+        self.addCleanup(self.s.stop)
+
+    def test_page_baseline_matches_latest_and_is_stable(self):
+        d, r = self.s.page_data()
+        self.assertIn("no-cache", r.getheader("Cache-Control"))
+        for _ in range(3):
+            self.assertEqual(self.s.api("/api/latest")["rev"], d["rev"])
+        d2, _ = self.s.page_data("/p/")
+        self.assertEqual(d2["rev"], d["rev"])
+
+    def test_sync_without_new_files_does_not_change_value(self):
+        d, _ = self.s.page_data()
+        before = self.s.api("/api/latest")
+        self.s.srv.catalog.sync()
+        self.s.srv.catalog.sync(force=False)
+        time.sleep(0.05)
+        self.s.srv.catalog.maybe_sync(0)
+        self.assertEqual(self.s.api("/api/latest"), before)
+        self.assertEqual(before["rev"], d["rev"])
+
+    def test_new_render_changes_value_once(self):
+        d, _ = self.s.page_data()
+        mk(self.root, "p", "20261124T110000Z-b", "2026-11-24T11:00:00Z", "b", title="B")
+        self.s.srv.catalog.sync()
+        self.assertNotEqual(self.s.api("/api/latest")["rev"], d["rev"])
+        d2, _ = self.s.page_data()
+        self.assertEqual(self.s.api("/api/latest")["rev"], d2["rev"])
+
+    def test_hidden_attribute_not_overridden_by_css(self):
+        s, b, _ = get(self.s.port, "/")
+        self.assertIn("[hidden]{display:none!important}", b.decode())
+
+
+class Pagination(unittest.TestCase):
+    def build(self, n):
+        root = fresh_root()
+        for i in range(n):
+            mk(root, "p", f"20261124T{10 + i // 60:02d}{i % 60:02d}00Z-g{i}", f"2026-11-24T{10 + i // 60:02d}:{i % 60:02d}:00Z",
+               f"n{i}", title=f"G{i}")
+        s = Serving()
+        s.start(root)
+        self.addCleanup(s.stop)
+        return s
+
+    def test_exact_boundary_and_one_over(self):
+        from tulda.server import PAGE_SIZE
+        for n, more in ((PAGE_SIZE - 1, False), (PAGE_SIZE, False), (PAGE_SIZE + 1, True)):
+            s = self.build(n)
+            for path in ("/", "/p/", "/_d/2026-11-24/", "/search?q=G", "/?tag=n0"):
+                d, _ = s.page_data(path)
+                if path == "/?tag=n0":
+                    self.assertFalse(d["has_more"])
+                    continue
+                self.assertEqual(d["has_more"], more, (n, path))
+                self.assertEqual(d["next"] is not None, more)
+                self.assertEqual(len(d["groups"]), min(n, PAGE_SIZE))
+            s.stop()
+            self.addCleanup(lambda: None)
+
+    def test_api_pages_end_with_has_more_false(self):
+        s = self.build(25)
+        a = s.api("/api/groups?limit=20")
+        self.assertTrue(a["has_more"])
+        b = s.api("/api/groups?limit=20&cursor=" + a["next"].replace("~", "%7E"))
+        self.assertEqual((len(b["groups"]), b["has_more"], b["next"]), (5, False, None))
+        s2 = self.build(20)
+        self.assertFalse(s2.api("/api/groups?limit=20")["has_more"])
+
+
+class AutoTags(unittest.TestCase):
+    def setUp(self):
+        self.root = fresh_root()
+        mk(self.root, "nfc", "20261124T100000Z-pz", "2026-11-24T10:00:00Z", "nfc_holder_body_pizza",
+           title="Pizza", sources=("nfc_holder_body_pizza.scad", "t.3mf"))
+        p = mk(self.root, "build", "20261124T100000Z-pz", "2026-11-24T10:00:01Z", "nfc_teardrop_pizza",
+               title="Pizza", adapter="bambu-export-png")
+        sc = p.with_suffix(".json")
+        m = json.loads(sc.read_text())
+        m["source"] = "nfc_teardrop_pizza.3mf"
+        sc.write_text(json.dumps(m))
+        self.cat, _ = quiet(self.root)
+        self.gid = "20261124T100000Z-pz"
+
+    def test_source_tags_derived(self):
+        g = self.cat.get_group(self.gid)
+        self.assertEqual(g["auto_tags"], ["nfc_holder_body_pizza", "nfc_teardrop_pizza"])
+        self.assertEqual({i["tag"] for i in g["items"]}, {"nfc_holder_body_pizza", "nfc_teardrop_pizza"})
+        self.assertEqual(cm.source_tag("/x/Foo Bar.SCAD"), "foo_bar")
+        self.assertIsNone(cm.source_tag(None))
+
+    def test_filter_and_search_match_source_tags(self):
+        for f in (Filters(tags=["nfc_holder_body_pizza"]), Filters(q="nfc_holder_body_pizza"),
+                  Filters(q="nfc_teardrop")):
+            self.assertEqual([g["id"] for g in self.cat.list_groups(f)[0]], [self.gid])
+        self.assertEqual(self.cat.list_groups(Filters(tags=["nope"]))[0], [])
+        self.assertIn(["nfc_teardrop_pizza", 1], self.cat.facets()["tags"])
+
+    def test_user_tags_independent_of_auto(self):
+        self.cat.add_tags(self.gid, ["keep"])
+        with self.assertRaises(CatalogError):
+            self.cat.remove_tags(self.gid, ["nfc_teardrop_pizza"])
+        self.cat.remove_tags(self.gid, ["keep"])
+        self.assertEqual(utags(self.cat.get_group(self.gid)), [])
+        self.cat.add_tags(self.gid, ["keep"])
+        self.cat.sync(force=True)       # reindex keeps user tags and regenerates auto tags
+        g = self.cat.get_group(self.gid)
+        self.assertEqual(utags(g), ["keep"])
+        self.assertEqual(len(g["auto_tags"]), 2)
+
+    def test_reindex_regenerates_and_prunes_auto_tags(self):
+        with self.cat.conn(True) as c:
+            c.execute("DELETE FROM tags WHERE kind='auto'")
+            c.execute("INSERT INTO tags(group_id,tag,kind) VALUES(?,?,'auto')", (self.gid, "stale"))
+        self.cat.sync(force=True)
+        self.assertEqual(self.cat.get_group(self.gid)["auto_tags"], ["nfc_holder_body_pizza", "nfc_teardrop_pizza"])
+
+    def test_upgrade_from_v2_backfills(self):
+        root = fresh_root()
+        mk(root, "p", "20261124T100000Z-x", "2026-11-24T10:00:00Z", "widget", title="X")
+        (root / ".tulda").mkdir()
+        raw = sqlite3.connect(root / ".tulda" / "catalog.db", isolation_level=None)
+        cm._m1(raw)
+        cm._m2(raw)
+        raw.execute("PRAGMA user_version=2")
+        raw.execute("INSERT INTO groups(id,sources,day,last_mtime,n_renders) VALUES('20261124T100000Z-x','[]',"
+                    "'2026-11-24',1,1)")
+        raw.execute("INSERT INTO tags VALUES('20261124T100000Z-x','mine')")
+        raw.close()
+        cat, _ = quiet(root)
+        cat.ensure()
+        g = cat.get_group("20261124T100000Z-x")
+        self.assertEqual((g["auto_tags"], utags(g)), (["widget"], ["mine"]))
+
+    def test_tag_url_serves_group(self):
+        s = Serving()
+        s.start(self.root)
+        self.addCleanup(s.stop)
+        d, _ = s.page_data("/?tag=nfc_holder_body_pizza")
+        self.assertEqual([g["id"] for g in d["groups"]], [self.gid])
+        self.assertFalse(d["has_more"])

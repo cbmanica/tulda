@@ -332,3 +332,20 @@ Not found: any existing project that is a LAN image-gallery server for OpenSCAD/
   - 3mfthumb's "embedded thumbnail else render the mesh" is effectively our selection rule (`bambu-plate` first, mesh fallback second), which strengthens that design choice.
   - bambuuzle and Printernizer remain Bambu-specific; they inform only the built-in Bambu adapters, which is where that knowledge now belongs.
   - Nothing found changes the decision to keep the core stdlib-only.
+
+
+## Tags and pagination (addendum)
+
+- `tags(group_id, tag, kind)`; `kind` is `user` or `auto` (schema v3). Auto tags = stems of the
+  `source` of each non-missing render in the group, recomputed in the same transaction as any index
+  change, so `db reindex` regenerates them and never touches user tags. A user tag with the same name
+  as an auto tag stays a user tag. Upgrading from v2 forces a full re-sync, which backfills auto tags.
+  `untag` refuses auto tags (decision: not removable, to keep the model simple; no hide flag).
+- The project name is not an auto tag: it is already a facet and would add one tag to every group.
+- The page's `rev` is read before the group list and compared with `/api/latest`'s `rev`; both come
+  from `meta.rev`, which only changes when renders are indexed/removed or metadata is edited. A sync
+  with no new files does not bump it. The "new renders" button once showed permanently because
+  `#fresh{display:block}` overrode the `hidden` attribute; the stylesheet now has
+  `[hidden]{display:none!important}` (same fix for "Load more"). HTML is sent `no-cache, no-store`.
+- `/api/groups` and the page data carry `has_more` (fetch limit+1); the client also stops on an
+  empty or short page.

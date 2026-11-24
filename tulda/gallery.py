@@ -10,6 +10,7 @@ PAGE = r"""<!doctype html>
 <style>
 :root{--bg:#fff;--fg:#1c1c1e;--mut:#6b6b70;--card:#f2f2f5;--acc:#2e8b57;--line:#d8d8de}
 @media (prefers-color-scheme:dark){:root{--bg:#121214;--fg:#eee;--mut:#9a9aa2;--card:#1d1d21;--acc:#4fc58a;--line:#33333a}}
+[hidden]{display:none!important}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif}
 header{padding:12px 16px;border-bottom:1px solid var(--line)}
 .top{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px}
@@ -39,6 +40,9 @@ details[open]>summary .caret::before{transform:rotate(90deg)}
 .gh h2{font-size:16px;margin:0;overflow-wrap:anywhere;flex:1 1 160px;min-width:0}
 .gh .t{color:var(--mut);font-size:12px}.gh a.o{font-size:12px;color:var(--acc)}
 .tg{font-size:11px;padding:0 7px;border-radius:9px;border:1px solid var(--line);color:var(--mut)}
+.tg{text-decoration:none}a.tg:hover{border-color:var(--acc);color:var(--fg)}
+.tg.src{font-size:12px;padding:1px 9px;color:var(--acc);border-color:var(--acc);font-weight:600}
+.card .m a.tg{display:inline-block;margin-top:3px}
 .star{color:#d9a400}
 .ths{display:flex;gap:3px}.ths img{width:36px;height:27px;object-fit:contain;border-radius:3px;background:#8884}
 details[open]>summary .ths{display:none}
@@ -86,7 +90,7 @@ const D=JSON.parse(document.getElementById('data').textContent);
 const ctx=D.ctx,F=D.filters,single=ctx.kind==='group';
 const $=id=>document.getElementById(id);
 const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-let compare=false,picks=[],view=[],next=D.next,loaded=D.groups.slice();
+let compare=false,picks=[],view=[],next=D.next,hasMore=!!D.has_more&&!!D.next,loaded=D.groups.slice();
 function el(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
 function fmt(s){if(!s)return '';const d=new Date(s);return isNaN(d)?s:d.toLocaleString([], {dateStyle:'medium',timeStyle:'short'})}
 // ---- fold state, per browser
@@ -111,7 +115,7 @@ function chips(){const c=$('chips');c.textContent='';
  const fx=D.facets;
  [['adapter',fx.adapters],['stage',fx.stages],['view',fx.views],['tag',fx.tags]].forEach(([k,vals])=>{
   const act=F[k]||[];if(vals.length<2&&!act.length)return;c.append(el('span','lbl',k));
-  vals.forEach(([v])=>c.append(link('chip'+(act.includes(v)?' on':''),v,toggleVal(k,v))));
+  vals.forEach(([v,n])=>c.append(link('chip'+(act.includes(v)?' on':''),k==='tag'?v+' ('+n+')':v,toggleVal(k,v))));
   act.filter(v=>!vals.some(x=>x[0]===v)).forEach(v=>c.append(link('chip on',v,toggleVal(k,v))))});
  c.append(link('chip'+(F.starred?' on':''),'★ starred',toggleFlag('starred')));
  if(fx.trashed||F.trash)c.append(link('chip'+(F.trash?' on':''),'show trash ('+fx.trashed+')',toggleFlag('trash')))}
@@ -127,10 +131,13 @@ function dates(){const b=$('dbody');b.textContent='';const ys=new Map();
  if(ctx.day)$('dates').open=true}
 // ---- groups
 function title(g){return g.title||(g.legacy?'':g.sources.join(', '))||g.id}
+function tagLink(t,cls){const a=link('tg '+cls,t,'/?tag='+encodeURIComponent(t));a.title='show requests tagged '+t;
+ a.onclick=e=>e.stopPropagation();return a}
 function card(i){const c=el('div','card');c._i=i;c.tabIndex=0;c.setAttribute('role','button');
  const im=el('img');im.src=i.url;im.loading='lazy';im.decoding='async';im.alt=i.file;c.append(im);
  if(i.view)c.append(el('span','badge',i.view));
  const m=el('div','m');m.append(el('b','',i.source||i.file),el('div','',i.adapter+' / '+i.stage+(ctx.project?'':' / '+i.project)));
+ if(i.tag)m.append(tagLink(i.tag,'src'));
  c.append(m);const go=()=>compare?pick(i):openCard(c);c.onclick=go;
  c.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();go()}};return c}
 function buildBody(root,g){if(root._built)return;root._built=true;const b=root.querySelector('.bd');
@@ -142,7 +149,7 @@ function groupEl(g,first){
  h.append(el('h2','',title(g)));
  if(g.starred){const s=el('span','star','★');s.title='starred';h.append(s)}
  if(g.trashed)h.append(el('span','tg','trashed'));
- g.tags.forEach(t=>h.append(el('span','tg',t)));
+ const au=g.auto_tags||[];au.forEach(t=>h.append(tagLink(t,'src')));g.tags.filter(t=>!au.includes(t)).forEach(t=>h.append(tagLink(t,'')));
  const srcs=g.sources.length||new Set(g.items.map(i=>i.source).filter(Boolean)).size;
  const when=g.created?fmt(g.created):fmt(new Date(g.mtime*1000).toISOString());
  h.append(el('span','t',when+' | '+srcs+' source'+(srcs==1?'':'s')+' | '+g.items.length+' image'+(g.items.length==1?'':'s')));
@@ -161,14 +168,15 @@ function groupEl(g,first){
   if(root.open===root._state)return;root._state=root.open;fold[g.id]=root.open;saveFold()});
  return root}
 function addGroups(gs,first){gs.forEach((g,ix)=>$('groups').append(groupEl(g,first&&ix===0)));
- $('more').hidden=!next;$('empty').hidden=loaded.length>0;
- $('info').textContent=loaded.length+' request'+(loaded.length==1?'':'s')+(next?' (more available)':'');
+ $('more').hidden=!(hasMore&&next);$('empty').hidden=loaded.length>0;
+ $('info').textContent=loaded.length+' request'+(loaded.length==1?'':'s')+(hasMore&&next?' (more available)':'');
  $('bar').hidden=single}
 function setAll(v){document.querySelectorAll('#groups details.grp').forEach(d=>{d.open=v})}
 $('expall').onclick=()=>setAll(true);$('colall').onclick=()=>setAll(false);
 $('more').onclick=async()=>{const b=$('more');b.disabled=true;
- try{const r=await fetch('/api/groups?'+D.qs+'&cursor='+encodeURIComponent(next));if(!r.ok)throw new Error(r.status);
-  const j=await r.json();loaded.push(...j.groups);next=j.next;addGroups(j.groups,false)}
+ try{const r=await fetch('/api/groups?'+D.qs+'&limit='+D.page_size+'&cursor='+encodeURIComponent(next));if(!r.ok)throw new Error(r.status);
+  const j=await r.json();loaded.push(...j.groups);next=j.next;
+  hasMore=!!j.has_more&&!!j.next&&j.groups.length>=D.page_size;addGroups(j.groups,false)}
  catch(e){$('info').textContent='Could not load more ('+e.message+')'}b.disabled=false};
 // ---- lightbox / compare over the visible cards
 const cards=()=>[...document.querySelectorAll('#groups .card')].filter(c=>c.offsetParent!==null);
