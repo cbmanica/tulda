@@ -4,9 +4,9 @@ LAN-only gallery for renders of CAD/print files, plus a small tool-agnostic
 adapter runner that produces those renders. Python >= 3.11, stdlib only (no
 third-party runtime dependencies). Design: [docs/PLAN.md](docs/PLAN.md).
 
-Status: phases 1-2 plus the adapter core. Built-in adapters: `openscad`
+Status: phases 1-2 plus the adapter core, request groups and named views. Built-in adapters: `openscad`
 (.scad) and `bambu-export-png` (.3mf, Bambu Studio headless). Not yet: the
-`bambu-plate` fallback, chaining examples, live refresh, compare view, STL
+`bambu-plate` fallback, chaining examples, live refresh, STL
 viewer (see the plan's phases).
 
 ## Install / run
@@ -17,12 +17,39 @@ viewer (see the plan's phases).
     uv run tulda adapters
     python3 -m unittest discover -s tests -t .
 
+`tulda render a.scad b.scad c.3mf` accepts several files; everything one invocation
+produces is ONE request ("group"): id `<UTC stamp>-<slug>` (slug from `--title`/`--group`,
+else the first file's name), optional human title, source list and the command, all stored
+in each sidecar (`group_id`, `group_title`, `group_sources`, `request_cmd`, `seq`, `view`).
+Sidecars without a `group_id` (older renders) are shown as ungrouped, one group per UTC day.
+
 Renders live under `$TULDA_RENDERS`, `--renders-root`, or `[defaults] renders_root`
 in config, default `~/.local/share/tulda/renders`, laid out as
-`<project>/<UTC-stamp>-<adapter>-<name>.png` with a `.json` sidecar (adapter,
+`<project>/<UTC-stamp>-<adapter>[-<view>]-<name>.png` with a `.json` sidecar (adapter,
 stage, tool version, command, source sha256, git sha, timestamp). The project
 defaults to the input's parent directory name. `render` prints
 `http://<LocalHostName>.local:8765/<project>/`.
+
+Pages: `/` is "Recent requests" (groups newest first, across all projects, so a request
+that spans `nfc_teardrop/` and `build/` stays together); `/<project>/` is the same view
+limited to one project; `/_g/<group id>/` is one request (shows the full command).
+Each group is a card with title, time, source files and thumbnails (with a view badge);
+chips filter by adapter, stage and view; "Compare" lets you tap two images to see them
+side by side. (A project directory named `_g` is not listed.)
+
+Views: an adapter declares named camera presets (`[adapter.X.views]`, each an `options`
+table) and `default_views`. `--view bottom` (repeatable) or `--views iso,bottom` picks
+them; with neither, the adapter's defaults are used. Each view is its own PNG, labelled
+in the sidecar and UI. Built-in views:
+
+- `openscad` (default `iso`, `bottom`): `iso top bottom front back left right`, via
+  `--camera=0,0,0,rx,ry,rz,0 --autocenter --viewall`.
+- `bambu-export-png` (default `iso`, `bottom`): `--camera-view N`. `--help` documents
+  0 iso, 1 top-front, 2 left, 3 right (10-12 iso variants) and NO bottom. Probing Bambu
+  Studio 02.09.01.70 showed undocumented 4 = top, 5 = bottom, 6 = front, 7 = rear; 5
+  renders the underside in real filament colours, so a bed-face inlay (the pizza on the
+  NFC tag) is visible. If a future Studio drops those, point the `bottom` view at an
+  OpenSCAD-based fallback; there is no 3mf-to-mesh converter yet.
 
 Useful flags: `--adapter ID` (or `a,b` chain or a named chain), `--stage
 source|built|sliced`, `--all`, `--opt w=800`, `--project`, `--keep`, `--config`.

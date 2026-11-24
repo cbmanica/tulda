@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -160,19 +161,39 @@ def _atomic_write(dest: Path, data: bytes | None = None, src: Path | None = None
     os.replace(tmp, dest)
 
 
+def slugify(text: str, default: str = "render") -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40].strip("-")
+    return s or default
+
+
+def make_group(title: str | None, sources: list[Path], command: str,
+               now: datetime | None = None) -> dict:
+    """A render request: id = UTC stamp + short slug (from the title, else the first
+    source's stem). Shared by every PNG the request produces."""
+    now = now or datetime.now(timezone.utc)
+    names = [p.name for p in sources]
+    slug = slugify(title or (sources[0].stem if sources else ""))
+    return {"id": f"{now.strftime('%Y%m%dT%H%M%SZ')}-{slug}", "title": title or None,
+            "sources": names, "command": command,
+            "created_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+
 def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path,
-              project: str, cli_opts: dict | None = None, keep: bool = False) -> Path:
-    cli_opts = cli_opts or {}
+              project: str, cli_opts: dict | None = None, keep: bool = False,
+              group: dict | None = None, view: str | None = None,
+              view_opts: dict | None = None, seq: int = 0) -> Path:
+    cli_opts = {**(view_opts or {}), **(cli_opts or {})}
     src = src.resolve()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     term = chain[-1]
     proj_dir = renders_root / project
     proj_dir.mkdir(parents=True, exist_ok=True)
-    base = f"{stamp}-{term.id}-{src.stem}"
+    prefix = f"{stamp}-{term.id}" + (f"-{view}" if view else "")
+    base = f"{prefix}-{src.stem}"
     n = 1
     while (proj_dir / f"{base}.png").exists() or (proj_dir / f"{base}.fail.json").exists():
         n += 1
-        base = f"{stamp}-{term.id}-{src.stem}-{n}"
+        base = f"{prefix}-{src.stem}-{n}"
     scratch = Path(tempfile.mkdtemp(prefix="tulda-"))
     steps: list[dict] = []
     try:
@@ -184,7 +205,8 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
         except TuldaError as e:
             _atomic_write(proj_dir / f"{base}.fail.json", json.dumps(
                 {"schema": 1, "error": str(e), "code": e.code, "source": str(src),
-                 "steps": steps, "created_utc": _now()}, indent=2).encode())
+                 "steps": steps, "created_utc": _now(),
+                 **({"group_id": group["id"], "view": view} if group else {})}, indent=2).encode())
             raise
         opts = option_values(reg, term, cli_opts)
         sidecar = {
@@ -195,6 +217,12 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
             "options": {k: v for k, v in opts.items() if not isinstance(v, list)},
             "tulda_version": __version__, "created_utc": _now(),
         }
+        if view:
+            sidecar["view"] = view
+        if group:
+            sidecar.update(group_id=group["id"], group_title=group.get("title"),
+                           group_sources=group.get("sources"), request_cmd=group.get("command"),
+                           group_created_utc=group.get("created_utc"), seq=seq)
         png = proj_dir / f"{base}.png"
         _atomic_write(png, src=cur)
         _atomic_write(proj_dir / f"{base}.json", json.dumps(sidecar, indent=2).encode())

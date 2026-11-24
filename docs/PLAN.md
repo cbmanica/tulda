@@ -192,6 +192,12 @@ Each step writes into a per-run scratch dir; step N's `{out}` becomes step N+1's
 - Hard part: Bambu plate PNG reliability. Needs a spike (sliced via Studio vs headless; one source claimed `plate_1.png` is blank if sliced headlessly; unverified).
 - Later, `render watch` reuses the fswatch idea; it just re-runs `render <file>` on change.
 
+## Request groups and views (added 2026-11-24)
+
+- A render request (one `tulda render a b c` invocation) is a group: id `<UTC stamp>-<slug>`, optional title (`--title`/`--group`), sources, command. Stored in every sidecar (`group_id`, `group_title`, `group_sources`, `request_cmd`, `group_created_utc`, `seq`). The on-disk layout stays `<project>/...` (a request can span projects); grouping happens at read time, so old sidecars work and appear as one `legacy-YYYYMMDD` group per UTC day.
+- Landing page `/` lists groups newest first across all projects; `/<project>/` filters the same view; `/_g/<id>/` shows one group. Group ids are validated against `[A-Za-z0-9._-]{1,100}` and only matched against scanned data, never mapped to paths.
+- Views are per-adapter named option sets (`views.<name>.options`) plus `default_views`; the view name goes in the filename and sidecar (`view`). Bambu Studio has no documented bottom view; `--camera-view 5` is an empirically verified undocumented bottom (4 top, 6 front, 7 rear) on 02.09.01.70. Fallback if that disappears: extract the 3mf meshes (zipfile/xml, apply build transforms) to STL and render with OpenSCAD `--camera=...,180,0,0,0`. Not implemented.
+
 ## Sidecar metadata schema
 
 `<name>.json`, written atomically next to the PNG:

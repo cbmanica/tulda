@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import sys
 import urllib.parse
 from pathlib import Path
 
 from . import __version__
-from .adapters import load_registry, plan
+from .adapters import load_registry, parse_views, plan_jobs
 from .errors import TuldaError
 from .netinfo import bonjour_name, lan_ipv4, local_host_names, parse_hosts, tailscale_dnsname, tailscale_ipv4
-from .runner import run_chain, tool_version
+from .runner import make_group, run_chain, tool_version
 
 DEFAULT_PORT = 8765
 
@@ -33,33 +34,79 @@ def parse_opts(items) -> dict:
     return out
 
 
+def request_command(args, names: list[str]) -> str:
+    """The request as typed, with file arguments reduced to base names (no local paths)."""
+    parts = ["tulda", "render", *names]
+    if args.title:
+        parts += ["--title", args.title]
+    if args.adapter:
+        parts += ["--adapter", args.adapter]
+    if args.stage:
+        parts += ["--stage", args.stage]
+    if args.all:
+        parts.append("--all")
+    views = parse_views(args.view, args.views)
+    if views:
+        parts += ["--views", ",".join(views)]
+    for o in args.opt or []:
+        parts += ["--opt", o]
+    if args.project:
+        parts += ["--project", args.project]
+    return shlex.join(parts)
+
+
 def cmd_render(args) -> int:
-    src = Path(args.file).expanduser().resolve()
-    if not src.is_file():
-        raise TuldaError(f"no such file: {src}")
-    reg = load_registry(src, Path(args.config) if args.config else None)
-    chains = plan(reg, src, args.adapter, args.stage, args.all)
-    project = args.project or src.parent.name
-    root = renders_root(args, reg)
-    opts = parse_opts(args.opt)
+    srcs = [Path(f).expanduser().resolve() for f in args.files]
+    for src in srcs:
+        if not src.is_file():
+            raise TuldaError(f"no such file: {src}")
+    views = parse_views(args.view, args.views)
+    group = make_group(args.title, srcs, request_command(args, [f.name for f in srcs]))
     code = 0
-    for chain in chains:
-        label = " -> ".join(a.id for a in chain)
+    ok_any = False
+    seq = 0
+    projects: list[str] = []
+    root = None
+    port = None
+    for src in srcs:
+        reg = load_registry(src, Path(args.config) if args.config else None)
+        root = renders_root(args, reg)
+        port = args.port or int(reg.defaults.get("port", DEFAULT_PORT))
+        project = args.project or src.parent.name
+        opts = parse_opts(args.opt)
         try:
-            png = run_chain(reg, chain, src, root, project, opts, args.keep)
+            jobs = plan_jobs(reg, src, args.adapter, args.stage, args.all, views)
         except TuldaError as e:
-            print(f"error [{label}]: {e}", file=sys.stderr)
+            print(f"error [{src.name}]: {e}", file=sys.stderr)
             code = code or e.code
             continue
-        print(f"rendered {png}  ({label})")
-    if code == 0:
-        port = args.port or int(reg.defaults.get("port", DEFAULT_PORT))
-        q = urllib.parse.quote(project)
-        print(f"view: http://{bonjour_name()}:{port}/{q}/")
+        for job in jobs:
+            try:
+                png = run_chain(reg, job.chain, src, root, project, opts, args.keep,
+                                group=group, view=job.view, view_opts=job.options,
+                                seq=seq)
+            except TuldaError as e:
+                print(f"error [{job.label}] {src.name}: {e}", file=sys.stderr)
+                code = code or e.code
+                continue
+            finally:
+                seq += 1
+            ok_any = True
+            if project not in projects:
+                projects.append(project)
+            print(f"rendered {png}  ({job.label})")
+    if ok_any:
+        hosts = [f"http://{bonjour_name()}:{port}"]
         from .service import configured_tailscale_host
         ts = configured_tailscale_host()
         if ts:
-            print(f"tailscale: http://{ts}:{port}/{q}/")
+            hosts.append(f"http://{ts}:{port}")
+        gq = urllib.parse.quote(group["id"])
+        print(f"group: {group['id']}")
+        for h, label in zip(hosts, ("view", "tailscale")):
+            print(f"{label}: {h}/_g/{gq}/")
+            for p in projects:
+                print(f"  project: {h}/{urllib.parse.quote(p)}/")
     return code
 
 
@@ -191,8 +238,15 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--config", help="extra TOML config, merged last")
         sp.add_argument("--renders-root", help="renders directory (env TULDA_RENDERS)")
 
-    r = sub.add_parser("render", help="render a file to PNG via adapters")
-    r.add_argument("file")
+    r = sub.add_parser("render", help="render one or more files to PNG via adapters; "
+                       "all outputs of one invocation form one group (request)")
+    r.add_argument("files", nargs="+", metavar="file")
+    r.add_argument("--title", "--group", dest="title", metavar="NAME",
+                   help="human title for this request's group")
+    r.add_argument("--view", action="append", default=[], metavar="NAME",
+                   help="view to render (repeatable or comma separated), e.g. bottom")
+    r.add_argument("--views", metavar="A,B", help="comma separated views, e.g. iso,bottom "
+                   "(default: the adapter's default_views)")
     r.add_argument("--adapter", help="adapter id, a,b chain, or named chain")
     r.add_argument("--stage", choices=["source", "built", "sliced"])
     r.add_argument("--all", action="store_true", help="render with every satisfiable terminal adapter")

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .gallery import render_index
@@ -15,6 +17,32 @@ ALLOWED_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".svg": "image/svg+xml", ".json": "application/json",
                ".stl": "model/stl"}
 MAX_SIDECAR = 256 * 1024
+GROUP_ID = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+GROUP_PREFIX = "_g"   # /_g/<group id>/ is the group page; a project dir of that name is not listed
+
+
+def _strs(v, limit=50) -> list[str]:
+    return [x[:200] for x in v[:limit] if isinstance(x, str)] if isinstance(v, list) else []
+
+
+def _text(v, limit=300):
+    return v[:limit] if isinstance(v, str) else None
+
+
+def group_fields(meta: dict, mtime: float) -> dict:
+    """Group info for one render. Sidecars without a valid group_id (legacy, or no sidecar)
+    are grouped by UTC day of their creation time."""
+    gid = meta.get("group_id")
+    if isinstance(gid, str) and GROUP_ID.match(gid):
+        return {"group_id": gid, "group_title": _text(meta.get("group_title")),
+                "group_sources": _strs(meta.get("group_sources")),
+                "request_cmd": _text(meta.get("request_cmd"), 1000),
+                "group_created_utc": _text(meta.get("group_created_utc"), 40),
+                "seq": meta["seq"] if isinstance(meta.get("seq"), int) else 0, "legacy": False}
+    day = datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d")
+    return {"group_id": f"legacy-{day.replace('-', '')}", "group_title": f"Earlier renders, {day}",
+            "group_sources": [], "request_cmd": None, "group_created_utc": None,
+            "seq": 0, "legacy": True}
 
 
 class PathError(Exception):
@@ -47,7 +75,7 @@ def safe_resolve(root: Path, urlpath: str) -> Path:
 def scan(root: Path) -> list[dict]:
     items = []
     for pdir in sorted(root.iterdir()):
-        if pdir.name.startswith(".") or not pdir.is_dir():
+        if pdir.name.startswith(".") or pdir.name == GROUP_PREFIX or not pdir.is_dir():
             continue
         try:
             if not pdir.resolve().is_relative_to(root):
@@ -87,6 +115,7 @@ def scan(root: Path) -> list[dict]:
                 "tool_version": ((meta.get("steps") or [{}])[-1] or {}).get("tool_version")
                 if isinstance(meta.get("steps"), list) and meta.get("steps") else None,
                 "source_sha256": meta.get("source_sha256"),
+                "view": _text(meta.get("view"), 40), **group_fields(meta, mtime),
             })
     items.sort(key=lambda i: (i["mtime"], i["file"]), reverse=True)
     return items
@@ -114,6 +143,12 @@ class Handler(BaseHTTPRequestHandler):
         if not head:
             self.wfile.write(body)
 
+    def _send_page(self, html: str, head: bool):
+        return self._send(200, html.encode(), "text/html; charset=utf-8", head, {
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": "default-src 'none'; img-src 'self'; "
+            "style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'"})
+
     def _host_ok(self) -> bool:
         h = self.headers.get("Host")
         if not h:
@@ -140,6 +175,14 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(scan(root)).encode()
             return self._send(200, body, "application/json", head,
                               {"Cache-Control": "no-store"})
+        gparts = [p for p in route.split("/") if p]
+        if gparts and gparts[0] == GROUP_PREFIX:
+            if len(gparts) != 2 or not GROUP_ID.match(gparts[1]):
+                return self._send(404, b"not found\n", head=head)
+            items = scan(root)
+            if not any(i["group_id"] == gparts[1] for i in items):
+                return self._send(404, b"no such group\n", head=head)
+            return self._send_page(render_index(items, None, gparts[1]), head)
         try:
             target = safe_resolve(root, path)
         except PathError as e:
@@ -148,11 +191,7 @@ class Handler(BaseHTTPRequestHandler):
             if target != root and target.parent != root:
                 return self._send(404, b"not found\n", head=head)
             project = None if target == root else target.name
-            page = render_index(scan(root), project).encode()
-            return self._send(200, page, "text/html; charset=utf-8", head, {
-                "Cache-Control": "no-store",
-                "Content-Security-Policy": "default-src 'none'; img-src 'self'; "
-                "style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'"})
+            return self._send_page(render_index(scan(root), project), head)
         ctype = ALLOWED_EXT.get(target.suffix.lower())
         if ctype is None or not target.is_file():
             return self._send(403, b"file type not served\n", head=head)
