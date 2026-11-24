@@ -45,23 +45,55 @@ Good-faith engineering review, fetched 2026-11-24. Not legal advice. Inferences 
 
 ### 2. Bambu Lab Terms of Use / EULA / cloud terms
 
-NOT VERIFIED. I could not read Bambu's own terms:
+Bambu's own Terms of Use were read in full in the 2026-11-24 review; see the next section.
+The earlier attempt to fetch them failed (HTTP 403 from https://bambulab.com/en-us/policies/terms
+and https://bambulab.com/en-us/legal; HTTP 402 from https://us.store.bambulab.com/agree-terms),
+so the earlier wording below is superseded where it differs. The software licence text shown at
+install time was not seen.
 
-- https://bambulab.com/en-us/policies/terms and https://bambulab.com/en-us/legal returned
-  HTTP 403; https://us.store.bambulab.com/agree-terms returned 402; the Wayback Machine is
-  blocked from this tool. I did not see the software licence text shown at install time.
-- Secondhand only (unverified forum repost,
-  https://groups.google.com/g/3d-printing-tips--tricks/c/PzNhy_lBytk): a non-exclusive
-  licence "on one Bambu Lab device", no commercial use, no modifying or reverse engineering
-  the software. Treat as unconfirmed.
+- Secondhand forum repost (https://groups.google.com/g/3d-printing-tips--tricks/c/PzNhy_lBytk),
+  now superseded by the Terms text: a non-exclusive licence "on one Bambu Lab device", no
+  commercial use, no modifying or reverse engineering the software.
 - Bambu's own blog (https://blog.bambulab.com/setting-the-record-straight-on-cloud-access-and-community/,
   fetched 2026-11-24): "Our cloud is a private service. Access to it is governed by a user
   agreement, not the AGPL license." and "impersonating official clients in communication
   with our cloud infrastructure is not allowed." This concerns the cloud and the plugin,
   which tulda does not touch. Bambu's position on terms overriding AGPL is disputed by SFC.
-- Not found anywhere I could read: any clause on CLI automation, undocumented flags,
-  sharing rendered previews, or third-party tool naming/trademark. Absence of evidence
-  only. Bambu Lab is a trademark; use it descriptively only.
+- Not found in the Terms (see the next section): any clause on CLI automation, undocumented
+  flags, sharing rendered previews, or third-party tool naming/trademark. Bambu Lab is a
+  trademark; use it descriptively only.
+
+## Bambu Lab Terms of Use (reviewed 2026-11-24, version dated 24 April 2024)
+
+URL: https://bambulab.com/en-us/policies/terms (the version reviewed is marked "last updated
+24 April 2024"). Read from the full text supplied for this review. Quotes are short excerpts;
+read the Terms themselves before relying on this.
+
+Scope (sections 1.1 and 1.2):
+- 1.1 defines "the Product" as "the Bambu Lab device, and the software contained therein",
+  including updates.
+- 1.2 says the Software is bound "whether it is stored in a read-only memory or any other media
+  or form or it is from an online download location authorized by Bambu Lab".
+- Open interpretation question (inference): the text does not make clear whether Bambu Studio,
+  which is separately licensed under AGPL-3.0 on GitHub, counts as "the Software" here.
+
+Grants and restrictions that bear on tulda:
+- 2: "a limited and non-exclusive licence to access and use this software ... on only one Bambu
+  Lab device".
+- 3.2: "You may not distribute or provide the Software through networks so that it is available
+  to multiple devices or computers at the same time."
+- 3.4: no "reverse engineer, publish, publicly disseminate, decompile, export codes, disassemble
+  or create derivatives of the Product".
+- 3.5(2): no "provide to third parties, or allow third parties to use the whole or part of the
+  Software without obtaining Bambu Lab's written consent (including but not limited to apps,
+  services, code, and source code)".
+- 8.2 and the "Bambu cloud" paragraph: cloud and account features (for example remote printing
+  and remote monitoring) need an account and "additional terms". tulda uses none of them.
+- 17: governing law is the law of the People's Republic of China, with CIETAC arbitration.
+
+Not in this text: no express clause on automating the CLI, headless rendering, trademarks or
+branding of third-party tools, or sharing preview images of models. This is an absence in this
+text, not a legal conclusion.
 
 ### 3. File formats
 
@@ -69,8 +101,8 @@ NOT VERIFIED. I could not read Bambu's own terms:
   25422:2025, specification licence listed as "Free & Open Source", no licensing fees;
   the page states no usage restrictions.
 - Bambu extensions (`Metadata/*.config`, `project_settings`) are ordinary entries in the
-  3MF zip. I found no published licence or restriction on them (could not check Bambu's
-  terms; see section 2). Parsing a user's own file with stdlib is ordinary interoperability
+  3MF zip. I found no published licence or restriction on them in the Bambu Terms (see the
+  Terms section above). Parsing a user's own file with stdlib is ordinary interoperability
   (inference). 3MF has an optional "Secure Content" encryption feature; tulda must not try
   to bypass any encrypted/protected content.
 
@@ -78,23 +110,24 @@ NOT VERIFIED. I could not read Bambu's own terms:
 
 None touched, by code inspection (see above). Keep it that way: any future feature that
 loads the networking plugin, logs in, or talks to a printer or MakerWorld would bring Bambu's
-cloud user agreement into scope, which I could not read.
+cloud user agreement and "additional terms" into scope (see the Terms section above).
 
 ## Conclusions
 
 | Bucket | Verdict | Basis |
 |---|---|---|
-| (a) One user, own machine, own models | Compliant (high confidence on AGPL; terms unread) | Separate process, no bundling; AGPL permits use. Terms unverified, but private personal use of a licensed install is the ordinary case. |
-| (b) Public repo, users run it against their own Studio install | Compliant, with unclear residual risk | tulda ships no Bambu code (AGPL distribution duties don't arise). Unclear: whether Bambu's terms object to automating the CLI or using undocumented `--camera-view` values (unread). Trademark: descriptive use only, with a non-affiliation notice. |
-| (c) Hosted/shared service, others access it or submit their models | Unclear, leaning likely a problem | Running one licensed install to serve other people may exceed a per-user/per-device licence (the unverified "one device" wording), and publicly displaying renders of others' models raises content/IP questions; AGPL section 13 would matter if Studio were modified. Rests on terms I could not read. |
+| (a) Private single-user use on the user's own machine and devices | No clause found that this breaches the Terms. High confidence on AGPL. | Separate process, no bundling; AGPL permits use. Remaining uncertainty: whether the Terms apply to Studio at all (inference: "the Software" is tied to the device, and Studio's AGPL licence is separate); and the undocumented `--camera-view` values. Clause 3.4 is about decompiling and reverse engineering code; probing a CLI flag value is arguably not that (inference). |
+| (b) Public repo, each user runs their own installed Studio | Same open questions as (a); no new breach identified | tulda distributes none of the Software, so 3.3 and 3.5(2) are not engaged by distribution of tulda itself (inference). AGPL distribution duties don't arise (no Bambu code shipped). Trademark: descriptive use only, with a non-affiliation notice. |
+| (c) Hosted or shared service where third parties use the owner's installed Studio, even indirectly by rendering their models | Unclear, leaning likely a problem | Clauses 2, 3.2 and 3.5(2) make this a real risk (inference): one licensed install serving other people, on more than one device, or to third parties without written consent. AGPL section 13 would matter if Studio were modified. Recommendation: do not do this without Bambu Lab's written consent. |
 
 ## Recommendations
 
 1. Use tulda only with your own models and your own licensed Studio install; do not expose
-   it publicly or run it as a service for third parties, until the Terms of Use have been
-   read in full (or Bambu is asked).
-2. Read the current Terms of Use at https://bambulab.com/en-us/legal and the licence shown at
-   Studio install. Re-check any clause on automation, reverse engineering and commercial use.
+   it publicly or run it as a service for third parties; for third-party use, get Bambu Lab's
+   written consent first.
+2. Re-read the Terms of Use at https://bambulab.com/en-us/policies/terms (version dated 24 April
+   2024 when reviewed) and the licence shown at Studio install. Re-check clauses 2, 3.2, 3.4,
+   3.5(2) and 17 if the version changes.
 3. Keep tulda away from the networking plugin, cloud, authentication and printers.
 4. Treat `--camera-view` 4-7 as unstable; there is a documented fallback plan (OpenSCAD render
    of an extracted mesh) in `docs/PLAN.md`.
