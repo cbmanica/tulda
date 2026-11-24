@@ -673,7 +673,7 @@ class Catalog:
                 "group_id": r["group_id"], "seq": r["seq"], "size": r["size"],
                 "tag": source_tag(r["source"]), "kind": r["kind"],
                 "info": _load_info(r["info"]),
-                "viewer_url": viewer_url(r["project"], r["file"]) if r["kind"] != "image" else None}
+                "viewer_url": viewer_url(r["project"], r["file"]) if r["kind"] in ("mesh", "turntable") else None}
 
     def get_render(self, project: str, stem: str) -> dict | None:
         """A mesh or turntable render by project and file stem (the /_v/ page's id), plus the

@@ -23,7 +23,7 @@ from .items import (DATE_PREFIX, STATIC_PREFIX, VIEWER_PREFIX, GROUP_ID, GROUP_P
 
 ALLOWED_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".svg": "image/svg+xml", ".json": "application/json",
-               ".stl": "model/stl", ".glb": "model/gltf-binary"}
+               ".stl": "model/stl", ".glb": "model/gltf-binary", ".htm": "text/html; charset=utf-8"}
 
 # /_s/<path>: files shipped inside the package (never the renders root), by explicit allowlist.
 # The vendored three.js lives in a version-named directory, so its URLs are immutable.

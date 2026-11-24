@@ -14,7 +14,7 @@ from ..errors import ConfigError
 from . import probes
 
 STAGES = ("source", "built", "sliced", "mesh")
-KINDS = ("image", "mesh", "turntable")
+KINDS = ("image", "mesh", "turntable", "slice")
 BUILTIN_TOML = Path(__file__).with_name("builtin.toml")
 BASE_KEYS = {"in", "out", "name", "workdir", "w", "h"}
 _TOKEN = re.compile(r"\{\{|\}\}|\{(\w+)\}")
@@ -97,6 +97,8 @@ class Adapter:
             raise err("kind 'mesh' adapters must produce glb")
         if kind == "turntable" and produces != "png":
             raise err("kind 'turntable' adapters must produce png (frame 0 is the poster)")
+        if kind == "slice" and produces != "htm":
+            raise err("kind 'slice' adapters must produce htm (a summary page)")
         if produces == "png" and stage not in STAGES:
             raise err(f"png adapters need stage in {STAGES}")
         if stage is not None and stage not in STAGES:

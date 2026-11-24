@@ -51,6 +51,12 @@ in the sidecar and UI. Built-in views:
   NFC tag) is visible. If a future Studio drops those, point the `bottom` view at an
   OpenSCAD-based fallback; there is no 3mf-to-mesh converter yet.
 
+`--views slice` (`.3mf` only) slices a COPY of the model with Bambu Studio (`slice-bambu`, ~2 s,
+the source is never modified) and stores a summary page (`.htm`) plus the same data in the
+sidecar `info`: print time, layers, filament g/m per filament, extrusion per `; FEATURE:` type,
+and explicit yes/no for supports, brim, skirt and prime tower ("No supports needed" when none).
+The group page shows it as a text card. It slices with the settings embedded in the 3mf.
+
 ### Catalog, navigation and management
 
 A SQLite catalog at `<renders root>/.tulda/catalog.db` (never served over HTTP) indexes the
@@ -125,7 +131,7 @@ label is `com.tulda.server`; the plist goes to `~/Library/LaunchAgents/`.
   addresses (or the explicit `--host` values), so `curl http://127.0.0.1:<port>/`
   works on the Mac itself. It is added automatically; you do not pass it.
 - Multiple addresses / Tailscale: one listening socket per address in one process.
-  `tulda service install --host 192.168.1.50 --tailscale` (or `serve`) listens on
+  `tulda service install --host 192.168.1.50 --tailscale` (or `serve`) listens on <!-- guard:ok -->
   the LAN IP and the tailnet IPv4 (`tailscale ip -4` from PATH or
   `/Applications/Tailscale.app/...`, else any interface address in 100.64.0.0/10).
   If Tailscale is not up, a warning is logged and the others are served; once it

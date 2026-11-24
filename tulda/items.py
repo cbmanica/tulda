@@ -18,8 +18,8 @@ VIEWER_PREFIX = "_v"       # /_v/<project>/<name>/ is the interactive viewer pag
 STATIC_PREFIX = "_s"       # /_s/<path> is vendored viewer assets from the package
 RESERVED_DIRS = {GROUP_PREFIX, DATE_PREFIX, VIEWER_PREFIX, STATIC_PREFIX}
 # What a catalog row's primary file may be: a PNG (kind image / turntable poster) or a GLB (kind mesh).
-RENDER_EXTS = (".png", ".glb")
-KINDS = ("image", "mesh", "turntable")
+RENDER_EXTS = (".png", ".glb", ".htm")
+KINDS = ("image", "mesh", "turntable", "slice")
 MAX_INFO = 24 * 1024
 
 
@@ -100,6 +100,8 @@ def read_item(root: Path, pdir: Path, png: Path) -> dict | None:
     kind = meta.get("kind") if meta.get("kind") in KINDS else "image"
     if png.suffix.lower() == ".glb":
         kind = "mesh"
+    elif png.suffix.lower() == ".htm":
+        kind = "slice"
     info = meta.get("info")
     if not isinstance(info, dict) or len(json.dumps(info)) > MAX_INFO:
         info = None

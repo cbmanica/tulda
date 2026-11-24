@@ -57,6 +57,8 @@ details[open]>summary .ths{display:none}
 .t3d{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;width:100%;aspect-ratio:4/3;
 background:#8884;color:var(--acc);text-decoration:none;font-size:34px;font-weight:700;letter-spacing:1px}
 .t3d small{font-size:12px;font-weight:400;color:var(--mut);letter-spacing:0}
+.sl{display:block;width:100%;aspect-ratio:4/3;overflow:auto;padding:10px;color:var(--fg);text-decoration:none;
+font-size:13px;line-height:1.35}.sl b{display:block;font-size:14px;margin-bottom:3px}.sl .y{color:#c2410c;font-weight:600}.sl .n{color:var(--acc);font-weight:600}
 .card img{display:block;width:100%;aspect-ratio:4/3;object-fit:contain;background:#8884}
 .card .m{padding:6px 8px;font-size:12px;color:var(--mut);overflow-wrap:anywhere}.card .m b{color:var(--fg)}
 .badge{position:absolute;top:6px;left:6px;background:var(--acc);color:#fff;font-size:12px;font-weight:600;
@@ -137,14 +139,23 @@ function title(g){return g.title||(g.legacy?'':g.sources.join(', '))||g.id}
 function tagLink(t,cls){const a=link('tg '+cls,t,'/?tag='+encodeURIComponent(t));a.title='show requests tagged '+t;
  a.onclick=e=>e.stopPropagation();return a}
 const viewable=i=>i.kind==='mesh'||i.kind==='turntable';
+const special=i=>viewable(i)||i.kind==='slice';
+function sliceBody(i){const s=i.info||{},sp=s.supports||{},a=s.adhesion||{},yn=b=>b?'yes':'no';
+ const t=el('a','sl');t.href=i.url;t.tabIndex=-1;t.onclick=e=>e.stopPropagation();
+ t.append(el('b','',(s.print_time||'?')+' | '+(s.layers||0)+' layers'+(s.total_g!=null?' | '+s.total_g+' g':'')));
+ const l=el('div','');l.append('supports: ');l.append(el('span',sp.generated?'y':'n',sp.generated?'YES':'no (none needed)'));t.append(l);
+ t.append(el('div','','brim '+yn(a.brim)+' | skirt '+yn(a.skirt)+' | prime tower '+yn(a.prime_tower)));
+ (s.filaments||[]).forEach(f=>t.append(el('div','',(f.type||'filament '+f.id)+(f.color?' '+f.color:'')+': '+(f.used_g!=null?f.used_g+' g':'')+(f.used_m!=null?' / '+f.used_m+' m':''))));
+ return t}
 function card(i){const c=el('div','card');c._i=i;c.tabIndex=0;c.setAttribute('role','button');
  if(i.kind==='mesh'){const t=link('t3d','3D',i.viewer_url);t.append(el('small','','open interactive viewer'));
   t.tabIndex=-1;t.onclick=e=>e.stopPropagation();c.append(t)}
+ else if(i.kind==='slice')c.append(sliceBody(i));
  else{const im=el('img');im.src=i.url;im.loading='lazy';im.decoding='async';im.alt=i.file;c.append(im)}
  if(i.view)c.append(el('span','badge',i.view+(i.kind==='turntable'&&i.info&&i.info.frames?' ('+i.info.frames+')':'')));
  const m=el('div','m');m.append(el('b','',i.source||i.file),el('div','',i.adapter+' / '+i.stage+(ctx.project?'':' / '+i.project)));
  if(i.tag)m.append(tagLink(i.tag,'src'));
- c.append(m);const go=()=>viewable(i)?(location.href=i.viewer_url):compare?pick(i):openCard(c);c.onclick=go;
+ c.append(m);const go=()=>viewable(i)?(location.href=i.viewer_url):i.kind==='slice'?(location.href=i.url):compare?pick(i):openCard(c);c.onclick=go;
  c.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();go()}};return c}
 function buildBody(root,g){if(root._built)return;root._built=true;const b=root.querySelector('.bd');
  const gr=el('div','grid');g.items.forEach(i=>gr.append(card(i)));b.append(gr);markPicks()}
@@ -161,7 +172,7 @@ function groupEl(g,first){
  h.append(el('span','t',when+' | '+srcs+' source'+(srcs==1?'':'s')+' | '+g.items.length+' image'+(g.items.length==1?'':'s')));
  if(!single){h.append(link('o','open','/_g/'+encodeURIComponent(g.id)+'/'));
   const th=el('span','ths');th.setAttribute('aria-hidden','true');
-  g.items.filter(i=>!viewable(i)).slice(0,3).forEach(i=>{const im=el('img');im.src=i.url;im.loading='lazy';im.decoding='async';im.alt='';th.append(im)});h.append(th)}
+  g.items.filter(i=>!special(i)).slice(0,3).forEach(i=>{const im=el('img');im.src=i.url;im.loading='lazy';im.decoding='async';im.alt='';th.append(im)});h.append(th)}
  const b=el('div','bd');root.append(h,b);
  if(g.sources.length){const r=el('div','src');g.sources.forEach(x=>r.append(el('span','',x)));b.append(r)}
  if(g.cmd&&single)b.append(el('div','cmd',g.cmd));
@@ -185,7 +196,7 @@ $('more').onclick=async()=>{const b=$('more');b.disabled=true;
   hasMore=!!j.has_more&&!!j.next&&j.groups.length>=D.page_size;addGroups(j.groups,false)}
  catch(e){$('info').textContent='Could not load more ('+e.message+')'}b.disabled=false};
 // ---- lightbox / compare over the visible cards
-const cards=()=>[...document.querySelectorAll('#groups .card')].filter(c=>c.offsetParent!==null&&!viewable(c._i));
+const cards=()=>[...document.querySelectorAll('#groups .card')].filter(c=>c.offsetParent!==null&&!special(c._i));
 function markPicks(){document.querySelectorAll('#groups .card').forEach(c=>c.classList.toggle('pick',picks.includes(c._i)))}
 function pick(i){const k=picks.indexOf(i);if(k>=0)picks.splice(k,1);else{picks.push(i);if(picks.length>2)picks.shift()}
  markPicks();if(picks.length===2)openCmp()}

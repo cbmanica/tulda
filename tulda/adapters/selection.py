@@ -113,7 +113,7 @@ def parse_views(*values) -> list[str]:
 
 
 # Views that are not camera presets of a PNG adapter: they pick a `kind` of adapter instead.
-SPECIAL_VIEWS = {"interactive": "mesh", "turntable": "turntable"}
+SPECIAL_VIEWS = {"interactive": "mesh", "turntable": "turntable", "slice": "slice"}
 
 
 def plan_special(reg: Registry, path: Path, view: str) -> list[Adapter]:

@@ -100,6 +100,25 @@ produces = "glb"
 stage    = "mesh"
 python   = "builtin:stl_mesh"
 
+# ---- slice stage: .3mf -> slice summary page (`slice` view only) ----
+# Bambu Studio slices a COPY of the model in a scratch dir (the source is never touched) and
+# tulda parses the resulting gcode FEATURE markers and slice_info.config (print time,
+# filament, layers, supports / brim / skirt / prime tower yes-no). Verified 2026-11-24 with
+# Bambu Studio 02.09.01.70, ~2 s. --export-3mf is relative to --outputdir; the logged
+# "Invalid T command (T65535)" error is benign. Python adapter: tulda/adapters/slicing.py.
+[adapter.slice-bambu]
+kind     = "slice"
+accepts  = [".3mf"]
+produces = "htm"
+stage    = "sliced"
+requires = ["/Applications/BambuStudio.app/Contents/MacOS/BambuStudio"]
+python   = "builtin:bambu_slice"
+timeout  = 240
+
+[adapter.slice-bambu.options]
+bambu_bin = "/Applications/BambuStudio.app/Contents/MacOS/BambuStudio"
+slice_timeout = 180
+
 # ---- turntable stage: .scad -> 36 PNG frames (no-WebGL fallback + drag-to-rotate widget) ----
 # Selected by the `turntable` view only. OpenSCAD renders ~0.25 s per 800x600 frame (4 in
 # parallel). Bambu Studio only has fixed camera presets, so .3mf has no turntable.

@@ -181,7 +181,7 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
     term = chain[-1]
     proj_dir = renders_root / project
     proj_dir.mkdir(parents=True, exist_ok=True)
-    ext = ".glb" if term.produces == "glb" else ".png"
+    ext = {"glb": ".glb", "htm": ".htm"}.get(term.produces, ".png")
     prefix = f"{stamp}-{term.id}" + (f"-{view}" if view else "")
     base = f"{prefix}-{src.stem}"
     n = 1
