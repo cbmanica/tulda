@@ -1,0 +1,856 @@
+"""SQLite catalog: a rebuildable index of the renders on disk plus the home of management
+metadata (title edits, stars, tags, notes, trash) that sidecars do not hold.
+
+The PNG + sidecar files stay the source of truth for everything about a render. The DB
+(`<renders root>/.tulda/catalog.db`) can be deleted at any time and is rebuilt from the
+sidecars; only the management metadata (groups.user_title/starred/trashed_utc/notes and the
+tags table) exists nowhere else.
+
+Concurrency: WAL, short `BEGIN IMMEDIATE` write transactions, busy_timeout. The CLI and the
+server's sync thread write; HTTP handlers use `query_only` connections.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import sqlite3
+import threading
+import time
+import urllib.parse
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from .errors import TuldaError
+from .items import GROUP_ID, is_project_dir, read_item, render_url
+
+TAG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
+DAY_RE = re.compile(r"^(\d{4})-(\d{2})(?:-(\d{2}))?$")
+RECENT_SECS = 2.0          # a dir modified this recently is always rescanned (mtime granularity)
+CHUNK = 500
+
+
+class CatalogError(TuldaError):
+    code = 1
+
+
+def norm_tag(t: str) -> str:
+    t = t.strip().lower()
+    if not TAG_RE.match(t):
+        raise CatalogError(f"bad tag {t!r}: use 1-32 chars of a-z 0-9 . _ - (starting with a letter or digit)")
+    return t
+
+
+def valid_day(s: str) -> bool:
+    m = DAY_RE.match(s or "")
+    if not m:
+        return False
+    y, mo, d = int(m[1]), int(m[2]), m[3]
+    try:
+        datetime(y, mo, int(d) if d else 1)
+    except ValueError:
+        return False
+    return True
+
+
+def iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---- schema / migrations ------------------------------------------------------
+
+def _m1(c: sqlite3.Connection) -> None:
+    for stmt in (
+        "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)",
+        """CREATE TABLE groups(
+            rid INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
+            title TEXT, sources TEXT NOT NULL DEFAULT '[]', request_cmd TEXT,
+            legacy INTEGER NOT NULL DEFAULT 0, created_utc TEXT, day TEXT,
+            last_mtime REAL NOT NULL DEFAULT 0, n_renders INTEGER NOT NULL DEFAULT 0,
+            search_text TEXT NOT NULL DEFAULT '',
+            user_title TEXT, starred INTEGER NOT NULL DEFAULT 0, trashed_utc TEXT, notes TEXT)""",
+        """CREATE TABLE renders(
+            path TEXT PRIMARY KEY, project TEXT NOT NULL, file TEXT NOT NULL,
+            group_id TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0,
+            adapter TEXT, stage TEXT, view TEXT, source TEXT, source_type TEXT,
+            source_sha256 TEXT, tool_version TEXT, git_sha TEXT, git_dirty INTEGER,
+            has_sidecar INTEGER NOT NULL DEFAULT 0,
+            size INTEGER, mtime REAL NOT NULL, sidecar_mtime REAL, created_utc TEXT,
+            missing INTEGER NOT NULL DEFAULT 0)""",
+        "CREATE TABLE tags(group_id TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(group_id, tag))",
+        "CREATE TABLE dirs(project TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL)",
+        "CREATE INDEX groups_recent ON groups(last_mtime DESC, id DESC)",
+        "CREATE INDEX groups_day ON groups(day)",
+        "CREATE INDEX renders_group ON renders(group_id)",
+        "CREATE INDEX renders_project ON renders(project, missing)",
+        "CREATE INDEX renders_mtime ON renders(mtime)",
+    ):
+        c.execute(stmt)
+
+
+def _m2(c: sqlite3.Connection) -> None:
+    """Search: FTS5 over groups.search_text when the build has it (else LIKE is used)."""
+    c.execute("CREATE INDEX tags_tag ON tags(tag)")
+    try:
+        c.execute("CREATE VIRTUAL TABLE search USING fts5(text)")
+    except sqlite3.OperationalError:
+        return
+    c.execute("INSERT INTO search(rowid, text) SELECT rid, search_text FROM groups")
+
+
+MIGRATIONS = [_m1, _m2]
+SCHEMA_VERSION = len(MIGRATIONS)
+
+
+def _is_corrupt(e: Exception) -> bool:
+    m = str(e).lower()
+    return isinstance(e, sqlite3.DatabaseError) and (
+        type(e) is sqlite3.DatabaseError
+        or any(s in m for s in ("malformed", "not a database", "disk image", "corrupt")))
+
+
+# ---- query model ---------------------------------------------------------------
+
+@dataclass
+class Filters:
+    project: str | None = None
+    adapters: list[str] = field(default_factory=list)
+    stages: list[str] = field(default_factory=list)
+    views: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+    starred: bool = False
+    trash: bool = False            # include trashed groups
+    trashed_only: bool = False
+    q: str | None = None
+    day: str | None = None         # YYYY-MM or YYYY-MM-DD (UTC)
+    since: str | None = None       # YYYY-MM-DD, inclusive
+    until: str | None = None
+
+
+def search_tokens(q: str) -> list[str]:
+    return re.findall(r"\w+", (q or "").lower())[:8]
+
+
+class Catalog:
+    def __init__(self, root, log=print):
+        self.root = Path(root).resolve()
+        self.dir = self.root / ".tulda"
+        self.path = self.dir / "catalog.db"
+        self.log = log
+        self._ready = False
+        self._init_lock = threading.RLock()
+        self._sync_lock = threading.RLock()
+        self._last_sync = 0.0
+        self._cache: dict = {}
+        self.fts = False
+
+    # -- connections
+    def _raw(self, write: bool) -> sqlite3.Connection:
+        c = sqlite3.connect(self.path, timeout=15, isolation_level=None, check_same_thread=False)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA busy_timeout=15000")
+        if not write:
+            c.execute("PRAGMA query_only=1")
+        return c
+
+    @contextmanager
+    def conn(self, write: bool = False):
+        self.ensure()
+        c = self._raw(write)
+        try:
+            yield c
+        except sqlite3.DatabaseError as e:
+            if _is_corrupt(e):
+                self.log(f"catalog: database error ({e}); will rebuild on next use")
+                self._ready = False
+            raise
+        finally:
+            c.close()
+
+    def ensure(self) -> None:
+        if self._ready:
+            return
+        with self._init_lock:
+            if self._ready:
+                return
+            self.dir.mkdir(parents=True, exist_ok=True)
+            with open(self.dir / "lock", "a+") as lk:
+                fcntl.flock(lk, fcntl.LOCK_EX)
+                try:
+                    fresh = self._open_or_rebuild()
+                finally:
+                    fcntl.flock(lk, fcntl.LOCK_UN)
+            self._ready = True
+            if fresh:
+                t0 = time.monotonic()
+                st = self.sync(force=True)
+                self.log(f"catalog: built {st['indexed']} renders from sidecars in "
+                         f"{time.monotonic() - t0:.2f}s ({self.path})")
+                if isinstance(fresh, dict):
+                    self._restore_meta(fresh)
+
+    def _open_or_rebuild(self):
+        """-> True/dict when the DB was created from scratch (needs a full sync); the dict
+        holds management metadata salvaged from a corrupt DB."""
+        salvaged = None
+        try:
+            return self._migrate()
+        except sqlite3.DatabaseError as e:
+            if not _is_corrupt(e):
+                raise
+            self.log(f"catalog: {self.path} is corrupt ({e}); rebuilding from sidecars")
+        salvaged = self._salvage()
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        for old in self.dir.glob("catalog.db.corrupt-*"):
+            old.unlink(missing_ok=True)
+        if self.path.exists():
+            os.replace(self.path, self.dir / f"catalog.db.corrupt-{stamp}")
+        for ext in ("-wal", "-shm"):
+            Path(str(self.path) + ext).unlink(missing_ok=True)
+        self._migrate()
+        return salvaged or True
+
+    def _migrate(self):
+        c = self._raw(True)
+        try:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")
+            ver = c.execute("PRAGMA user_version").fetchone()[0]
+            if ver > SCHEMA_VERSION:
+                raise CatalogError(f"catalog schema v{ver} is newer than this tulda (v{SCHEMA_VERSION})")
+            fresh = ver == 0
+            if ver < SCHEMA_VERSION:
+                c.execute("BEGIN IMMEDIATE")
+                try:
+                    ver = c.execute("PRAGMA user_version").fetchone()[0]
+                    fresh = ver == 0
+                    for i in range(ver, SCHEMA_VERSION):
+                        MIGRATIONS[i](c)
+                        c.execute(f"PRAGMA user_version={i + 1}")
+                    c.execute("COMMIT")
+                except BaseException:
+                    c.execute("ROLLBACK")
+                    raise
+            c.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            self.fts = bool(c.execute("SELECT 1 FROM sqlite_master WHERE name='search'").fetchone())
+            return fresh
+        finally:
+            c.close()
+
+    def _salvage(self) -> dict | None:
+        if not self.path.exists():
+            return None
+        try:
+            c = sqlite3.connect(self.path, timeout=5)
+            try:
+                g = c.execute("SELECT id,user_title,starred,trashed_utc,notes FROM groups").fetchall()
+                t = c.execute("SELECT group_id,tag FROM tags").fetchall()
+            finally:
+                c.close()
+        except sqlite3.DatabaseError:
+            return None
+        return {"groups": g, "tags": t}
+
+    def _restore_meta(self, s: dict) -> None:
+        with self.conn(True) as c:
+            c.execute("BEGIN IMMEDIATE")
+            for gid, ut, st, tr, no in s["groups"]:
+                c.execute("UPDATE groups SET user_title=?, starred=?, trashed_utc=?, notes=? WHERE id=?",
+                          (ut, st, tr, no, gid))
+            for gid, tag in s["tags"]:
+                if c.execute("SELECT 1 FROM groups WHERE id=?", (gid,)).fetchone():
+                    c.execute("INSERT OR IGNORE INTO tags VALUES(?,?)", (gid, tag))
+            self._refresh_fts(c, [r[0] for r in s["groups"]])
+            self._bump(c)
+            c.execute("COMMIT")
+        self.log(f"catalog: restored metadata for {len(s['groups'])} groups from the corrupt copy")
+
+    # -- write helpers (call inside BEGIN IMMEDIATE)
+    @staticmethod
+    def _bump(c) -> None:
+        c.execute("INSERT INTO meta(key,value) VALUES('rev','1') ON CONFLICT(key) DO UPDATE "
+                  "SET value=CAST(value AS INTEGER)+1")
+
+    def _refresh_fts(self, c, gids) -> None:
+        for gid in set(gids):
+            row = c.execute("SELECT rid, id, title, user_title, sources, notes FROM groups WHERE id=?",
+                            (gid,)).fetchone()
+            if not row:
+                continue
+            tags = " ".join(r[0] for r in c.execute("SELECT tag FROM tags WHERE group_id=?", (gid,)))
+            extra = " ".join(r[0] for r in c.execute(
+                "SELECT DISTINCT COALESCE(project,'')||' '||COALESCE(source,'')||' '||COALESCE(adapter,'')"
+                "||' '||COALESCE(view,'') FROM renders WHERE group_id=? AND missing=0", (gid,)))
+            try:
+                srcs = " ".join(json.loads(row["sources"]))
+            except ValueError:
+                srcs = ""
+            text = " ".join(x for x in (row["id"], row["title"], row["user_title"], srcs, tags,
+                                        row["notes"], extra) if x)
+            c.execute("UPDATE groups SET search_text=? WHERE rid=?", (text.lower(), row["rid"]))
+            if self.fts:
+                c.execute("DELETE FROM search WHERE rowid=?", (row["rid"],))
+                c.execute("INSERT INTO search(rowid,text) VALUES(?,?)", (row["rid"], text))
+
+    def _aggregate(self, c, gids) -> None:
+        for gid in set(gids):
+            c.execute("""UPDATE groups SET
+                n_renders=(SELECT count(*) FROM renders WHERE group_id=groups.id AND missing=0),
+                last_mtime=COALESCE((SELECT max(mtime) FROM renders WHERE group_id=groups.id AND missing=0),0)
+                WHERE id=?""", (gid,))
+            c.execute("""UPDATE groups SET created_utc=strftime('%Y-%m-%dT%H:%M:%SZ',
+                (SELECT min(mtime) FROM renders WHERE group_id=groups.id AND missing=0),'unixepoch')
+                WHERE id=? AND legacy=1 AND n_renders>0""", (gid,))
+
+    def _apply(self, c, items: list[dict], gone: list[str] = (), dir_state=None) -> None:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            affected: set[str] = set()
+            groups: dict[str, dict] = {}
+            for it in items:
+                path = f"{it['project']}/{it['file']}"
+                old = c.execute("SELECT group_id FROM renders WHERE path=?", (path,)).fetchone()
+                if old:
+                    affected.add(old[0])
+                c.execute("""INSERT INTO renders(path,project,file,group_id,seq,adapter,stage,view,source,
+                    source_type,source_sha256,tool_version,git_sha,git_dirty,has_sidecar,size,mtime,
+                    sidecar_mtime,created_utc,missing) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
+                    ON CONFLICT(path) DO UPDATE SET group_id=excluded.group_id, seq=excluded.seq,
+                    adapter=excluded.adapter, stage=excluded.stage, view=excluded.view,
+                    source=excluded.source, source_type=excluded.source_type,
+                    source_sha256=excluded.source_sha256, tool_version=excluded.tool_version,
+                    git_sha=excluded.git_sha, git_dirty=excluded.git_dirty,
+                    has_sidecar=excluded.has_sidecar, size=excluded.size, mtime=excluded.mtime,
+                    sidecar_mtime=excluded.sidecar_mtime, created_utc=excluded.created_utc, missing=0""",
+                          (path, it["project"], it["file"], it["group_id"], it["seq"], it["adapter"],
+                           it["stage"], it["view"], it["source"], it["source_type"], it["source_sha256"],
+                           it["tool_version"], it["git_sha"],
+                           None if it["git_dirty"] is None else int(it["git_dirty"]),
+                           1 if it["json_url"] else 0, it["size"], it["mtime"], it["sidecar_mtime"],
+                           it["created_utc"]))
+                groups.setdefault(it["group_id"], it)
+            for gid, it in groups.items():
+                created = it["group_created_utc"]
+                day = created[:10] if created else (gid[7:11] + "-" + gid[11:13] + "-" + gid[13:15]
+                                                     if it["legacy"] else None)
+                if not day or not valid_day(day):
+                    day = datetime.fromtimestamp(it["mtime"], timezone.utc).strftime("%Y-%m-%d")
+                c.execute("""INSERT INTO groups(id,title,sources,request_cmd,legacy,created_utc,day)
+                    VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,
+                    sources=excluded.sources, request_cmd=excluded.request_cmd, legacy=excluded.legacy,
+                    created_utc=COALESCE(excluded.created_utc, groups.created_utc), day=excluded.day""",
+                          (gid, it["group_title"], json.dumps(it["group_sources"]), it["request_cmd"],
+                           int(it["legacy"]), created, day))
+            affected |= set(groups)
+            for path in gone:
+                r = c.execute("SELECT group_id FROM renders WHERE path=?", (path,)).fetchone()
+                if r:
+                    affected.add(r[0])
+                    c.execute("UPDATE renders SET missing=1 WHERE path=?", (path,))
+            self._aggregate(c, affected)
+            self._refresh_fts(c, affected)
+            if dir_state:
+                c.execute("INSERT INTO dirs VALUES(?,?) ON CONFLICT(project) DO UPDATE SET mtime_ns=excluded.mtime_ns",
+                          dir_state)
+            if items or gone:
+                self._bump(c)
+            c.execute("COMMIT")
+        except BaseException:
+            try:
+                c.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+    # -- indexing
+    def index_png(self, png: Path) -> bool:
+        """Index one freshly published render (called by `tulda render`)."""
+        png = Path(png)
+        pdir = self.root / png.parent.name
+        it = read_item(self.root, pdir, pdir / png.name)
+        if not it:
+            return False
+        with self.conn(True) as c:
+            self._apply(c, [it])
+        return True
+
+    def sync(self, force: bool = False) -> dict:
+        """Bring the DB in line with the disk. Incremental by default: a project directory
+        whose mtime is unchanged (and not very recent) is skipped. force=True re-reads every
+        sidecar (`tulda db reindex`). Never deletes metadata; vanished files are marked missing."""
+        st = {"indexed": 0, "missing": 0, "dirs": 0}
+        with self._sync_lock:
+            self.ensure()
+            self._last_sync = time.monotonic()
+            on_disk = [p for p in sorted(self.root.iterdir()) if is_project_dir(self.root, p)] \
+                if self.root.is_dir() else []
+            with self.conn(True) as c:
+                known = {r["project"]: r["mtime_ns"] for r in c.execute("SELECT * FROM dirs")}
+                names = {p.name for p in on_disk}
+                for proj in set(known) | {r[0] for r in c.execute(
+                        "SELECT DISTINCT project FROM renders WHERE missing=0")}:
+                    if proj not in names:
+                        gone = [r[0] for r in c.execute(
+                            "SELECT path FROM renders WHERE project=? AND missing=0", (proj,))]
+                        self._apply(c, [], gone)
+                        c.execute("DELETE FROM dirs WHERE project=?", (proj,))
+                        st["missing"] += len(gone)
+                for pdir in on_disk:
+                    try:
+                        mt = pdir.stat().st_mtime_ns
+                    except OSError:
+                        continue
+                    if not force and known.get(pdir.name) == mt \
+                            and time.time() - mt / 1e9 > RECENT_SECS:
+                        continue
+                    st["dirs"] += 1
+                    self._sync_project(c, pdir, mt, force, st)
+        self._last_sync = time.monotonic()
+        return st
+
+    def _sync_project(self, c, pdir: Path, dir_mtime: int, force: bool, st: dict) -> None:
+        disk: dict[str, tuple] = {}
+        sides: dict[str, float] = {}
+        try:
+            with os.scandir(pdir) as it:
+                for e in it:
+                    n = e.name
+                    if n.startswith("."):
+                        continue
+                    low = n.lower()
+                    try:
+                        if low.endswith(".png"):
+                            s = e.stat()
+                            disk[n] = (s.st_mtime, s.st_size)
+                        elif low.endswith(".json") and not low.endswith(".fail.json"):
+                            sides[n[:-5]] = e.stat().st_mtime
+                    except OSError:
+                        continue
+        except OSError:
+            return
+        known = {r["file"]: r for r in c.execute(
+            "SELECT file,mtime,size,sidecar_mtime,missing FROM renders WHERE project=?", (pdir.name,))}
+        todo = []
+        for n, (mt, sz) in disk.items():
+            k = known.get(n)
+            sm = sides.get(n[:-4])
+            if force or k is None or k["missing"] or k["mtime"] != mt or k["size"] != sz \
+                    or k["sidecar_mtime"] != sm:
+                todo.append(n)
+        gone = [f"{pdir.name}/{n}" for n, k in known.items() if n not in disk and not k["missing"]]
+        items = [it for it in (read_item(self.root, pdir, pdir / n) for n in todo) if it]
+        st["indexed"] += len(items)
+        st["missing"] += len(gone)
+        chunks = [items[i:i + CHUNK] for i in range(0, len(items), CHUNK)] or [[]]
+        for i, ch in enumerate(chunks):
+            last = i == len(chunks) - 1
+            self._apply(c, ch, gone if last else (), (pdir.name, dir_mtime) if last else None)
+
+    def maybe_sync(self, min_interval: float = 2.0) -> None:
+        """Cheap opportunistic incremental sync for request paths; skips if one ran recently
+        or is running."""
+        if time.monotonic() - self._last_sync < min_interval:
+            return
+        if not self._sync_lock.acquire(blocking=False):
+            return
+        self._sync_lock.release()
+        try:
+            self.sync()
+        except (sqlite3.Error, OSError) as e:
+            self.log(f"catalog: sync failed: {e}")
+
+    # -- reading
+    def rev(self) -> int:
+        with self.conn() as c:
+            r = c.execute("SELECT value FROM meta WHERE key='rev'").fetchone()
+            return int(r[0]) if r else 0
+
+    def latest(self) -> dict:
+        with self.conn() as c:
+            r = c.execute("SELECT max(mtime) FROM renders WHERE missing=0").fetchone()[0]
+            rev = c.execute("SELECT value FROM meta WHERE key='rev'").fetchone()
+            return {"rev": int(rev[0]) if rev else 0, "mtime": r or 0}
+
+    def _where(self, f: Filters, alias: str = "g") -> tuple[str, list]:
+        w = [f"{alias}.n_renders>0"]
+        a: list = []
+        if f.trashed_only:
+            w.append(f"{alias}.trashed_utc IS NOT NULL")
+        elif not f.trash:
+            w.append(f"{alias}.trashed_utc IS NULL")
+        if f.starred:
+            w.append(f"{alias}.starred=1")
+        if f.day:
+            if len(f.day) == 7:
+                w.append(f"{alias}.day>=? AND {alias}.day<=?")
+                a += [f.day + "-00", f.day + "-99"]
+            else:
+                w.append(f"{alias}.day=?")
+                a.append(f.day)
+        if f.since:
+            w.append(f"{alias}.day>=?")
+            a.append(f.since)
+        if f.until:
+            w.append(f"{alias}.day<=?")
+            a.append(f.until)
+        rc, ra = self._render_where(f, "r")
+        if rc:
+            w.append(f"EXISTS (SELECT 1 FROM renders r WHERE r.group_id={alias}.id AND r.missing=0 AND {rc})")
+            a += ra
+        for t in f.tags:
+            w.append(f"{alias}.id IN (SELECT group_id FROM tags WHERE tag=?)")
+            a.append(t)
+        if f.q is not None:
+            toks = search_tokens(f.q)
+            if not toks:
+                w.append("0")
+            elif self.fts:
+                w.append(f"{alias}.rid IN (SELECT rowid FROM search WHERE search MATCH ?)")
+                a.append(" ".join(f'"{t}"*' for t in toks))
+            else:
+                for t in toks:
+                    w.append(f"{alias}.search_text LIKE ?")
+                    a.append(f"%{t}%")
+        return " AND ".join(w), a
+
+    @staticmethod
+    def _render_where(f: Filters, alias: str = "r") -> tuple[str, list]:
+        w: list[str] = []
+        a: list = []
+        for col, vals in (("project", [f.project] if f.project else []), ("adapter", f.adapters),
+                          ("stage", f.stages), ("view", f.views)):
+            if vals:
+                w.append(f"{alias}.{col} IN ({','.join('?' * len(vals))})")
+                a += vals
+        return " AND ".join(w), a
+
+    def list_groups(self, f: Filters | None = None, limit: int = 20, cursor: str | None = None,
+                    with_items: bool = True) -> tuple[list[dict], str | None]:
+        """Newest-first page of groups (by last render mtime) and the cursor for the next page."""
+        f = f or Filters()
+        where, args = self._where(f)
+        if cursor:
+            cm, _, cid = cursor.partition("~")
+            try:
+                cm_f = float(cm)
+            except ValueError:
+                raise CatalogError("bad cursor") from None
+            where += " AND (g.last_mtime, g.id) < (?, ?)"
+            args += [cm_f, cid]
+        limit = max(1, min(int(limit), 500))
+        with self.conn() as c:
+            rows = c.execute(f"SELECT g.* FROM groups g WHERE {where} "
+                             f"ORDER BY g.last_mtime DESC, g.id DESC LIMIT ?", [*args, limit + 1]).fetchall()
+            more = len(rows) > limit
+            rows = rows[:limit]
+            out = self._hydrate(c, rows, f, with_items)
+        nxt = f"{rows[-1]['last_mtime']!r}~{rows[-1]['id']}" if more and rows else None
+        return out, nxt
+
+    def get_group(self, gid: str, f: Filters | None = None) -> dict | None:
+        with self.conn() as c:
+            row = c.execute("SELECT * FROM groups WHERE id=?", (gid,)).fetchone()
+            if not row:
+                return None
+            return self._hydrate(c, [row], f or Filters(), True)[0]
+
+    def resolve_group(self, ident: str) -> dict:
+        """Exact id, else a unique prefix; raises CatalogError otherwise."""
+        with self.conn() as c:
+            row = c.execute("SELECT id FROM groups WHERE id=?", (ident,)).fetchone()
+            if not row and ident:
+                like = ident.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+                rows = c.execute("SELECT id FROM groups WHERE id LIKE ? ESCAPE '\\' LIMIT 6", (like,)).fetchall()
+                if len(rows) > 1:
+                    raise CatalogError(f"{ident!r} is ambiguous: " + ", ".join(r[0] for r in rows[:5]))
+                row = rows[0] if rows else None
+        if not row:
+            raise CatalogError(f"no such group: {ident}")
+        return self.get_group(row[0])
+
+    def _hydrate(self, c, rows, f: Filters, with_items: bool) -> list[dict]:
+        ids = [r["id"] for r in rows]
+        tags: dict[str, list] = {i: [] for i in ids}
+        items: dict[str, list] = {i: [] for i in ids}
+        for i in range(0, len(ids), 400):
+            part = ids[i:i + 400]
+            ph = ",".join("?" * len(part))
+            for r in c.execute(f"SELECT group_id,tag FROM tags WHERE group_id IN ({ph}) ORDER BY tag", part):
+                tags[r[0]].append(r[1])
+            if with_items:
+                rc, ra = self._render_where(f, "r")
+                q = f"SELECT * FROM renders r WHERE r.group_id IN ({ph}) AND r.missing=0" + \
+                    (f" AND {rc}" if rc else "") + " ORDER BY r.seq, r.mtime, r.file"
+                for r in c.execute(q, [*part, *ra]):
+                    items[r["group_id"]].append(self._render_dict(r))
+        out = []
+        for r in rows:
+            try:
+                srcs = json.loads(r["sources"])
+            except ValueError:
+                srcs = []
+            out.append({"id": r["id"], "title": r["user_title"] or r["title"], "auto_title": r["title"],
+                        "user_title": r["user_title"], "sources": srcs, "cmd": r["request_cmd"],
+                        "legacy": bool(r["legacy"]), "created": r["created_utc"], "day": r["day"],
+                        "mtime": r["last_mtime"], "n_renders": r["n_renders"], "starred": bool(r["starred"]),
+                        "trashed": r["trashed_utc"], "notes": r["notes"], "tags": tags[r["id"]],
+                        "items": items[r["id"]]})
+        return out
+
+    @staticmethod
+    def _render_dict(r) -> dict:
+        return {"project": r["project"], "file": r["file"], "url": render_url(r["project"], r["file"]),
+                "json_url": render_url(r["project"], r["file"][:-4] + ".json") if r["has_sidecar"] else None,
+                "mtime": r["mtime"], "adapter": r["adapter"], "stage": r["stage"], "view": r["view"],
+                "source": r["source"], "source_type": r["source_type"], "created_utc": r["created_utc"],
+                "git_sha": r["git_sha"], "git_dirty": None if r["git_dirty"] is None else bool(r["git_dirty"]),
+                "tool_version": r["tool_version"], "source_sha256": r["source_sha256"],
+                "group_id": r["group_id"], "seq": r["seq"], "size": r["size"]}
+
+    def all_items(self, limit: int = 1000) -> list[dict]:
+        with self.conn() as c:
+            return [self._render_dict(r) for r in c.execute(
+                "SELECT * FROM renders WHERE missing=0 ORDER BY mtime DESC, file DESC LIMIT ?", (limit,))]
+
+    def dates(self, trash: bool = False) -> list[list]:
+        """[[day, group count], ...] newest first (cached per catalog revision)."""
+        key = ("dates", trash, self.rev())
+        hit = self._cache.get(key)
+        if hit is None:
+            with self.conn() as c:
+                hit = [[r[0], r[1]] for r in c.execute(
+                    "SELECT day, count(*) FROM groups WHERE n_renders>0"
+                    + ("" if trash else " AND trashed_utc IS NULL") + " AND day IS NOT NULL "
+                    "GROUP BY day ORDER BY day DESC")]
+            self._cache_put(key, hit)
+        return hit
+
+    def _cache_put(self, key, val) -> None:
+        with self._init_lock:
+            self._cache = {k: v for k, v in self._cache.items() if k[0] != key[0]}
+            self._cache[key] = val
+
+    def facets(self) -> dict:
+        key = ("facets", self.rev())
+        out = self._cache.get(key)
+        if out is None:
+            with self.conn() as c:
+                out = {}
+                for col in ("project", "adapter", "stage", "view"):
+                    out[col + "s"] = [[r[0], r[1]] for r in c.execute(
+                        f"SELECT {col}, count(*) FROM renders WHERE missing=0 AND {col} IS NOT NULL "
+                        f"GROUP BY {col} ORDER BY {col}")]
+                out["tags"] = [[r[0], r[1]] for r in c.execute(
+                    "SELECT tag, count(*) FROM tags WHERE group_id IN (SELECT id FROM groups WHERE n_renders>0) "
+                    "GROUP BY tag ORDER BY tag")]
+                out["trashed"] = c.execute(
+                    "SELECT count(*) FROM groups WHERE n_renders>0 AND trashed_utc IS NOT NULL").fetchone()[0]
+            self._cache_put(key, out)
+        return out
+
+    def stats(self) -> dict:
+        with self.conn() as c:
+            one = lambda q: c.execute(q).fetchone()[0]
+            size = self.path.stat().st_size if self.path.exists() else 0
+            return {"path": str(self.path), "schema_version": one("PRAGMA user_version"),
+                    "fts5": self.fts, "db_bytes": size,
+                    "groups": one("SELECT count(*) FROM groups WHERE n_renders>0"),
+                    "renders": one("SELECT count(*) FROM renders WHERE missing=0"),
+                    "missing_renders": one("SELECT count(*) FROM renders WHERE missing=1"),
+                    "starred": one("SELECT count(*) FROM groups WHERE starred=1 AND n_renders>0"),
+                    "trashed": one("SELECT count(*) FROM groups WHERE trashed_utc IS NOT NULL AND n_renders>0"),
+                    "tags": one("SELECT count(DISTINCT tag) FROM tags"),
+                    "projects": one("SELECT count(DISTINCT project) FROM renders WHERE missing=0"),
+                    "rev": one("SELECT COALESCE((SELECT value FROM meta WHERE key='rev'),0)")}
+
+    # -- management (CLI only; the HTTP server never calls these)
+    def _mutate(self, gid: str, sql: str, args=(), extra=None) -> None:
+        with self.conn(True) as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                if not c.execute("SELECT 1 FROM groups WHERE id=?", (gid,)).fetchone():
+                    raise CatalogError(f"no such group: {gid}")
+                if sql:
+                    c.execute(sql, args)
+                if extra:
+                    extra(c)
+                self._refresh_fts(c, [gid])
+                self._bump(c)
+                c.execute("COMMIT")
+            except BaseException:
+                try:
+                    c.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def set_title(self, gid: str, title: str | None) -> None:
+        self._mutate(gid, "UPDATE groups SET user_title=? WHERE id=?", ((title or "").strip() or None, gid))
+
+    def set_notes(self, gid: str, notes: str | None) -> None:
+        self._mutate(gid, "UPDATE groups SET notes=? WHERE id=?", (notes or None, gid))
+
+    def set_starred(self, gid: str, on: bool) -> None:
+        self._mutate(gid, "UPDATE groups SET starred=? WHERE id=?", (int(on), gid))
+
+    def set_trashed(self, gid: str, on: bool) -> None:
+        self._mutate(gid, "UPDATE groups SET trashed_utc=? WHERE id=?", (iso(time.time()) if on else None, gid))
+
+    def add_tags(self, gid: str, tags: list[str]) -> None:
+        tags = [norm_tag(t) for t in tags]
+        self._mutate(gid, "", (), lambda c: [c.execute("INSERT OR IGNORE INTO tags VALUES(?,?)", (gid, t))
+                                              for t in tags])
+
+    def remove_tags(self, gid: str, tags: list[str]) -> None:
+        tags = [norm_tag(t) for t in tags]
+        self._mutate(gid, "", (), lambda c: [c.execute("DELETE FROM tags WHERE group_id=? AND tag=?", (gid, t))
+                                              for t in tags])
+
+    def group_files(self, gid: str) -> list[tuple[str, str]]:
+        with self.conn() as c:
+            return [(r[0], r[1]) for r in c.execute(
+                "SELECT project, file FROM renders WHERE group_id=?", (gid,))]
+
+    def delete_group(self, gid: str) -> dict:
+        """Permanently delete a group's files (strictly inside the renders root) and its rows.
+        Rows of renders whose files could not be removed are kept."""
+        res = {"deleted": [], "errors": []}
+        for project, file in self.group_files(gid):
+            try:
+                res["deleted"] += safe_delete_render(self.root, project, file)
+            except (OSError, CatalogError) as e:
+                res["errors"].append(f"{project}/{file}: {e}")
+        with self.conn(True) as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                keep = {f"{e.split(': ')[0]}" for e in res["errors"]}
+                for project, file in [r for r in self.group_files(gid)]:
+                    if f"{project}/{file}" not in keep:
+                        c.execute("DELETE FROM renders WHERE path=?", (f"{project}/{file}",))
+                left = c.execute("SELECT count(*) FROM renders WHERE group_id=?", (gid,)).fetchone()[0]
+                if not left:
+                    rid = c.execute("SELECT rid FROM groups WHERE id=?", (gid,)).fetchone()
+                    if rid and self.fts:
+                        c.execute("DELETE FROM search WHERE rowid=?", (rid[0],))
+                    c.execute("DELETE FROM tags WHERE group_id=?", (gid,))
+                    c.execute("DELETE FROM groups WHERE id=?", (gid,))
+                else:
+                    self._aggregate(c, [gid])
+                    self._refresh_fts(c, [gid])
+                self._bump(c)
+                c.execute("COMMIT")
+            except BaseException:
+                try:
+                    c.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+        return res
+
+    def vacuum(self) -> None:
+        with self.conn(True) as c:
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            c.execute("VACUUM")
+            c.execute("PRAGMA optimize")
+
+    def check(self) -> list[str]:
+        """Problems: integrity errors, DB rows whose files vanished, files not in the DB."""
+        probs: list[str] = []
+        with self.conn() as c:
+            for r in c.execute("PRAGMA integrity_check"):
+                if r[0] != "ok":
+                    probs.append(f"integrity: {r[0]}")
+            indb = {r[0] for r in c.execute("SELECT path FROM renders WHERE missing=0")}
+        ondisk = set()
+        for pdir in (sorted(self.root.iterdir()) if self.root.is_dir() else []):
+            if is_project_dir(self.root, pdir):
+                for p in pdir.iterdir():
+                    if read_item(self.root, pdir, p):
+                        ondisk.add(f"{pdir.name}/{p.name}")
+        probs += [f"in index but not on disk: {p}" for p in sorted(indb - ondisk)[:50]]
+        probs += [f"on disk but not indexed: {p}" for p in sorted(ondisk - indb)[:50]]
+        return probs
+
+
+# ---- deletion safety --------------------------------------------------------------
+
+def _plain_name(n: str) -> bool:
+    return bool(n) and n not in (".", "..") and not n.startswith(".") \
+        and not any(ch in n for ch in "/\\\x00")
+
+
+def safe_delete_render(root: Path, project: str, file: str) -> list[str]:
+    """Delete <project>/<file> and its sidecar. Refuses anything that is not a plain
+    two-level name inside the (resolved) root, a project dir that is a symlink, or a file
+    that is a symlink resolving outside root. A symlink inside root is removed itself,
+    never its target. Returns the root-relative paths removed."""
+    root = root.resolve()
+    if not (_plain_name(project) and _plain_name(file) and file.lower().endswith(".png")):
+        raise CatalogError(f"refusing unsafe path {project!r}/{file!r}")
+    pdir = root / project
+    if os.path.islink(pdir) or not pdir.is_dir() or pdir.resolve().parent != root:
+        raise CatalogError(f"refusing: {project!r} is not a plain directory directly under the renders root")
+    removed = []
+    for name in (file, file[:-4] + ".json"):
+        p = pdir / name
+        if not os.path.lexists(p):
+            continue
+        if os.path.islink(p) and not p.resolve().is_relative_to(root):
+            raise CatalogError(f"refusing: {project}/{name} is a symlink that leaves the renders root")
+        if p.is_dir() and not os.path.islink(p):
+            raise CatalogError(f"refusing: {project}/{name} is a directory")
+        os.unlink(p)
+        removed.append(f"{project}/{name}")
+    return removed
+
+
+# ---- prune selection -----------------------------------------------------------------
+
+_DUR = re.compile(r"^(\d+)([hdw])$")
+
+
+def parse_duration(s: str) -> timedelta:
+    m = _DUR.match(s.strip().lower())
+    if not m:
+        raise CatalogError(f"bad duration {s!r}: use e.g. 12h, 30d, 2w")
+    n = int(m[1])
+    return timedelta(**{{"h": "hours", "d": "days", "w": "weeks"}[m[2]]: n})
+
+
+def select_prune(groups: list[dict], now: float, older_than: timedelta | None = None,
+                 keep_last: int | None = None, keep_starred: bool = True) -> list[dict]:
+    """Pure selection. groups: candidate groups (non-trashed, already scoped to a project),
+    each with 'mtime', 'starred'. The keep_last newest are kept; starred are kept unless
+    keep_starred is False; with older_than only groups whose newest render is older than that
+    go. At least one of older_than/keep_last is required."""
+    if older_than is None and keep_last is None:
+        raise CatalogError("prune needs --older-than and/or --keep-last")
+    ordered = sorted(groups, key=lambda g: (g["mtime"], g["id"]), reverse=True)
+    protected = {g["id"] for g in ordered[:keep_last]} if keep_last is not None else set()
+    cutoff = now - older_than.total_seconds() if older_than is not None else None
+    out = []
+    for g in ordered:
+        if g["id"] in protected or (keep_starred and g["starred"]):
+            continue
+        if cutoff is not None and g["mtime"] >= cutoff:
+            continue
+        out.append(g)
+    return out
+
+
+def prune_candidates(cat: Catalog, project: str | None = None) -> list[dict]:
+    """Non-trashed groups eligible for pruning. With a project: only groups whose present
+    renders are ALL in that project (a request spanning other projects is left alone)."""
+    sql = "SELECT g.id, g.last_mtime AS mtime, g.starred, g.n_renders, g.day, " \
+          "COALESCE(g.user_title, g.title) AS title FROM groups g WHERE g.n_renders>0 AND g.trashed_utc IS NULL"
+    args: list = []
+    if project:
+        sql += " AND EXISTS (SELECT 1 FROM renders r WHERE r.group_id=g.id AND r.missing=0 AND r.project=?)" \
+               " AND NOT EXISTS (SELECT 1 FROM renders r WHERE r.group_id=g.id AND r.missing=0 AND r.project<>?)"
+        args = [project, project]
+    with cat.conn() as c:
+        return [dict(r) for r in c.execute(sql, args)]

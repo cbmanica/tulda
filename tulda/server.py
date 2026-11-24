@@ -6,43 +6,56 @@ import json
 import os
 import re
 import shutil
+import sqlite3
+import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .catalog import Catalog, CatalogError, Filters, valid_day
 from .gallery import render_index
+from .items import (DATE_PREFIX, GROUP_ID, GROUP_PREFIX, RESERVED_DIRS, group_fields,  # noqa: F401
+                    is_project_dir, read_item)
+
 
 ALLOWED_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".svg": "image/svg+xml", ".json": "application/json",
                ".stl": "model/stl"}
-MAX_SIDECAR = 256 * 1024
-GROUP_ID = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
-GROUP_PREFIX = "_g"   # /_g/<group id>/ is the group page; a project dir of that name is not listed
+
+PAGE_SIZE = 20
 
 
-def _strs(v, limit=50) -> list[str]:
-    return [x[:200] for x in v[:limit] if isinstance(x, str)] if isinstance(v, list) else []
+def _vals(q: dict, key: str, pat=re.compile(r"^[^\x00-\x1f]{1,100}$")) -> list[str]:
+    return [v for v in q.get(key, []) if pat.match(v)][:10]
 
 
-def _text(v, limit=300):
-    return v[:limit] if isinstance(v, str) else None
+def parse_filters(q: dict, project: str | None = None, day: str | None = None) -> Filters:
+    """Validated Filters from a parsed query string (parse_qs). Unknown/invalid values are dropped."""
+    qv = (q.get("q") or [None])[0]
+    return Filters(project=project, adapters=_vals(q, "adapter"), stages=_vals(q, "stage"),
+                   views=_vals(q, "view"), tags=[t.lower() for t in _vals(q, "tag")],
+                   starred=(q.get("starred") or [""])[0] not in ("", "0"),
+                   trash=(q.get("trash") or [""])[0] not in ("", "0"),
+                   q=qv[:100] if qv else None, day=day)
 
 
-def group_fields(meta: dict, mtime: float) -> dict:
-    """Group info for one render. Sidecars without a valid group_id (legacy, or no sidecar)
-    are grouped by UTC day of their creation time."""
-    gid = meta.get("group_id")
-    if isinstance(gid, str) and GROUP_ID.match(gid):
-        return {"group_id": gid, "group_title": _text(meta.get("group_title")),
-                "group_sources": _strs(meta.get("group_sources")),
-                "request_cmd": _text(meta.get("request_cmd"), 1000),
-                "group_created_utc": _text(meta.get("group_created_utc"), 40),
-                "seq": meta["seq"] if isinstance(meta.get("seq"), int) else 0, "legacy": False}
-    day = datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d")
-    return {"group_id": f"legacy-{day.replace('-', '')}", "group_title": f"Earlier renders, {day}",
-            "group_sources": [], "request_cmd": None, "group_created_utc": None,
-            "seq": 0, "legacy": True}
+def filters_qs(f: Filters) -> str:
+    p: list[tuple[str, str]] = []
+    if f.project:
+        p.append(("project", f.project))
+    if f.day:
+        p.append(("day", f.day))
+    p += [("adapter", v) for v in f.adapters] + [("stage", v) for v in f.stages] + \
+         [("view", v) for v in f.views] + [("tag", v) for v in f.tags]
+    if f.starred:
+        p.append(("starred", "1"))
+    if f.trash:
+        p.append(("trash", "1"))
+    if f.q is not None:
+        p.append(("q", f.q))
+    return urllib.parse.urlencode(p)
 
 
 class PathError(Exception):
@@ -73,50 +86,15 @@ def safe_resolve(root: Path, urlpath: str) -> Path:
 
 
 def scan(root: Path) -> list[dict]:
+    """Full filesystem scan (no catalog). Kept for tests and as the reference for the indexer."""
     items = []
     for pdir in sorted(root.iterdir()):
-        if pdir.name.startswith(".") or pdir.name == GROUP_PREFIX or not pdir.is_dir():
-            continue
-        try:
-            if not pdir.resolve().is_relative_to(root):
-                continue
-        except OSError:
+        if not is_project_dir(root, pdir):
             continue
         for png in pdir.iterdir():
-            if png.name.startswith(".") or png.suffix.lower() != ".png":
-                continue
-            try:
-                rp = png.resolve(strict=True)
-                if not rp.is_relative_to(root):
-                    continue
-                mtime = rp.stat().st_mtime
-            except OSError:
-                continue
-            meta = {}
-            side = png.with_suffix(".json")
-            try:
-                if side.is_file() and side.resolve().is_relative_to(root) \
-                        and side.stat().st_size <= MAX_SIDECAR:
-                    meta = json.loads(side.read_text())
-                    if not isinstance(meta, dict):
-                        meta = {}
-            except (OSError, ValueError):
-                meta = {}
-            q = urllib.parse.quote
-            items.append({
-                "project": pdir.name, "file": png.name,
-                "url": f"/{q(pdir.name)}/{q(png.name)}",
-                "json_url": f"/{q(pdir.name)}/{q(side.name)}" if meta else None,
-                "mtime": mtime, "adapter": meta.get("adapter") or "unknown",
-                "stage": meta.get("stage") or "unknown",
-                "source_type": meta.get("source_type"), "source": meta.get("source"),
-                "created_utc": meta.get("created_utc"), "git_sha": meta.get("git_sha"),
-                "git_dirty": meta.get("git_dirty"),
-                "tool_version": ((meta.get("steps") or [{}])[-1] or {}).get("tool_version")
-                if isinstance(meta.get("steps"), list) and meta.get("steps") else None,
-                "source_sha256": meta.get("source_sha256"),
-                "view": _text(meta.get("view"), 40), **group_fields(meta, mtime),
-            })
+            it = read_item(root, pdir, png)
+            if it:
+                items.append(it)
     items.sort(key=lambda i: (i["mtime"], i["file"]), reverse=True)
     return items
 
@@ -163,26 +141,77 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return name in self.server.allowed_hosts
 
+    def _json(self, obj, head: bool):
+        return self._send(200, json.dumps(obj).encode(), "application/json", head,
+                          {"Cache-Control": "no-store"})
+
+    def _page(self, ctx: dict, f: Filters, head: bool, groups=None, nxt=None):
+        cat: Catalog = self.server.catalog
+        if groups is None:
+            groups, nxt = cat.list_groups(f, PAGE_SIZE)
+        data = {"ctx": ctx, "groups": groups, "next": nxt, "facets": cat.facets(),
+                "dates": cat.dates(f.trash), "rev": cat.rev(), "qs": filters_qs(f),
+                "filters": {"adapter": f.adapters, "stage": f.stages, "view": f.views, "tag": f.tags,
+                            "starred": f.starred, "trash": f.trash}}
+        return self._send_page(render_index(data), head)
+
     def _serve(self, head: bool):
         if not self._host_ok():
             return self._send(403, b"bad host\n", head=head)
         path = self.path
         if not path.startswith("/"):
             return self._send(400, b"bad request\n", head=head)
-        route = urllib.parse.unquote(path.split("?", 1)[0].split("#", 1)[0])
-        root: Path = self.server.root
-        if route == "/api/index":
-            body = json.dumps(scan(root)).encode()
-            return self._send(200, body, "application/json", head,
-                              {"Cache-Control": "no-store"})
+        raw, _, query = path.partition("#")[0].partition("?")
+        route = urllib.parse.unquote(raw)
+        q = urllib.parse.parse_qs(query, max_num_fields=40)
         gparts = [p for p in route.split("/") if p]
+        try:
+            return self._route(route, gparts, q, path, self.server.root, self.server.catalog, head)
+        except CatalogError as e:
+            return self._send(400, (str(e) + "\n").encode(), head=head)
+        except sqlite3.Error as e:
+            self.server.log(f"catalog error on {raw}: {e}")
+            return self._send(503, b"catalog unavailable; retry\n", head=head)
+
+    def _route(self, route, gparts, q, path, root, cat, head):
+        cat.maybe_sync(self.server.sync_min_interval)
+        if route == "/api/latest":
+            return self._json(cat.latest(), head)
+        if route == "/api/dates":
+            return self._json({"dates": cat.dates((q.get("trash") or [""])[0] not in ("", "0"))}, head)
+        if route == "/api/index":
+            try:
+                lim = int((q.get("limit") or ["1000"])[0])
+            except ValueError:
+                lim = 1000
+            return self._json(cat.all_items(max(1, min(lim, 5000))), head)
+        if route == "/api/groups":
+            day = (q.get("day") or [None])[0]
+            if day and not valid_day(day):
+                return self._send(400, b"bad day\n", head=head)
+            proj = (q.get("project") or [None])[0]
+            f = parse_filters(q, proj, day)
+            try:
+                lim = int((q.get("limit") or [str(PAGE_SIZE)])[0])
+            except ValueError:
+                lim = PAGE_SIZE
+            groups, nxt = cat.list_groups(f, lim, (q.get("cursor") or [None])[0])
+            return self._json({"groups": groups, "next": nxt}, head)
+        if route == "/search":
+            f = parse_filters(q)
+            return self._page({"kind": "search", "q": f.q or ""}, f, head)
+        if gparts and gparts[0] == DATE_PREFIX:
+            if len(gparts) != 2 or not valid_day(gparts[1]):
+                return self._send(404, b"not found\n", head=head)
+            f = parse_filters(q, None, gparts[1])
+            return self._page({"kind": "day", "day": gparts[1]}, f, head)
         if gparts and gparts[0] == GROUP_PREFIX:
             if len(gparts) != 2 or not GROUP_ID.match(gparts[1]):
                 return self._send(404, b"not found\n", head=head)
-            items = scan(root)
-            if not any(i["group_id"] == gparts[1] for i in items):
+            g = cat.get_group(gparts[1])
+            if not g or not g["n_renders"]:
                 return self._send(404, b"no such group\n", head=head)
-            return self._send_page(render_index(items, None, gparts[1]), head)
+            return self._page({"kind": "group", "group": gparts[1]}, Filters(trash=True), head, [g], None)
         try:
             target = safe_resolve(root, path)
         except PathError as e:
@@ -190,8 +219,10 @@ class Handler(BaseHTTPRequestHandler):
         if target.is_dir():
             if target != root and target.parent != root:
                 return self._send(404, b"not found\n", head=head)
-            project = None if target == root else target.name
-            return self._send_page(render_index(scan(root), project), head)
+            if target == root:
+                return self._page({"kind": "recent"}, parse_filters(q), head)
+            return self._page({"kind": "project", "project": target.name},
+                              parse_filters(q, target.name), head)
         ctype = ALLOWED_EXT.get(target.suffix.lower())
         if ctype is None or not target.is_file():
             return self._send(403, b"file type not served\n", head=head)
@@ -235,12 +266,18 @@ class Server(ThreadingHTTPServer):
         self.server_port = self.server_address[1]
 
 
-def make_server(root: Path, host: str, port: int, allowed_hosts=(), verbose=False) -> Server:
+def make_server(root: Path, host: str, port: int, allowed_hosts=(), verbose=False,
+                catalog: Catalog | None = None, log=print) -> Server:
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     srv = Server((host, port), Handler)
     srv.root = root
     srv.verbose = verbose
+    srv.log = log
+    srv.sync_min_interval = 2.0
+    srv.catalog = catalog or Catalog(root, log=log)
+    if catalog is None:
+        srv.catalog.sync()
     srv.allowed_hosts = {h.lower() for h in allowed_hosts} | {"127.0.0.1", "localhost", host.lower()}
     return srv
 
@@ -251,13 +288,16 @@ class MultiServer:
     seconds while the others keep serving."""
 
     def __init__(self, root, hosts, port, allowed_hosts=(), verbose=False,
-                 retry_interval=15.0, log=print):
+                 retry_interval=15.0, log=print, sync_interval=30.0):
         import threading
         self.root = Path(root).resolve()
         self.port = port
         self.verbose = verbose
         self.retry_interval = retry_interval
         self.log = log
+        self.sync_interval = sync_interval
+        self.catalog = Catalog(self.root, log=log)
+        self._initial_sync()
         self.allowed = {h.lower() for h in allowed_hosts} | {"localhost", "127.0.0.1"}
         self.servers: dict[str, Server] = {}
         self.pending: list[str] = list(dict.fromkeys(hosts))
@@ -267,13 +307,29 @@ class MultiServer:
         self._threads: list = []
         self.try_bind()
 
+    def _initial_sync(self) -> None:
+        t0 = time.monotonic()
+        try:
+            st = self.catalog.sync()
+            self.log(f"catalog: {self.catalog.path} synced in {time.monotonic() - t0:.2f}s "
+                     f"({st['indexed']} indexed, {st['missing']} missing, {st['dirs']} dirs scanned)")
+        except (sqlite3.Error, OSError) as e:
+            self.log(f"catalog: initial sync failed: {e}")
+
+    def _sync_loop(self):
+        while not self._stop.wait(self.sync_interval):
+            try:
+                self.catalog.sync()
+            except (sqlite3.Error, OSError) as e:
+                self.log(f"catalog: sync failed: {e}")
+
     def try_bind(self) -> list[str]:
         import threading
         got = []
         with self._lock:
             for h in list(self.pending):
                 try:
-                    srv = make_server(self.root, h, self.port, (), self.verbose)
+                    srv = make_server(self.root, h, self.port, (), self.verbose, self.catalog, self.log)
                 except OSError as e:
                     if self.errors.get(h) != str(e):
                         self.log(f"cannot bind {h}:{self.port}: {e}; will retry")
@@ -301,6 +357,8 @@ class MultiServer:
     def serve_forever(self):
         import threading
         threading.Thread(target=self._retry_loop, daemon=True, name="bind-retry").start()
+        if self.sync_interval > 0:
+            threading.Thread(target=self._sync_loop, daemon=True, name="catalog-sync").start()
         self._stop.wait()
 
     def shutdown(self):

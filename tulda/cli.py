@@ -188,7 +188,7 @@ def cmd_serve(args) -> int:
     magic = tailscale_dnsname() if args.tailscale else None
     names = [bonjour_name(), *local_host_names(magic), *args.allow_host]
     srv = MultiServer(root, hosts, port, names, args.verbose,
-                      log=lambda m: print(m, flush=True))
+                      log=lambda m: print(m, flush=True), sync_interval=args.sync_interval)
     if not srv.servers:
         print("error: could not bind any address; exiting for launchd retry", file=sys.stderr, flush=True)
         return 1
@@ -273,8 +273,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--log-dir", help="rotate and redirect stdout/stderr to server.{out,err}.log here")
     s.add_argument("--watch-interval", type=float, default=30.0, metavar="SEC",
                    help="exit 75 if an auto-detected address (LAN/tailnet) differs from the bound one (0 = off)")
+    s.add_argument("--sync-interval", type=float, default=30.0, metavar="SEC",
+                   help="incremental catalog sync period for renders created elsewhere (0 = off)")
     common(s)
     s.set_defaults(fn=cmd_serve)
+    from .manage import add_manage_parsers
+    add_manage_parsers(sub, common)
     from .service import add_service_parser
     add_service_parser(sub)
     return p

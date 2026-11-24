@@ -226,6 +226,7 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
         png = proj_dir / f"{base}.png"
         _atomic_write(png, src=cur)
         _atomic_write(proj_dir / f"{base}.json", json.dumps(sidecar, indent=2).encode())
+        _index(renders_root, png)
         if keep:
             keep_dir = renders_root.parent / "build" / base
             keep_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -233,6 +234,17 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
         return png
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _index(renders_root: Path, png: Path) -> None:
+    """Add the new render to the catalog. The files are the source of truth, so a failure
+    here only costs a warning (the server's next sync, or `tulda db reindex`, picks it up)."""
+    import sys
+    from .catalog import Catalog
+    try:
+        Catalog(renders_root, log=lambda m: print(m, file=sys.stderr)).index_png(png)
+    except Exception as e:  # noqa: BLE001
+        print(f"warning: catalog not updated ({e}); run `tulda db reindex`", file=sys.stderr)
 
 
 def _now() -> str:
