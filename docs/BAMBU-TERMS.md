@@ -45,7 +45,7 @@ Good-faith engineering review, fetched 2026-11-24. Not legal advice. Inferences 
 
 ### 2. Bambu Lab Terms of Use / EULA / cloud terms
 
-Bambu's own Terms of Use were read in full in the 2026-11-24 review; see the next section.
+Bambu's own Terms of Use were reviewed from the public page on 2026-11-24; see the next section.
 The earlier attempt to fetch them failed (HTTP 403 from https://bambulab.com/en-us/policies/terms
 and https://bambulab.com/en-us/legal; HTTP 402 from https://us.store.bambulab.com/agree-terms),
 so the earlier wording below is superseded where it differs. The software licence text shown at
@@ -66,27 +66,28 @@ install time was not seen.
 ## Bambu Lab Terms of Use (reviewed 2026-11-24, version dated 24 April 2024)
 
 URL: https://bambulab.com/en-us/policies/terms (the version reviewed is marked "last updated
-24 April 2024"). Read from the full text supplied for this review. Quotes are short excerpts;
-read the Terms themselves before relying on this.
+24 April 2024"). Reviewed from the public page. Clauses are paraphrased except for the short
+quotes shown; read the Terms themselves before relying on this.
 
 Scope (sections 1.1 and 1.2):
-- 1.1 defines "the Product" as "the Bambu Lab device, and the software contained therein",
+- 1.1 defines "the Product" as the Bambu Lab device and the software contained in it,
   including updates.
-- 1.2 says the Software is bound "whether it is stored in a read-only memory or any other media
-  or form or it is from an online download location authorized by Bambu Lab".
+- 1.2 extends the Software definition to copies however stored or obtained, including from an
+  online download location authorized by Bambu Lab.
 - Open interpretation question (inference): the text does not make clear whether Bambu Studio,
   which is separately licensed under AGPL-3.0 on GitHub, counts as "the Software" here.
 
 Grants and restrictions that bear on tulda:
 - 2: "a limited and non-exclusive licence to access and use this software ... on only one Bambu
   Lab device".
-- 3.2: "You may not distribute or provide the Software through networks so that it is available
-  to multiple devices or computers at the same time."
-- 3.4: no "reverse engineer, publish, publicly disseminate, decompile, export codes, disassemble
-  or create derivatives of the Product".
-- 3.5(2): no "provide to third parties, or allow third parties to use the whole or part of the
-  Software without obtaining Bambu Lab's written consent (including but not limited to apps,
-  services, code, and source code)".
+- 3.2: no distributing or providing the Software through networks so that it is available to
+  multiple devices or computers at the same time (paraphrase).
+- 3.3: no sale, lease, sublicensing or distribution of the Software to third parties without
+  written permission (paraphrase).
+- 3.4: no "reverse engineer, publish, publicly disseminate, decompile, export codes,
+  disassemble or create derivatives of the Product".
+- 3.5(2): no providing third parties with the Software, or allowing them to use it, including
+  apps, services and code, "without obtaining Bambu Lab's written consent".
 - 8.2 and the "Bambu cloud" paragraph: cloud and account features (for example remote printing
   and remote monitoring) need an account and "additional terms". tulda uses none of them.
 - 17: governing law is the law of the People's Republic of China, with CIETAC arbitration.
