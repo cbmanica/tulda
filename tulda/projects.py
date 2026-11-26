@@ -31,6 +31,8 @@ MakerWorld detection (conservative; `--force` overrides for `project create`):
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import fnmatch
 import hashlib
 import json
@@ -50,6 +52,9 @@ from pathlib import Path, PurePosixPath
 from .errors import TuldaError
 
 MANIFEST = "tulda-project.json"
+LOCK_NAME = ".tulda-project.lock"
+STAGING_PREFIX = ".tulda-staging-"
+STALE_STAGING = 24 * 3600            # staging dirs older than this are leftovers of a kill
 LICENCE_NOTE = "LICENCE-NOTE.txt"
 KEEP_EXT = {".3mf", ".scad", ".stl", ".step", ".stp", ".obj", ".amf", ".ply", ".f3d", ".iges",
             ".igs", ".dxf", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".txt",
@@ -259,10 +264,39 @@ def detect(src: Path) -> tuple[bool, str]:
 
 # ---- create -------------------------------------------------------------------------------
 
+@contextlib.contextmanager
+def dest_lock(dest: Path):
+    """Exclusive advisory lock on DEST/.tulda-project.lock, so a manual `project create` and the
+    watch service never pick the same name or import the same source twice."""
+    fd = os.open(Path(dest) / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def clean_stale_staging(dest: Path, now: float | None = None) -> int:
+    """Remove staging dirs left by a killed import (older than STALE_STAGING). Call under lock."""
+    now = now or time.time()
+    n = 0
+    for p in Path(dest).glob(STAGING_PREFIX + "*"):
+        try:
+            if p.is_dir() and now - p.stat().st_mtime > STALE_STAGING:
+                shutil.rmtree(p, ignore_errors=True)
+                n += 1
+        except OSError:
+            continue
+    return n
+
+
 def find_existing(dest: Path, sha: str) -> Path | None:
     if not dest.is_dir():
         return None
     for m in dest.glob(f"*/{MANIFEST}"):
+        if m.parent.name.startswith("."):
+            continue                    # staging dirs and other hidden folders are not projects
         try:
             if json.loads(m.read_text("utf-8")).get("source", {}).get("sha256") == sha:
                 return m.parent
@@ -330,7 +364,10 @@ def licence_note(name: str, models: list[dict]) -> str:
 def create_project(src: Path, dest: Path, force: bool = False,
                    now: datetime | None = None) -> tuple[str, Path]:
     """-> ("created" | "exists", project dir). Raises NotMakerWorld / UnsafeArchive / ProjectError.
-    Builds in a staging dir inside dest and renames it into place, so a failure leaves nothing."""
+    Builds in a hidden staging dir inside dest and renames it into place, so a failure or kill
+    never leaves a half project that looks complete. The name choice and rename happen under
+    DEST/.tulda-project.lock with a second sha256 check, so concurrent importers (the watch
+    service and a manual `project create`) cannot create duplicates."""
     src = Path(src)
     if not src.is_file():
         raise ProjectError(f"{src.name}: no such file")
@@ -345,7 +382,7 @@ def create_project(src: Path, dest: Path, force: bool = False,
     existing = find_existing(dest, sha)
     if existing:
         return "exists", existing
-    staging = Path(tempfile.mkdtemp(prefix=".tulda-staging-", dir=dest))
+    staging = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=dest))
     try:
         (staging / "source").mkdir()
         shutil.copy2(src, staging / "source" / src.name)
@@ -362,19 +399,27 @@ def create_project(src: Path, dest: Path, force: bool = False,
                       and m["provenance"].get("title")), None) \
             or next((m["provenance"].get("title") for m in models
                      if m["provenance"] and m["provenance"].get("title")), None)
-        target = unique_dir(dest, base_name(title, src.stem))
+        name = base_name(title, src.stem)
         now = now or datetime.now(timezone.utc)
         manifest = {
-            "tulda_project": 1, "name": target.name,
+            "tulda_project": 1, "name": name,
             "created_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "source": {"filename": src.name, "sha256": sha, "size": src.stat().st_size, "type": ext[1:]},
             "detection": {"makerworld": ok, "reason": reason, "forced": bool(force and not ok)},
             "files": files, "skipped": skipped, "models": models,
             "note": "Self-reported metadata; the MakerWorld page is authoritative. Do not redistribute.",
         }
-        (staging / MANIFEST).write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", "utf-8")
-        (staging / LICENCE_NOTE).write_text(licence_note(target.name, models), "utf-8")
-        os.rename(staging, target)
+        with dest_lock(dest):
+            existing = find_existing(dest, sha)
+            if existing:
+                shutil.rmtree(staging, ignore_errors=True)
+                return "exists", existing
+            target = unique_dir(dest, name)
+            manifest["name"] = target.name
+            (staging / MANIFEST).write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", "utf-8")
+            (staging / LICENCE_NOTE).write_text(licence_note(target.name, models), "utf-8")
+            os.rename(staging, target)
+            clean_stale_staging(dest)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -596,10 +641,14 @@ def cmd_watch(args) -> int:
         print("summary: " + ", ".join(f"{k} {v}" for k, v in c.items()), flush=True)
         return 1 if c["errors"] else 0
     print(f"watching {src_dir} every {args.interval:g}s -> {dest} (Ctrl-C to stop)", flush=True)
+    from .watchd import Stopper
+    stop = Stopper(lambda m: print(m, flush=True))
+    stop.install()
     try:
-        w.run(interval=args.interval)
+        w.run(interval=args.interval, sleep=stop.sleep, should_stop=stop)
     except KeyboardInterrupt:
-        print("stopped", flush=True)
+        print("aborted the current file", flush=True)
+    print("stopped", flush=True)
     return 0
 
 
@@ -623,6 +672,11 @@ def add_project_parsers(sub) -> None:
                    "com.tulda.watch service runs")
     w.add_argument("--config", metavar="PATH",
                    help="watch config to use instead of the user config (with --from-config)")
+    w.add_argument("--log-dir", metavar="DIR",
+                   help="rotate and redirect output to DIR/watch.log and watch.err.log (with --from-config)")
+    w.add_argument("--state-dir", metavar="DIR",
+                   help="where watch.json and the last-known-good config live (default "
+                   "$TULDA_STATE_DIR, else $XDG_STATE_HOME/tulda or ~/.local/state/tulda)")
     w.add_argument("--once", action="store_true", help="scan once and exit")
     w.add_argument("--interval", type=float, default=None, metavar="SEC",
                    help="poll period (default 5; overrides the config)")

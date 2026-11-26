@@ -132,7 +132,8 @@ class Create(unittest.TestCase):
         self.assertIn("Standard Digital File License", note)
         self.assertIn("authoritative", note)
         self.assertIn("Do not redistribute", note)
-        self.assertEqual([p.name for p in self.dest.iterdir()], [proj.name])   # no staging left
+        self.assertEqual([p.name for p in self.dest.iterdir() if p.name != projects.LOCK_NAME],
+                         [proj.name])                             # no staging left
 
     def test_unknown_licence_note(self):
         src = write_zip(self.d / "T_stls.zip", {"a.stl": b"solid"})
@@ -256,7 +257,7 @@ class WatcherTests(unittest.TestCase):
         (self.inbox / "b.3mf.part").unlink()
         self.w.poll()
         self.w.poll()
-        self.assertEqual(len(list(self.dest.iterdir())), 2)
+        self.assertEqual(len([p for p in self.dest.iterdir() if not p.name.startswith(".")]), 2)
 
     def test_growing_file_waits(self):
         f = self.inbox / "g.3mf"

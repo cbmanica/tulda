@@ -249,6 +249,154 @@ class Doctor(unittest.TestCase):
         self.assertIn("[BROKEN] watch config", out.getvalue())
 
 
+class Robustness(unittest.TestCase):
+    def setUp(self):
+        self.d = tmpdir()
+        self.addCleanup(shutil.rmtree, self.d)
+        self.dest = self.d / "projects"
+        self.src = write_3mf(self.d / "a.3mf")
+
+    def visible(self):
+        return sorted(p.name for p in self.dest.iterdir() if not p.name.startswith("."))
+
+    def test_second_sha_check_under_lock(self):
+        projects.create_project(self.src, self.dest)
+        real = projects.find_existing
+        calls = []
+
+        def racy(dest, sha):                      # the unlocked fast path misses the other import
+            calls.append(1)
+            return None if len(calls) == 1 else real(dest, sha)
+        with mock.patch.object(projects, "find_existing", racy):
+            state, proj = projects.create_project(self.src, self.dest)
+        self.assertEqual(state, "exists")
+        self.assertEqual(self.visible(), ["Example-Box-v2-final"])
+        self.assertFalse(list(self.dest.glob(projects.STAGING_PREFIX + "*")))
+
+    def test_concurrent_importers(self):
+        import threading
+        results, barrier = [], threading.Barrier(4)
+
+        def go():
+            barrier.wait()
+            results.append(projects.create_project(self.src, self.dest)[0])
+        ts = [threading.Thread(target=go) for _ in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(sorted(results), ["created", "exists", "exists", "exists"])
+        self.assertEqual(self.visible(), ["Example-Box-v2-final"])
+
+    def test_interrupt_leaves_nothing(self):
+        with mock.patch.object(projects, "licence_note", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                projects.create_project(self.src, self.dest)
+        self.assertEqual([p.name for p in self.dest.iterdir() if p.name != projects.LOCK_NAME], [])
+
+    def test_staging_dirs_are_not_projects_and_stale_ones_are_removed(self):
+        self.dest.mkdir()
+        st = self.dest / (projects.STAGING_PREFIX + "old")
+        st.mkdir()
+        (st / projects.MANIFEST).write_text('{"source": {"sha256": "%s"}}' % projects.sha256_file(self.src))
+        old = time.time() - projects.STALE_STAGING - 10
+        os.utime(st, (old, old))
+        fresh = self.dest / (projects.STAGING_PREFIX + "fresh")
+        fresh.mkdir()
+        state, _ = projects.create_project(self.src, self.dest)
+        self.assertEqual(state, "created")            # the staging manifest did not count
+        self.assertFalse(st.exists())
+        self.assertTrue(fresh.exists())               # may belong to a running importer
+
+
+class DaemonState(unittest.TestCase):
+    def setUp(self):
+        self.d = tmpdir()
+        self.addCleanup(shutil.rmtree, self.d)
+        self.inbox, self.dest, self.sdir = self.d / "inbox", self.d / "projects", self.d / "state"
+        self.inbox.mkdir()
+        self.cfg = self.d / "config.toml"
+        self.cfg.write_text(f'[watch]\nsettle = 0\n[[watch.dir]]\npath = "{self.inbox}"\n'
+                            f'destination = "{self.dest}"\n')
+        self.logs = []
+
+    def test_state_file(self):
+        from tulda import watchd
+        write_3mf(self.inbox / "a.3mf")
+        now = [time.time() + 10]
+        dm = watchd.WatchDaemon(self.cfg, self.sdir, log=self.logs.append, clock=lambda: now[0])
+        dm.start()
+        dm.tick()
+        now[0] += 6
+        dm.tick()
+        st = watchd.read_state(self.sdir)
+        self.assertEqual(st["mode"], "config")
+        self.assertEqual(st["pid"], os.getpid())
+        self.assertTrue(st["last_poll"])
+        self.assertEqual(st["last_created"]["project"], "Example-Box-v2-final")
+        self.assertEqual(st["dirs"][0]["totals"]["created"], 1)
+        self.assertEqual(oct((self.sdir / "watch.json").stat().st_mode & 0o777), "0o600")
+        text = "\n".join(watchd.state_lines(st))
+        self.assertIn("Example-Box-v2-final <- a.3mf", text)
+        self.assertIn("running", text)
+
+    def test_unlistable_dir_logged_once_and_in_state(self):
+        from tulda import watchd
+        dm = watchd.WatchDaemon(self.cfg, self.sdir, log=self.logs.append)
+        dm.start()
+        shutil.rmtree(self.inbox)
+        for _ in range(3):
+            dm.loop.entries[next(iter(dm.loop.entries))][2] = 0
+            dm.tick()
+        self.assertEqual(sum("cannot list" in m for m in self.logs), 1)
+        st = watchd.read_state(self.sdir)
+        self.assertIn("cannot list", st["last_error"]["message"])
+        self.assertIn("cannot list", st["dirs"][0]["error"])
+
+    def test_tcc_error_in_watcher(self):
+        w = projects.Watcher(self.inbox, self.dest, log=self.logs.append)
+
+        def boom(self_):
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+        with mock.patch.object(Path, "iterdir", boom), mock.patch.object(wc.sys, "platform", "darwin"):
+            w.poll()
+            w.poll()
+        self.assertTrue(w.tcc_blocked)
+        self.assertEqual(len(self.logs), 1)
+        self.assertIn("Full Disk Access", self.logs[0])
+
+    def test_state_lines_fallback_and_missing(self):
+        from tulda import watchd
+        self.assertIn("no state file", watchd.state_lines(None)[0])
+        st = {"pid": -1, "mode": "fallback", "since": "2026-01-01T00:00:00+00:00",
+              "reason": "bad toml", "dirs": []}
+        text = "\n".join(watchd.state_lines(st))
+        self.assertIn("running on fallback config since 2026-01-01T00:00:00+00:00: bad toml", text)
+        self.assertIn("not running", text)
+
+    def test_sigterm_clean_exit_and_log_dir(self):
+        import signal
+        logdir = self.d / "logs"
+        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent))
+        p = subprocess.Popen([sys.executable, "-m", "tulda", "watch", "--from-config", "--config",
+                              str(self.cfg), "--state-dir", str(self.sdir), "--log-dir", str(logdir),
+                              "--interval", "0.2"], env=env)
+        try:
+            end = time.time() + 15
+            while time.time() < end and not (self.sdir / "watch.json").exists():
+                time.sleep(0.1)
+            self.assertTrue((self.sdir / "watch.json").exists())
+            p.send_signal(signal.SIGTERM)
+            self.assertEqual(p.wait(15), 0)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        log = (logdir / "watch.log").read_text()
+        self.assertIn("received SIGTERM", log)
+        self.assertIn("stopped", log)
+        self.assertTrue((logdir / "watch.err.log").exists())
+
+
 class ZipConfigNeverExtracted(unittest.TestCase):
     """A config inside a downloaded zip could inject adapter commands via the walk-up project
     config lookup used by `render`; it must never be extracted."""

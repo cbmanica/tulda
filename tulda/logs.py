@@ -10,14 +10,15 @@ from pathlib import Path
 MAX_BYTES = 5 * 1024 * 1024
 KEEP = 2
 LOG_NAMES = {"out": "server.out.log", "err": "server.err.log"}
+WATCH_LOG_NAMES = {"out": "watch.log", "err": "watch.err.log"}
 
 
 def default_log_dir() -> Path:
     return Path.home() / "Library" / "Logs" / "tulda"
 
 
-def log_path(log_dir: Path, err: bool = False) -> Path:
-    return Path(log_dir) / LOG_NAMES["err" if err else "out"]
+def log_path(log_dir: Path, err: bool = False, names: dict | None = None) -> Path:
+    return Path(log_dir) / (names or LOG_NAMES)["err" if err else "out"]
 
 
 def rotate(path: Path, max_bytes: int = MAX_BYTES, keep: int = KEEP) -> bool:
@@ -56,14 +57,15 @@ def tail_lines(path: Path, n: int) -> list[str]:
     return list(deque(lines, maxlen=n))
 
 
-def redirect_stdio(log_dir: Path, max_bytes: int = MAX_BYTES, keep: int = KEEP) -> None:
+def redirect_stdio(log_dir: Path, max_bytes: int = MAX_BYTES, keep: int = KEEP,
+                   names: dict | None = None) -> None:
     """Rotate the service log files, then point fd 1 and 2 at fresh append-mode
     handles. launchd opened the files before we started; doing it ourselves means
     the rotated-away file is never the one we keep writing to."""
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     for err in (False, True):
-        p = log_path(log_dir, err)
+        p = log_path(log_dir, err, names)
         rotate(p, max_bytes, keep)
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         os.dup2(fd, 2 if err else 1)
