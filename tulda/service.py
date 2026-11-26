@@ -1,4 +1,6 @@
-"""Run `tulda serve` as a macOS launchd user service (LaunchAgent).
+"""Run `tulda serve` (com.tulda.server) and `tulda watch --from-config` (com.tulda.watch) as
+macOS launchd user services (LaunchAgents). Every subcommand takes an optional target
+`server` (default, unchanged behaviour), `watch` or `all`.
 
 Design notes
 - Launch line: the absolute path of the Python that runs the install command
@@ -16,6 +18,9 @@ Design notes
   `start` re-enables it for this session. With --at-login it stays enabled and
   RunAtLoad is true.
 - All launchctl calls go through `run_launchctl` so tests can mock it.
+- The watcher is a separate job, not a thread in `serve`: the server exits 75 on every address
+  change, must stay read-only, and must not share fate with archive extraction or Bambu Studio
+  renders. Only the watcher may need a macOS privacy grant (Full Disk Access) for its inbox.
 """
 
 from __future__ import annotations
@@ -33,6 +38,9 @@ from . import logs
 from .errors import TuldaError
 
 LABEL = "com.tulda.server"
+WATCH_LABEL = "com.tulda.watch"
+LABELS = {"server": LABEL, "watch": WATCH_LABEL}
+EXIT_TIMEOUT = 30          # seconds launchd waits after SIGTERM (the watcher finishes a file)
 DEFAULT_PORT = 8765
 THROTTLE = 10
 SERVICE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -48,12 +56,12 @@ def domain() -> str:
     return f"gui/{uid()}"
 
 
-def target() -> str:
-    return f"{domain()}/{LABEL}"
+def target(label: str = LABEL) -> str:
+    return f"{domain()}/{label}"
 
 
-def plist_path() -> Path:
-    return Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+def plist_path(label: str = LABEL) -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
 
 
 # ---- launchctl wrapper and argv builders -----------------------------------
@@ -66,20 +74,20 @@ def argv_bootstrap(path) -> list[str]:
     return ["bootstrap", domain(), str(path)]
 
 
-def argv_bootout() -> list[str]:
-    return ["bootout", target()]
+def argv_bootout(label: str = LABEL) -> list[str]:
+    return ["bootout", target(label)]
 
 
-def argv_kickstart(kill: bool = False) -> list[str]:
-    return ["kickstart", *(["-k"] if kill else []), target()]
+def argv_kickstart(kill: bool = False, label: str = LABEL) -> list[str]:
+    return ["kickstart", *(["-k"] if kill else []), target(label)]
 
 
-def argv_print() -> list[str]:
-    return ["print", target()]
+def argv_print(label: str = LABEL) -> list[str]:
+    return ["print", target(label)]
 
 
-def argv_enable(on: bool = True) -> list[str]:
-    return ["enable" if on else "disable", target()]
+def argv_enable(on: bool = True, label: str = LABEL) -> list[str]:
+    return ["enable" if on else "disable", target(label)]
 
 
 # ---- plist ------------------------------------------------------------------
@@ -116,13 +124,44 @@ def build_plist(*, python: str, project: Path, host, port: int,
     }
 
 
+def build_watch_plist(*, python: str, project: Path, log_dir: Path, config: str | None = None,
+                      state_dir: str | None = None, at_login: bool = False) -> dict:
+    """com.tulda.watch: `tulda watch --from-config`. Same interpreter/env as the server; low
+    priority; a clean exit (SIGTERM, or a config it cannot use) is not restarted."""
+    args = [python, "-u", "-m", "tulda", "watch", "--from-config", "--log-dir", str(log_dir)]
+    if config:
+        args += ["--config", str(config)]
+    if state_dir:
+        args += ["--state-dir", str(state_dir)]
+    return {
+        "Label": WATCH_LABEL,
+        "ProgramArguments": args,
+        "WorkingDirectory": str(project),
+        "EnvironmentVariables": {
+            "PATH": SERVICE_PATH,
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONPATH": str(project),
+            "HOME": str(Path.home()),
+        },
+        "RunAtLoad": bool(at_login),
+        "KeepAlive": {"SuccessfulExit": False},
+        "ThrottleInterval": THROTTLE,
+        "ExitTimeOut": EXIT_TIMEOUT,
+        "ProcessType": "Background",
+        "LowPriorityIO": True,
+        "Nice": 5,
+        "StandardOutPath": str(logs.log_path(log_dir, names=logs.WATCH_LOG_NAMES)),
+        "StandardErrorPath": str(logs.log_path(log_dir, err=True, names=logs.WATCH_LOG_NAMES)),
+    }
+
+
 def plist_bytes(d: dict) -> bytes:
     return plistlib.dumps(d, sort_keys=False)
 
 
-def read_installed() -> dict | None:
+def read_installed(label: str = LABEL) -> dict | None:
     try:
-        with open(plist_path(), "rb") as f:
+        with open(plist_path(label), "rb") as f:
             return plistlib.load(f)
     except (OSError, plistlib.InvalidFileException, ValueError):
         return None
@@ -150,7 +189,8 @@ def server_binds_tailscale() -> bool:
 
 def configured_watch_python() -> str | None:
     """Interpreter of the installed watch service, if any (else None: use this one)."""
-    return None
+    argv = (read_installed(WATCH_LABEL) or {}).get("ProgramArguments") or []
+    return argv[0] if argv else None
 
 
 def args_option(argv: list[str], flag: str, default=None):
@@ -187,8 +227,8 @@ def parse_print(text: str) -> dict:
 
 # ---- operations -------------------------------------------------------------
 
-def is_loaded() -> tuple[bool, dict]:
-    p = run_launchctl(*argv_print())
+def is_loaded(label: str = LABEL) -> tuple[bool, dict]:
+    p = run_launchctl(*argv_print(label))
     if p.returncode != 0:
         return False, {}
     return True, parse_print(p.stdout)
@@ -200,6 +240,21 @@ def _check(p: subprocess.CompletedProcess, what: str) -> None:
         raise TuldaError(f"launchctl {what} failed ({p.returncode}): {msg}", 4)
 
 
+def _install_plist(d: dict, label: str, at_login: bool) -> Path:
+    path = plist_path(label)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".plist.tmp")
+    tmp.write_bytes(plist_bytes(d))
+    os.replace(tmp, path)
+    if is_loaded(label)[0]:
+        run_launchctl(*argv_bootout(label))
+    run_launchctl(*argv_enable(True, label))
+    _check(run_launchctl(*argv_bootstrap(path)), "bootstrap")
+    if not at_login:
+        run_launchctl(*argv_enable(False, label))
+    return path
+
+
 def install(*, host, port, renders_root, at_login, python=None, project=PROJECT_DIR,
             log_dir=None, tailscale=False) -> Path:
     log_dir = Path(log_dir) if log_dir else logs.default_log_dir()
@@ -207,63 +262,65 @@ def install(*, host, port, renders_root, at_login, python=None, project=PROJECT_
     d = build_plist(python=python or sys.executable, project=Path(project), host=host,
                     port=port, renders_root=renders_root, log_dir=log_dir, at_login=at_login,
                     tailscale=tailscale)
-    path = plist_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".plist.tmp")
-    tmp.write_bytes(plist_bytes(d))
-    os.replace(tmp, path)
-    if is_loaded()[0]:
-        run_launchctl(*argv_bootout())
-    run_launchctl(*argv_enable(True))
-    _check(run_launchctl(*argv_bootstrap(path)), "bootstrap")
-    if not at_login:
-        run_launchctl(*argv_enable(False))
-    return path
+    return _install_plist(d, LABEL, at_login)
 
 
-def uninstall() -> bool:
+def install_watch(*, at_login, config=None, state_dir=None, python=None, project=PROJECT_DIR,
+                  log_dir=None) -> Path:
+    log_dir = Path(log_dir) if log_dir else logs.default_log_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    d = build_watch_plist(python=python or sys.executable, project=Path(project), log_dir=log_dir,
+                          config=config, state_dir=state_dir, at_login=at_login)
+    return _install_plist(d, WATCH_LABEL, at_login)
+
+
+def uninstall(label: str = LABEL) -> bool:
     was = False
-    if is_loaded()[0]:
+    if is_loaded(label)[0]:
         was = True
-        run_launchctl(*argv_bootout())
-    run_launchctl(*argv_enable(True))  # clear our override entry
-    path = plist_path()
+        run_launchctl(*argv_bootout(label))
+    run_launchctl(*argv_enable(True, label))  # clear our override entry
+    path = plist_path(label)
     if path.exists():
         path.unlink()
         was = True
     return was
 
 
-def start() -> None:
-    cfg = read_installed()
+def _which_name(label: str) -> str:
+    return "" if label == LABEL else " watch"
+
+
+def start(label: str = LABEL) -> None:
+    cfg = read_installed(label)
     if cfg is None:
-        raise TuldaError("not installed; run `tulda service install` first", 3)
-    if is_loaded()[0]:
-        _check(run_launchctl(*argv_kickstart()), "kickstart")
+        raise TuldaError(f"not installed; run `tulda service install{_which_name(label)}` first", 3)
+    if is_loaded(label)[0]:
+        _check(run_launchctl(*argv_kickstart(label=label)), "kickstart")
         return
     at_login = bool(cfg.get("RunAtLoad"))
-    run_launchctl(*argv_enable(True))
+    run_launchctl(*argv_enable(True, label))
     try:
-        _check(run_launchctl(*argv_bootstrap(plist_path())), "bootstrap")
+        _check(run_launchctl(*argv_bootstrap(plist_path(label))), "bootstrap")
     finally:
         if not at_login:
-            run_launchctl(*argv_enable(False))
+            run_launchctl(*argv_enable(False, label))
 
 
-def stop() -> bool:
-    if not is_loaded()[0]:
+def stop(label: str = LABEL) -> bool:
+    if not is_loaded(label)[0]:
         return False
-    _check(run_launchctl(*argv_bootout()), "bootout")
+    _check(run_launchctl(*argv_bootout(label)), "bootout")
     return True
 
 
-def restart() -> None:
-    if read_installed() is None:
-        raise TuldaError("not installed; run `tulda service install` first", 3)
-    if is_loaded()[0]:
-        _check(run_launchctl(*argv_kickstart(kill=True)), "kickstart -k")
+def restart(label: str = LABEL) -> None:
+    if read_installed(label) is None:
+        raise TuldaError(f"not installed; run `tulda service install{_which_name(label)}` first", 3)
+    if is_loaded(label)[0]:
+        _check(run_launchctl(*argv_kickstart(kill=True, label=label)), "kickstart -k")
     else:
-        start()
+        start(label)
 
 
 
@@ -322,7 +379,7 @@ def _wait_all(hosts, port) -> bool:
     return all(wait_listening(h, port) for h in hosts)
 
 
-def cmd_status(args) -> int:
+def server_status(args) -> int:
     from .netinfo import bonjour_name
     s = status_info()
     print(f"installed : {'yes' if s['installed'] else 'no'}  ({s['plist']})")
@@ -348,7 +405,7 @@ def cmd_status(args) -> int:
     return 0 if running and listening else 1
 
 
-def cmd_install(args) -> int:
+def server_install(args) -> int:
     root = None
     if args.renders_root or os.environ.get("TULDA_RENDERS"):
         root = str(Path(args.renders_root or os.environ["TULDA_RENDERS"]).expanduser().resolve())
@@ -361,12 +418,12 @@ def cmd_install(args) -> int:
     return 0 if ok else 1
 
 
-def cmd_uninstall(args) -> int:
+def server_uninstall(args) -> int:
     print("uninstalled" if uninstall() else "nothing to uninstall")
     return 0
 
 
-def cmd_start(args) -> int:
+def server_start(args) -> int:
     start()
     cfg = read_installed() or {}
     argv = cfg.get("ProgramArguments", [])
@@ -375,12 +432,12 @@ def cmd_start(args) -> int:
     return 0 if ok else 1
 
 
-def cmd_stop(args) -> int:
+def server_stop(args) -> int:
     print("stopped" if stop() else "not loaded")
     return 0
 
 
-def cmd_restart(args) -> int:
+def server_restart(args) -> int:
     restart()
     cfg = read_installed() or {}
     argv = cfg.get("ProgramArguments", [])
@@ -390,7 +447,7 @@ def cmd_restart(args) -> int:
     return 0 if ok else 1
 
 
-def cmd_logs(args) -> int:
+def server_logs(args) -> int:
     cfg = read_installed()
     log_dir = Path(cfg["StandardOutPath"]).parent if cfg else logs.default_log_dir()
     path = logs.log_path(log_dir, args.err)
@@ -434,7 +491,7 @@ def follow(path: Path, sleep=time.sleep, should_stop=lambda: False) -> None:
         f.close()
 
 
-def cmd_print_plist(args) -> int:
+def server_print_plist(args) -> int:
     root = None
     if args.renders_root or os.environ.get("TULDA_RENDERS"):
         root = str(Path(args.renders_root or os.environ["TULDA_RENDERS"]).expanduser().resolve())
@@ -445,9 +502,176 @@ def cmd_print_plist(args) -> int:
     return 0
 
 
+# ---- watch service ----------------------------------------------------------
+
+def _watch_state_dir(cfg) -> Path:
+    from . import watchconfig as wc
+    argv = (cfg or {}).get("ProgramArguments", [])
+    return wc.state_dir(args_option(argv, "--state-dir"))
+
+
+def _watch_running(cfg, secs: float = 5.0) -> bool:
+    """True once launchd reports a pid and the watcher wrote its state file."""
+    from .watchd import read_state
+    end = time.time() + secs
+    while True:
+        loaded, info = is_loaded(WATCH_LABEL)
+        st = read_state(_watch_state_dir(cfg))
+        if loaded and info.get("pid") and st and st.get("pid") == info.get("pid"):
+            return True
+        if time.time() >= end:
+            return False
+        time.sleep(0.25)
+
+
+def watch_preflight(config: str | None) -> tuple[bool, list[str]]:
+    """-> (ok, lines): the config must parse and have at least one [[watch.dir]]."""
+    from . import watchconfig as wc
+    path = wc.config_path(config)
+    try:
+        cfg = wc.load(path)
+    except wc.WatchConfigError as e:
+        return False, [f"error: {e}", "fix it (`tulda watch --check-config`) and run install again"]
+    if not cfg.dirs:
+        return False, [f"error: {path} has no [[watch.dir]] entries; add for example:", "",
+                       *wc.SAMPLE.splitlines()]
+    py = wc.real_python()
+    lines = [f"config: {path} ({len(cfg.dirs)} director{'y' if len(cfg.dirs) == 1 else 'ies'})"]
+    for e in cfg.dirs:
+        lines.append(f"  {e.path} -> {e.destination}")
+        prot = wc.protected_location(e.path)
+        if prot:
+            lines.append(f"  note: {prot} is privacy-protected (TCC); the service can only list it "
+                         f"with Full Disk Access for {py} (System Settings > Privacy & Security > "
+                         f"Full Disk Access > + > Cmd-Shift-G > paste the path), then "
+                         f"`tulda service restart watch`. A dedicated inbox outside ~/Downloads, "
+                         f"~/Desktop and ~/Documents needs no grant.")
+    return True, lines
+
+
+def watch_install(args) -> int:
+    config = getattr(args, "config", None)
+    config = str(Path(config).expanduser().resolve()) if config else None
+    ok, lines = watch_preflight(config)
+    for ln in lines:
+        print(ln, file=sys.stdout if ok else sys.stderr)
+    if not ok:
+        return 2
+    path = install_watch(at_login=args.at_login, config=config)
+    print(f"installed {path}")
+    up = _watch_running(read_installed(WATCH_LABEL))
+    print("started: " + ("running" if up else "NOT running yet; see `tulda service logs watch`"))
+    print("at login: " + ("yes" if args.at_login else "no (disabled; `tulda service start watch` to run)"))
+    return 0 if up else 1
+
+
+def watch_status(args) -> int:
+    from .watchd import read_state, state_lines
+    cfg = read_installed(WATCH_LABEL)
+    loaded, info = is_loaded(WATCH_LABEL)
+    running = info.get("state") == "running" and info.get("pid") is not None
+    print(f"installed : {'yes' if cfg else 'no'}  ({plist_path(WATCH_LABEL)})")
+    print(f"loaded    : {'yes' if loaded else 'no'}")
+    print(f"running   : {'yes' if running else 'no'}" + (f"  pid {info['pid']}" if running else ""))
+    print(f"last exit : {info.get('last exit raw') or '-'}   runs: {info.get('runs') or '-'}")
+    print(f"at login  : {'yes' if (cfg or {}).get('RunAtLoad') else 'no'}")
+    for ln in state_lines(read_state(_watch_state_dir(cfg))):
+        print(ln)
+    if cfg:
+        print(f"logs      : {Path(cfg.get('StandardOutPath', '')).parent}")
+    return 0 if running else 1
+
+
+def watch_uninstall(args) -> int:
+    print("uninstalled watch" if uninstall(WATCH_LABEL) else "watch: nothing to uninstall")
+    return 0
+
+
+def watch_start(args) -> int:
+    start(WATCH_LABEL)
+    up = _watch_running(read_installed(WATCH_LABEL))
+    print("started watch" if up else "started watch, but not running yet; see `tulda service logs watch`")
+    return 0 if up else 1
+
+
+def watch_stop(args) -> int:
+    print("stopped watch" if stop(WATCH_LABEL) else "watch: not loaded")
+    return 0
+
+
+def watch_restart(args) -> int:
+    restart(WATCH_LABEL)
+    time.sleep(0.5)
+    up = _watch_running(read_installed(WATCH_LABEL))
+    print("restarted watch" if up else "restarted watch, but not running yet; see `tulda service logs watch`")
+    return 0 if up else 1
+
+
+def watch_logs(args) -> int:
+    cfg = read_installed(WATCH_LABEL)
+    log_dir = Path(cfg["StandardOutPath"]).parent if cfg else logs.default_log_dir()
+    path = logs.log_path(log_dir, args.err, logs.WATCH_LOG_NAMES)
+    if not path.exists():
+        print(f"no log file yet: {path}", file=sys.stderr)
+        return 1
+    for line in logs.tail_lines(path, args.n):
+        print(line)
+    if args.follow:
+        sys.stdout.flush()
+        try:
+            follow(path)
+        except KeyboardInterrupt:
+            pass
+    return 0
+
+
+def watch_print_plist(args) -> int:
+    config = getattr(args, "config", None)
+    config = str(Path(config).expanduser().resolve()) if config else None
+    d = build_watch_plist(python=sys.executable, project=PROJECT_DIR, log_dir=logs.default_log_dir(),
+                          config=config, at_login=args.at_login)
+    sys.stdout.write(plist_bytes(d).decode())
+    return 0
+
+
+HANDLERS = {
+    "status": (server_status, watch_status), "install": (server_install, watch_install),
+    "uninstall": (server_uninstall, watch_uninstall), "start": (server_start, watch_start),
+    "stop": (server_stop, watch_stop), "restart": (server_restart, watch_restart),
+    "logs": (server_logs, watch_logs), "print-plist": (server_print_plist, watch_print_plist),
+}
+
+
+def dispatch(name: str):
+    def run(args) -> int:
+        which = getattr(args, "which", None) or "server"
+        srv, wat = HANDLERS[name]
+        if which == "server":
+            return srv(args)
+        if which == "watch":
+            return wat(args)
+        if name in ("logs", "print-plist"):
+            raise TuldaError(f"`service {name}` takes one target: server or watch", 2)
+        codes = []
+        for title, fn in (("server", srv), ("watch", wat)):
+            print(f"== {title} ==")
+            codes.append(fn(args))
+            sys.stdout.flush()
+        return max(codes)
+    return run
+
+
+cmd_status, cmd_install, cmd_uninstall, cmd_start = (dispatch(n) for n in ("status", "install", "uninstall", "start"))
+cmd_stop, cmd_restart, cmd_logs, cmd_print_plist = (dispatch(n) for n in ("stop", "restart", "logs", "print-plist"))
+
+
 def add_service_parser(sub) -> None:
-    sp = sub.add_parser("service", help="manage the launchd user service (com.tulda.server)")
+    sp = sub.add_parser("service", help="manage the launchd user services (com.tulda.server, com.tulda.watch)")
     ssub = sp.add_subparsers(dest="service_cmd", required=True)
+
+    def which(p, choices=("server", "watch", "all")):
+        p.add_argument("which", nargs="?", default="server", choices=choices,
+                       help="server (default), watch" + (" or all" if "all" in choices else ""))
 
     def opts(p):
         p.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -458,22 +682,29 @@ def add_service_parser(sub) -> None:
         p.add_argument("--renders-root", help="renders directory (default: as `serve`)")
         p.add_argument("--at-login", action="store_true",
                        help="also start at every login (default: only when started)")
+        p.add_argument("--config", metavar="PATH",
+                       help="watch only: watch config file baked into the plist (default: the user config)")
 
-    p = ssub.add_parser("install", help="write the plist, bootstrap it, and start the server")
+    p = ssub.add_parser("install", help="write the plist, bootstrap it, and start the service")
+    which(p)
     opts(p)
     p.set_defaults(fn=cmd_install)
     p = ssub.add_parser("print-plist", help="print the plist that install would write")
+    which(p, ("server", "watch"))
     opts(p)
     p.set_defaults(fn=cmd_print_plist)
     for name, fn, h in (("uninstall", cmd_uninstall, "stop and remove the plist"),
                         ("start", cmd_start, "bootstrap/kickstart the service"),
                         ("stop", cmd_stop, "bootout the service (plist stays installed)"),
                         ("restart", cmd_restart, "kickstart -k (kill and restart)"),
-                        ("status", cmd_status, "loaded/running/pid/exit/URL/port check")):
+                        ("status", cmd_status, "loaded/running/pid/exit/URL/port check; watch: "
+                                               "config mode, last poll, last import, last error")):
         q = ssub.add_parser(name, help=h)
+        which(q)
         q.set_defaults(fn=fn)
     p = ssub.add_parser("logs", help="tail the service log")
+    which(p, ("server", "watch"))
     p.add_argument("-n", type=int, default=50, help="lines (default 50)")
     p.add_argument("-f", "--follow", action="store_true")
-    p.add_argument("--err", action="store_true", help="stderr (request lines) instead of stdout")
+    p.add_argument("--err", action="store_true", help="stderr (server: request lines; watch: tracebacks) instead of stdout")
     p.set_defaults(fn=cmd_logs)

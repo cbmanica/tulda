@@ -94,7 +94,8 @@ class CommandTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        p = mock.patch.object(service, "plist_path", lambda: Path(self.tmp.name) / "x.plist")
+        p = mock.patch.object(service, "plist_path", lambda label=service.LABEL: Path(self.tmp.name) / (
+            "x.plist" if label == service.LABEL else f"{label}.plist"))
         p.start()
         self.addCleanup(p.stop)
         self.calls = []
@@ -307,6 +308,151 @@ class LogTests(unittest.TestCase):
             with contextlib.redirect_stdout(buf):
                 service.cmd_logs(argparse.Namespace(n=1, follow=False, err=True))
             self.assertEqual(buf.getvalue(), "e2\n")
+
+
+class WatchServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        p = mock.patch.object(service, "plist_path", lambda label=service.LABEL: self.dir / f"{label}.plist")
+        p.start()
+        self.addCleanup(p.stop)
+        self.calls = []
+        self.loaded = {}
+        self.cfg = self.dir / "config.toml"
+        (self.dir / "inbox").mkdir()
+        self.cfg.write_text(f'[[watch.dir]]\npath = "{self.dir}/inbox"\ndestination = "{self.dir}/projects"\n')
+
+    def fake(self, *a):
+        self.calls.append(list(a))
+        label = a[-1].rsplit("/", 1)[-1] if a[0] != "bootstrap" else Path(a[-1]).stem
+        if a[0] == "print":
+            return cp(0, SAMPLE.replace("com.tulda.server", label)) if self.loaded.get(label) else cp(113)
+        if a[0] == "bootstrap":
+            self.loaded[label] = True
+        if a[0] == "bootout":
+            self.loaded[label] = False
+        return cp()
+
+    def run_cli(self, *argv):
+        import io, contextlib
+        from tulda import cli
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                mock.patch.object(service, "run_launchctl", self.fake), \
+                mock.patch.object(service, "_watch_running", lambda cfg, secs=5.0: True):
+            code = cli.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_watch_plist(self):
+        d = service.build_watch_plist(python="/p/.venv/bin/python", project=Path("/p"),
+                                      log_dir=Path("/L"), config="/c/config.toml")
+        self.assertEqual(d["Label"], "com.tulda.watch")
+        self.assertEqual(d["ProgramArguments"][:6], ["/p/.venv/bin/python", "-u", "-m", "tulda", "watch", "--from-config"])
+        self.assertEqual(service.args_option(d["ProgramArguments"], "--config"), "/c/config.toml")
+        self.assertEqual(service.args_option(d["ProgramArguments"], "--log-dir"), "/L")
+        self.assertEqual(d["KeepAlive"], {"SuccessfulExit": False})
+        self.assertEqual(d["ProcessType"], "Background")
+        self.assertTrue(d["LowPriorityIO"])
+        self.assertEqual(d["StandardOutPath"], "/L/watch.log")
+        self.assertEqual(d["StandardErrorPath"], "/L/watch.err.log")
+        self.assertFalse(d["RunAtLoad"])
+        self.assertNotIn("--config", service.build_watch_plist(python="/p", project=Path("/p"),
+                                                               log_dir=Path("/L"))["ProgramArguments"])
+
+    def test_install_watch_uses_watch_label_only(self):
+        with mock.patch.object(service.logs, "default_log_dir", lambda: self.dir / "logs"):
+            code, out, err = self.run_cli("service", "install", "watch", "--config", str(self.cfg))
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue((self.dir / "com.tulda.watch.plist").exists())
+        self.assertFalse((self.dir / "com.tulda.server.plist").exists())
+        u = os.getuid()
+        self.assertEqual([c[0] for c in self.calls], ["print", "enable", "bootstrap", "disable"])
+        self.assertTrue(all(c[-1].endswith("com.tulda.watch") or c[-1].endswith("com.tulda.watch.plist")
+                            for c in self.calls))
+        self.assertIn(["disable", f"gui/{u}/com.tulda.watch"], self.calls)
+        argv = service.read_installed(service.WATCH_LABEL)["ProgramArguments"]
+        self.assertEqual(service.args_option(argv, "--config"), str(self.cfg.resolve()))
+
+    def test_install_watch_refuses_bad_or_empty_config(self):
+        self.cfg.write_text("[watch]\nsettle = 1\n")
+        code, _, err = self.run_cli("service", "install", "watch", "--config", str(self.cfg))
+        self.assertEqual(code, 2)
+        self.assertIn("no [[watch.dir]] entries", err)
+        self.assertIn('path = "~/MakerWorld-inbox"', err)
+        self.cfg.write_text("[watch\n")
+        code, _, err = self.run_cli("service", "install", "watch", "--config", str(self.cfg))
+        self.assertEqual(code, 2)
+        self.assertIn("TOML syntax error", err)
+        self.assertEqual(self.calls, [])
+
+    def test_install_watch_protected_folder_hint(self):
+        ok, lines = service.watch_preflight(str(self.cfg))
+        self.assertTrue(ok)
+        self.assertFalse([ln for ln in lines if "Full Disk Access" in ln])
+        self.cfg.write_text('[[watch.dir]]\npath = "~/Downloads"\ndestination = "~/mw-projects-example"\n')
+        ok, lines = service.watch_preflight(str(self.cfg))
+        self.assertTrue(ok)
+        self.assertTrue([ln for ln in lines if "Full Disk Access" in ln])
+
+    def test_lifecycle_and_all(self):
+        with mock.patch.object(service.logs, "default_log_dir", lambda: self.dir / "logs"):
+            self.run_cli("service", "install", "watch", "--config", str(self.cfg))
+        self.calls.clear()
+        code, out, _ = self.run_cli("service", "stop", "watch")
+        self.assertEqual((code, out.strip()), (0, "stopped watch"))
+        code, out, _ = self.run_cli("service", "start", "watch")
+        self.assertEqual(code, 0)
+        code, out, _ = self.run_cli("service", "restart", "watch")
+        self.assertEqual(code, 0)
+        self.assertIn(["kickstart", "-k", f"gui/{os.getuid()}/com.tulda.watch"], self.calls)
+        self.calls.clear()
+        code, out, _ = self.run_cli("service", "stop", "all")
+        self.assertIn("== server ==", out)
+        self.assertIn("== watch ==", out)
+        self.assertEqual([c[-1].rsplit("/", 1)[-1] for c in self.calls if c[0] == "bootout"], ["com.tulda.watch"])
+        code, out, _ = self.run_cli("service", "uninstall", "watch")
+        self.assertIn("uninstalled watch", out)
+        self.assertFalse((self.dir / "com.tulda.watch.plist").exists())
+
+    def test_default_target_is_server(self):
+        code, out, _ = self.run_cli("service", "stop")
+        self.assertEqual(out.strip(), "not loaded")
+        self.assertTrue(all(c[-1].endswith("com.tulda.server") for c in self.calls))
+
+    def test_status_watch_shows_state(self):
+        import json
+        sdir = self.dir / "state"
+        sdir.mkdir()
+        (sdir / "watch.json").write_text(json.dumps({
+            "pid": 12345, "started": "t0", "mode": "fallback", "since": "2026-01-02T03:04:05+00:00",
+            "reason": "TOML syntax error", "last_poll": "t1", "config": "/c",
+            "last_created": {"time": "t2", "project": "Box", "source": "box.3mf"},
+            "last_error": None, "dirs": [{"path": "/in", "destination": "/out", "error": None,
+                                          "totals": {"created": 1}}]}))
+        d = service.build_watch_plist(python="/p", project=Path("/p"), log_dir=self.dir, state_dir=str(sdir))
+        (self.dir / "com.tulda.watch.plist").write_bytes(service.plist_bytes(d))
+        self.loaded["com.tulda.watch"] = True
+        code, out, _ = self.run_cli("service", "status", "watch")
+        self.assertEqual(code, 0, out)
+        self.assertIn("running   : yes  pid 12345", out)
+        self.assertIn("running on fallback config since 2026-01-02T03:04:05+00:00: TOML syntax error", out)
+        self.assertIn("last new  : t2 Box <- box.3mf", out)
+        self.assertIn("watching  : /in -> /out  (created 1", out)
+
+    def test_logs_watch_and_print_plist(self):
+        (self.dir / "watch.log").write_text("w1\nw2\n")
+        d = service.build_watch_plist(python="/p", project=Path("/p"), log_dir=self.dir)
+        (self.dir / "com.tulda.watch.plist").write_bytes(service.plist_bytes(d))
+        code, out, _ = self.run_cli("service", "logs", "watch", "-n", "1")
+        self.assertEqual(out, "w2\n")
+        code, out, _ = self.run_cli("service", "print-plist", "watch")
+        self.assertIn("<string>com.tulda.watch</string>", out)
+        self.assertIn("<string>--from-config</string>", out)
+        self.assertEqual(self.calls, [])
+        with self.assertRaises(SystemExit):
+            self.run_cli("service", "logs", "all")
 
 
 if __name__ == "__main__":
