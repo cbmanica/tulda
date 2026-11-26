@@ -143,6 +143,16 @@ def configured_tailscale_host() -> str | None:
     return tailscale_dnsname() or tailscale_ipv4()
 
 
+def server_binds_tailscale() -> bool:
+    """True if the installed server service was set up with --tailscale."""
+    return "--tailscale" in (read_installed() or {}).get("ProgramArguments", [])
+
+
+def configured_watch_python() -> str | None:
+    """Interpreter of the installed watch service, if any (else None: use this one)."""
+    return None
+
+
 def args_option(argv: list[str], flag: str, default=None):
     if flag in argv:
         i = argv.index(flag)

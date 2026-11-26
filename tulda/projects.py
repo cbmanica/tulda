@@ -30,6 +30,8 @@ MakerWorld detection (conservative; `--force` overrides for `project create`):
 
 from __future__ import annotations
 
+import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -444,24 +446,51 @@ class Watcher:
     applies). Each (path, size, mtime) is handled once per run; sha256 idempotency covers runs."""
 
     def __init__(self, src_dir: Path, dest: Path, settle: float = 5.0, render: bool = False,
-                 log=print, clock=time.time):
+                 log=print, clock=time.time, force: bool = False, include=None):
         self.src_dir, self.dest, self.settle, self.render = Path(src_dir), Path(dest), settle, render
+        self.force, self.include = force, list(include) if include else None
         self.log, self.clock = log, clock
         self.last: dict = {}
         self.done: set = set()
+        self.list_error: str | None = None     # set while the directory cannot be listed
+        self.tcc_blocked = False
+        self.last_created: dict | None = None
+        self.last_error: str | None = None
+
+    def wanted(self, p: Path) -> bool:
+        if p.suffix.lower() not in (".3mf", ".zip"):
+            return False
+        return not self.include or any(fnmatch.fnmatch(p.name.casefold(), g.casefold())
+                                       for g in self.include)
 
     def candidates(self):
         try:
             entries = sorted(self.src_dir.iterdir())
         except OSError as e:
-            self.log(f"error: cannot list {self.src_dir}: {e}")
-            return []
-        return [p for p in entries if p.suffix.lower() in (".3mf", ".zip") and p.is_file()]
+            from .watchconfig import is_tcc_error, real_python, tcc_help
+            msg = f"cannot list {self.src_dir}: {e.strerror or e}"
+            tcc = is_tcc_error(e)
+            if tcc:
+                msg += "; " + tcc_help(real_python())
+            if msg != self.list_error:           # log once per distinct problem, not every poll
+                self.log(f"error: {msg}")
+            self.list_error, self.tcc_blocked = msg, tcc
+            return None
+        if self.list_error:
+            self.log(f"ok: {self.src_dir} is listable again")
+        self.list_error, self.tcc_blocked = None, False
+        return [p for p in entries if self.wanted(p) and p.is_file()]
 
-    def poll(self, once: bool = False) -> dict:
+    def poll(self, once: bool = False, should_stop=lambda: False) -> dict:
         counts = {"created": 0, "exists": 0, "skipped": 0, "errors": 0, "waiting": 0}
         seen = set()
-        for p in self.candidates():
+        found = self.candidates()
+        if found is None:
+            counts["errors"] += 1
+            return counts
+        for p in found:
+            if should_stop():
+                break
             try:
                 st = p.stat()
             except OSError:
@@ -479,33 +508,40 @@ class Watcher:
                 continue
             self.done.add(key)
             try:
-                state, proj = create_project(p, self.dest)
+                state, proj = create_project(p, self.dest, force=self.force)
             except NotMakerWorld as e:
                 counts["skipped"] += 1
                 self.log(f"skip {p.name}: {str(e).split(': ', 1)[-1].replace(' (use --force to import anyway)', '')}")
                 continue
             except Exception as e:     # one bad file must not stop the watcher
                 counts["errors"] += 1
+                self.last_error = f"{p.name}: {e}"
                 self.log(f"error {p.name}: {e}")
                 continue
             counts[state] += 1
             self.log(f"{state} {proj.name} <- {p.name}")
-            if state == "created" and self.render:
+            if state == "created":
+                self.last_created = {"project": proj.name, "source": p.name,
+                                     "time": datetime.now().astimezone().isoformat(timespec="seconds")}
+            if state == "created" and self.render and not should_stop():
                 try:
                     render_project(proj, self.log)
                 except Exception as e:
                     self.log(f"error rendering {proj.name}: {e}")
-        for k in list(self.last):
-            if k not in seen:
-                del self.last[k]
+        if not should_stop():
+            for k in list(self.last):
+                if k not in seen:
+                    del self.last[k]
         return counts
 
     def run(self, interval: float = 5.0, once: bool = False, sleep=time.sleep,
             should_stop=lambda: False) -> dict:
         if once:
-            return self.poll(once=True)
+            return self.poll(once=True, should_stop=should_stop)
         while not should_stop():
-            self.poll()
+            self.poll(should_stop=should_stop)
+            if should_stop():
+                break
             sleep(interval)
         return {}
 
@@ -537,6 +573,15 @@ def cmd_project_create(args) -> int:
 
 
 def cmd_watch(args) -> int:
+    if getattr(args, "check_config", None) is not None or getattr(args, "from_config", False):
+        from .watchd import cmd_watch_config
+        return cmd_watch_config(args)
+    if not args.directory or not args.destination:
+        raise ProjectError("usage: tulda watch DIR --destination DEST  (or --from-config)")
+    if args.interval is None:
+        args.interval = 5.0
+    if args.settle is None:
+        args.settle = 5.0
     dest = Path(args.destination).expanduser()
     src_dir = Path(args.directory).expanduser()
     if not src_dir.is_dir():
@@ -544,8 +589,8 @@ def cmd_watch(args) -> int:
     if dest.resolve() == src_dir.resolve():
         raise ProjectError("destination must differ from the watched directory")
     _warn_dest(dest)
-    w = Watcher(src_dir, dest, settle=args.settle, render=args.render,
-                log=lambda m: print(m, flush=True))
+    w = Watcher(src_dir, dest, settle=args.settle, render=bool(args.render),
+                force=bool(args.force), log=lambda m: print(m, flush=True))
     if args.once:
         c = w.run(once=True)
         print("summary: " + ", ".join(f"{k} {v}" for k, v in c.items()), flush=True)
@@ -571,11 +616,20 @@ def add_project_parsers(sub) -> None:
     c.set_defaults(fn=cmd_project_create)
     w = sub.add_parser("watch", help="poll a folder (e.g. Downloads) and make projects for finished "
                        "MakerWorld .3mf/.zip downloads; originals are never moved")
-    w.add_argument("directory")
-    w.add_argument("--destination", "-d", required=True, metavar="DIR")
+    w.add_argument("directory", nargs="?", help="folder to poll (ad-hoc mode; ignores the config)")
+    w.add_argument("--destination", "-d", metavar="DIR")
+    w.add_argument("--from-config", action="store_true",
+                   help="watch every [[watch.dir]] of the user config (or --config); what the "
+                   "com.tulda.watch service runs")
+    w.add_argument("--config", metavar="PATH",
+                   help="watch config to use instead of the user config (with --from-config)")
     w.add_argument("--once", action="store_true", help="scan once and exit")
-    w.add_argument("--interval", type=float, default=5.0, metavar="SEC", help="poll period (default 5)")
-    w.add_argument("--settle", type=float, default=5.0, metavar="SEC",
-                   help="minimum age of a file before it is processed (default 5)")
-    w.add_argument("--render", action="store_true", help="render new projects (off by default)")
+    w.add_argument("--interval", type=float, default=None, metavar="SEC",
+                   help="poll period (default 5; overrides the config)")
+    w.add_argument("--settle", type=float, default=None, metavar="SEC",
+                   help="minimum age of a file before it is processed (default 5; overrides the config)")
+    w.add_argument("--render", action=argparse.BooleanOptionalAction, default=None,
+                   help="render new projects (off by default; overrides the config)")
+    w.add_argument("--force", action=argparse.BooleanOptionalAction, default=None,
+                   help="import files without MakerWorld markers too (off by default)")
     w.set_defaults(fn=cmd_watch)

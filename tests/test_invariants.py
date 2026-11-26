@@ -50,7 +50,7 @@ class ReadOnlyServer(unittest.TestCase):
         tree = ast.parse((PKG / "server.py").read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.level:
-                self.assertNotIn((node.module or "").split(".")[0], {"manage", "service", "runner"})
+                self.assertNotIn((node.module or "").split(".")[0], {"manage", "service", "runner", "projects", "watchd", "watchconfig"})
             if isinstance(node, ast.Import):
                 self.assertFalse({a.name for a in node.names} & {"subprocess"})
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "open":

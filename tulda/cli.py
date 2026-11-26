@@ -151,7 +151,20 @@ def cmd_doctor(args) -> int:
     print(f"renders root: {root}")
     print(f"bind address would be {lan_ipv4()}, host name {bonjour_name()}, "
           f"tailnet {tailscale_ipv4() or 'not found'}")
+    bad += doctor_watch(args, root)
     return 3 if bad else 0
+
+
+def doctor_watch(args, root: Path) -> int:
+    """Watch-config section of doctor; -> number of problems."""
+    from . import watchconfig as wc
+    from .service import configured_watch_python, server_binds_tailscale
+    lines, errors = wc.doctor_report(wc.config_path(args.config), root,
+                                     wc.real_python(configured_watch_python()),
+                                     server_binds_tailscale(), explicit=bool(args.config))
+    for ln in lines:
+        print(ln)
+    return errors
 
 
 def cmd_info(args) -> int:
