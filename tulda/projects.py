@@ -672,6 +672,9 @@ def add_project_parsers(sub) -> None:
                    "com.tulda.watch service runs")
     w.add_argument("--config", metavar="PATH",
                    help="watch config to use instead of the user config (with --from-config)")
+    w.add_argument("--check-config", nargs="?", const="", default=None, metavar="PATH",
+                   help="validate the watch config (PATH, else --config, else the user config) "
+                   "and exit: 0 valid, 2 invalid")
     w.add_argument("--log-dir", metavar="DIR",
                    help="rotate and redirect output to DIR/watch.log and watch.err.log (with --from-config)")
     w.add_argument("--state-dir", metavar="DIR",

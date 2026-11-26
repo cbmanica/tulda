@@ -164,6 +164,17 @@ def doctor_watch(args, root: Path) -> int:
                                      server_binds_tailscale(), explicit=bool(args.config))
     for ln in lines:
         print(ln)
+    from .service import WATCH_LABEL, _watch_state_dir, read_installed
+    from .watchd import read_state, state_lines
+    sdir = _watch_state_dir(read_installed(WATCH_LABEL))
+    st = read_state(sdir)
+    if st:
+        print(f"watch state ({sdir}):")
+        for ln in state_lines(st):
+            print("    " + ln)
+    lg = wc.last_good_path(sdir)
+    if lg.exists():
+        print(f"    last-known-good config: {lg} (`tulda config show-last-good --diff`)")
     return errors
 
 
@@ -340,6 +351,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_service_parser(sub)
     from .projects import add_project_parsers
     add_project_parsers(sub)
+    from .watchd import add_config_parser
+    add_config_parser(sub)
     return p
 
 

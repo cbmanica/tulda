@@ -10,7 +10,16 @@ Service behaviour (com.tulda.watch):
 - `--log-dir DIR` rotates and redirects stdout/stderr to DIR/watch.log and watch.err.log.
 - A small state file (`<state dir>/watch.json`: pid, config, last poll, last created, last
   error, per-directory status) lets `tulda service status watch` and `doctor` show health
-  without parsing logs. It is never served over HTTP."""
+  without parsing logs. It is never served over HTTP.
+- Reload without signals: the config file's (mtime, size, inode) is checked every tick; a change
+  that is stable for one tick is re-read and validated.
+- Last-known-good fallback: once a config has been loaded and at least one of its directories
+  listed, its exact bytes are saved as `<state dir>/watch-config.last-good.toml` (mode 600,
+  atomic). When the config fails to read/parse/validate, or none of its directories is usable,
+  the watcher logs why and runs on the last-known-good copy (mode "fallback"); without a usable
+  copy it stays alive and idle (mode "idle"), so launchd never restart-loops. Not-config modes
+  re-try the real config on every change and every RETRY seconds. The user's config file is only
+  ever read."""
 
 from __future__ import annotations
 
@@ -28,6 +37,7 @@ from . import watchconfig as wc
 from .projects import Watcher, git_publish_warning
 
 COUNT_KEYS = ("created", "exists", "skipped", "errors", "waiting")
+RETRY = 60.0               # seconds between re-tries of the real config while not on it
 
 
 def now_iso() -> str:
@@ -155,9 +165,21 @@ class WatchDaemon:
         self.log, self.clock = log, clock
         self.loop = WatchLoop(None, log=log, clock=clock)
         self.cfg: wc.WatchConfig | None = None
+        self.raw: bytes | None = None          # bytes of the config in use
+        self.good_saved = False
+        self.sig_seen = self.sig_pending = None
+        self.last_retry = 0.0
         self.state = {"pid": os.getpid(), "started": now_iso(), "config": str(self.cfg_path),
                       "mode": None, "since": None, "reason": None, "last_poll": None,
-                      "last_created": None, "last_error": None, "dirs": []}
+                      "last_created": None, "last_error": None, "last_good": None, "dirs": []}
+
+    @property
+    def mode(self) -> str | None:
+        return self.state["mode"]
+
+    @property
+    def last_good(self) -> Path:
+        return wc.last_good_path(self.sdir)
 
     # -- config --------------------------------------------------------------------------------
     def set_mode(self, mode: str, reason: str | None = None) -> None:
@@ -177,17 +199,134 @@ class WatchDaemon:
             self.log(f"watching {e.path} every {e.interval:g}s -> {e.destination}"
                      + (" (render)" if e.render else "") + (" (force)" if e.force else ""))
 
-    def start(self) -> None:
-        """Strict load: raises WatchConfigError on a bad config."""
-        _, cfg = wc.read_config(self.cfg_path)
+    def start_strict(self) -> None:
+        """For --once: raises WatchConfigError on a bad config, no fallback."""
+        self.raw, cfg = wc.read_config(self.cfg_path)
         self.use(cfg)
         self.set_mode("config")
+
+    def start(self) -> None:
+        """Load the config, falling back to last-known-good or idle; never raises on config."""
+        self.sig_seen = self.signature()
+        try:
+            st = self.last_good.stat()
+            self.state["last_good"] = {"path": str(self.last_good), "saved": datetime.fromtimestamp(
+                st.st_mtime).astimezone().isoformat(timespec="seconds")}
+        except OSError:
+            pass
+        self.load()
+
+    def signature(self):
+        try:
+            st = os.stat(self.cfg_path)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+    @staticmethod
+    def unusable(cfg: wc.WatchConfig) -> str | None:
+        """A reason when the config has directories but none of them can be listed."""
         if not cfg.dirs:
-            self.log(f"no [[watch.dir]] entries in {self.cfg_path}; idle")
+            return None
+        why = []
+        for e in cfg.dirs:
+            r = wc.probe_dir(e.path)
+            if r is None:
+                return None
+            why.append(f"{e.path} " + ("is blocked by macOS privacy (TCC); grant Full Disk Access "
+                                       f"to {wc.real_python()} or use an unprotected inbox"
+                                       if r == "TCC" else r))
+        return "no watched directory is usable: " + "; ".join(why)
+
+    def load(self) -> None:
+        self.last_retry = self.clock()
+        try:
+            raw, cfg = wc.read_config(self.cfg_path)
+            why = self.unusable(cfg)
+            if why:
+                raise wc.WatchConfigError(why)
+        except wc.WatchConfigError as e:
+            self.fallback(str(e))
+            return
+        if self.mode != "config" or raw != self.raw:
+            if self.mode in ("fallback", "idle"):
+                self.log(f"config {self.cfg_path} is valid again; leaving {self.mode} mode")
+            elif self.mode == "config":
+                self.log(f"config {self.cfg_path} changed; reloaded")
+            self.use(cfg)
+            self.raw = raw
+            self.good_saved = self._last_good_bytes() == raw
+            if not cfg.dirs:
+                self.log(f"no [[watch.dir]] entries in {self.cfg_path}; nothing to watch "
+                         f"(`tulda service stop watch` to stop the service)")
+        self.set_mode("config")
+
+    def _last_good_bytes(self) -> bytes | None:
+        try:
+            return self.last_good.read_bytes()
+        except OSError:
+            return None
+
+    def fallback(self, reason: str) -> None:
+        if self.mode in ("fallback", "idle") and self.state["reason"] is not None \
+                and self.state["reason"].startswith(reason):
+            return                                   # same problem: already handled and logged
+        self.log(f"error: config {self.cfg_path}: {reason}")
+        if self.last_good.exists():
+            try:
+                raw, cfg = wc.read_config(self.last_good)
+                why = self.unusable(cfg)
+                if why:
+                    raise wc.WatchConfigError(why)
+                if not cfg.dirs:
+                    raise wc.WatchConfigError("it has no [[watch.dir]] entries")
+            except wc.WatchConfigError as e:
+                msg = f"last-known-good config is unusable too ({e})"
+            else:
+                if self.mode != "fallback" or raw != self.raw:
+                    self.log(f"running on last-known-good config {self.last_good} "
+                             f"(your config file is not modified)")
+                    self.use(cfg)
+                    self.raw = raw
+                self.set_mode("fallback", reason)
+                return
+        else:
+            msg = "no last-known-good config saved yet"
+        self.log(f"{msg}; idle until {self.cfg_path} changes (no restart needed)")
+        self.use(None)
+        self.raw = None
+        self.set_mode("idle", f"{reason}; {msg}")
+
+    def check_reload(self) -> None:
+        sig = self.signature()
+        if sig != self.sig_seen:
+            if sig == self.sig_pending:              # unchanged for one tick: not mid-save
+                self.sig_seen, self.sig_pending = sig, None
+                self.load()
+            else:
+                self.sig_pending = sig
+        elif self.mode != "config" and self.clock() - self.last_retry >= RETRY:
+            self.load()                              # e.g. a watched folder appeared again
+
+    def save_last_good(self) -> None:
+        if self.good_saved or self.raw is None or self.mode != "config":
+            return
+        try:
+            atomic_write(self.last_good, self.raw, 0o600)
+        except OSError as e:
+            self.log(f"warning: cannot save last-known-good config {self.last_good}: {e}")
+            return
+        self.good_saved = True
+        self.state["last_good"] = {"path": str(self.last_good), "saved": now_iso()}
+        self.log(f"saved last-known-good config {self.last_good}")
 
     # -- polling -------------------------------------------------------------------------------
     def tick(self, should_stop=lambda: False, once: bool = False) -> dict:
+        if not once:
+            self.check_reload()
         counts, listed = self.loop.tick(should_stop, once)
+        if listed and self.persist:
+            self.save_last_good()
         self.after_poll(listed)
         return counts
 
@@ -274,7 +413,32 @@ def timestamped(m: str) -> None:
     print(f"{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')} {m}", flush=True)
 
 
+def check_config(path: Path, overrides: dict | None = None) -> int:
+    """`tulda watch --check-config [PATH]`: validate and summarise; never runs, never writes."""
+    try:
+        cfg = wc.apply_overrides(wc.load(path), overrides or {})
+    except wc.WatchConfigError as e:
+        print(f"invalid: {e}", file=sys.stderr)
+        return 2
+    print(f"valid: {path}")
+    if not cfg.dirs:
+        print("no [[watch.dir]] entries; nothing would be watched")
+    for e in cfg.dirs:
+        print(f"  {e.path} -> {e.destination}  interval {e.interval:g}s, settle {e.settle:g}s, "
+              f"render {str(e.render).lower()}, force {str(e.force).lower()}"
+              + (f", include {', '.join(e.include)}" if e.include else ""))
+        why = wc.probe_dir(e.path)
+        if why:
+            print(f"    warning: watched path "
+                  + ("is blocked by macOS privacy (TCC) for this process" if why == "TCC" else why))
+    return 0
+
+
 def cmd_watch_config(args) -> int:
+    if getattr(args, "check_config", None) is not None:
+        return check_config(Path(args.check_config).expanduser() if args.check_config
+                            else wc.config_path(getattr(args, "config", None)),
+                            overrides_from_args(args))
     if getattr(args, "log_dir", None):
         from .logs import WATCH_LOG_NAMES, redirect_stdio
         redirect_stdio(Path(args.log_dir).expanduser(), names=WATCH_LOG_NAMES)
@@ -283,7 +447,7 @@ def cmd_watch_config(args) -> int:
     log = timestamped if not args.once else (lambda m: print(m, flush=True))
     d = WatchDaemon(path, sdir, overrides_from_args(args), log=log, persist=not args.once)
     if args.once:
-        d.start()
+        d.start_strict()
         if not d.cfg.dirs:
             raise wc.WatchConfigError(f"{path}: no [[watch.dir]] entries; add one, e.g.:\n{wc.SAMPLE}")
         c = d.tick(once=True)
@@ -292,14 +456,8 @@ def cmd_watch_config(args) -> int:
     stop = Stopper(log)
     stop.install()
     log(f"tulda watch pid={os.getpid()} config={path} state={sdir}")
-    try:
-        d.start()
-    except wc.WatchConfigError as e:
-        # Exit 0: launchd's KeepAlive {SuccessfulExit: false} does not restart a clean exit.
-        log(f"error: {e}; not starting (fix the config, then `tulda service start watch`)")
-        d.set_mode("idle", str(e))
-        d.write_state()
-        return 0
+    d.start()
+    d.write_state()
     try:
         while not stop():
             d.tick(should_stop=stop)
@@ -310,3 +468,46 @@ def cmd_watch_config(args) -> int:
     log("stopped")
     sys.stdout.flush()
     return 0
+
+
+def cmd_show_last_good(args) -> int:
+    lg = wc.last_good_path(wc.state_dir(args.state_dir))
+    try:
+        raw = lg.read_bytes()
+    except FileNotFoundError:
+        print(f"no last-known-good config yet ({lg}); it is saved after the watcher has used a "
+              f"config successfully", file=sys.stderr)
+        return 1
+    if not args.diff:
+        print(f"# {lg}")
+        sys.stdout.write(raw.decode("utf-8", "replace"))
+        return 0
+    import difflib
+    cur = wc.config_path(args.config)
+    try:
+        now = cur.read_bytes().decode("utf-8", "replace")
+    except OSError:
+        now = ""
+    diff = list(difflib.unified_diff(raw.decode("utf-8", "replace").splitlines(True),
+                                     now.splitlines(True), str(lg), str(cur)))
+    if not diff:
+        print("identical")
+        return 0
+    sys.stdout.writelines(d if d.endswith("\n") else d + "\n" for d in diff)
+    return 0
+
+
+def add_config_parser(sub) -> None:
+    c = sub.add_parser("config", help="watch config helpers (read-only)")
+    cs = c.add_subparsers(dest="config_cmd", required=True)
+    g = cs.add_parser("show-last-good", help="print the last-known-good watch config the watcher "
+                      "falls back to (or --diff it against the current config)")
+    g.add_argument("--diff", action="store_true", help="unified diff: last-good -> current config")
+    g.add_argument("--config", metavar="PATH", help="current config to diff against (default: user config)")
+    g.add_argument("--state-dir", metavar="DIR", help="state directory (default as `tulda watch`)")
+    g.set_defaults(fn=cmd_show_last_good)
+    k = cs.add_parser("check", help="same as `tulda watch --check-config [PATH]`")
+    k.add_argument("path", nargs="?", default="")
+    k.add_argument("--config", metavar="PATH")
+    k.set_defaults(fn=lambda a: check_config(Path(a.path).expanduser() if a.path
+                                             else wc.config_path(a.config)))

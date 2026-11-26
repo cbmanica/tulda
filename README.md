@@ -77,7 +77,8 @@ tulda never downloads, never contacts MakerWorld and never builds a MakerWorld U
 
     tulda project create ~/Downloads/<model>.3mf --destination ~/makerworld-projects
     tulda project create <thing>_stls.zip -d ~/makerworld-projects [--force] [--render]
-    tulda watch ~/Downloads --destination ~/makerworld-projects [--once] [--interval 5] [--settle 5]
+    tulda watch ~/MakerWorld-inbox --destination ~/makerworld-projects [--once] [--interval 5] [--settle 5]
+    tulda watch --from-config [--config PATH] [--once]      # every [[watch.dir]] of the config
 
 Each project is `<destination>/<name>/` with `source/<original file>` (a copy; the original is
 never moved or deleted), `files/` (zip contents: model, image, PDF and text files only),
@@ -198,6 +199,74 @@ label is `com.tulda.server`; the plist goes to `~/Library/LaunchAgents/`.
   inbound connections is normally unaffected, but a launchd service has no
   terminal to attribute a prompt to. If other devices cannot connect, check
   System Settings > Privacy & Security > Local Network and the firewall.
+
+## Watching an inbox as a service (com.tulda.watch)
+
+A second, independent LaunchAgent runs `tulda watch --from-config`. It is not part of the
+server: the server stays read-only, never imports the import code, and keeps running if the
+watcher is stopped (and vice versa).
+
+1. Make an inbox folder **outside** `~/Downloads`, `~/Desktop` and `~/Documents`, for example
+   `~/MakerWorld-inbox`, and point your browser's "ask where to save" (or Bambu Studio's
+   download folder) at it. Those three folders are protected by macOS privacy controls (TCC);
+   a background service cannot list them without a grant, while a plain folder in your home
+   directory needs none.
+2. Add the watch section to `~/.config/tulda/config.toml` (or keep it in a separate file and
+   pass `--config PATH` to `install`):
+
+       [watch]                      # defaults for every [[watch.dir]]
+       interval = 5                 # seconds between polls
+       settle = 5                   # minimum file age before import
+       render = false               # renders are visible to everyone who can reach `serve`
+       # force = false              # also import files without MakerWorld markers
+       # include = ["*.3mf", "*_stls.zip"]   # optional file-name globs
+
+       [[watch.dir]]
+       path = "~/MakerWorld-inbox"
+       destination = "~/makerworld-projects"
+       # interval / settle / render / force / include may be overridden per entry
+
+   Paths must be absolute or start with `~`. Unknown keys, duplicate paths and a destination
+   inside its watched path (or the reverse) are errors. Precedence: built-in defaults <
+   `[watch]` < `[[watch.dir]]` < command-line flags. Watch entries are read only from this
+   file (or `--config`), never from a `tulda.toml` found next to a model or in a repository.
+3. Check and install:
+
+       tulda watch --check-config           # validate without running (exit 2 if invalid)
+       tulda doctor                         # listability, TCC, git, renders-root checks
+       tulda service install watch          # refuses a config without [[watch.dir]]
+       tulda service status watch           # pid, config mode, last poll/import/error
+       tulda service logs watch [-f]        # ~/Library/Logs/tulda/watch.log
+
+`tulda service install|status|start|stop|restart|uninstall [server|watch|all]`,
+`logs [server|watch]` and `print-plist [server|watch]` all default to `server`.
+
+Behaviour:
+- Polling, settle and partial-download rules are those of `tulda watch` above. Each project is
+  built in a hidden staging folder and renamed into place under a lock file
+  (`<destination>/.tulda-project.lock`), so a manual `tulda project create` and the service
+  never import the same file twice.
+- SIGTERM (`tulda service stop watch`) finishes the current file and exits 0; launchd does not
+  restart a clean exit. A crash is restarted after 10 s.
+- Config changes are picked up automatically (the file's mtime is checked on every poll;
+  no restart needed). After a config has been loaded and used for one successful poll, a copy
+  is kept as the last-known-good config (`~/.local/state/tulda/watch-config.last-good.toml`,
+  mode 600; your config file is never written). If the config later fails to parse or
+  validate, or none of its folders can be listed, the watcher logs why and keeps running on
+  the last-known-good copy; `service status watch` and `doctor` then show
+  `running on fallback config since <time>: <reason>`. Fix the file and it switches back by
+  itself. Without a last-known-good copy it stays idle (no restart loop) until the file
+  changes. `tulda config show-last-good [--diff]` shows that copy.
+- State for `status` lives in `~/.local/state/tulda/watch.json` (never served over HTTP).
+
+Watching `~/Downloads` instead (opt-in): the service needs Full Disk Access for the real
+interpreter binary (not the venv symlink). `tulda doctor` prints its path. System Settings >
+Privacy & Security > Full Disk Access > `+` > Cmd-Shift-G > paste that path > enable, then
+`tulda service restart watch`. Without the grant the log shows a `macOS privacy (TCC)` error
+naming the same path. Caveats: the grant covers every script that interpreter runs (a
+uv-managed Python is shared by all venvs using that version), and it is lost silently when
+that Python is upgraded or reinstalled; re-check `tulda service status watch` after upgrades.
+Running `tulda doctor` from Terminal tests Terminal's access, not the service's.
 
 ## Adapter config
 

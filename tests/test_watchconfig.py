@@ -397,6 +397,207 @@ class DaemonState(unittest.TestCase):
         self.assertTrue((logdir / "watch.err.log").exists())
 
 
+class Fallback(unittest.TestCase):
+    """Reload on change and last-known-good fallback (driven tick by tick with a fake clock)."""
+
+    def setUp(self):
+        from tulda import watchd
+        self.watchd = watchd
+        self.d = tmpdir()
+        self.addCleanup(shutil.rmtree, self.d)
+        self.inbox, self.inbox2 = self.d / "inbox", self.d / "inbox2"
+        self.inbox.mkdir()
+        self.inbox2.mkdir()
+        self.dest, self.sdir = self.d / "projects", self.d / "state"
+        self.cfg = self.d / "config.toml"
+        self.good = (f'[watch]\nsettle = 0\ninterval = 1\n[[watch.dir]]\npath = "{self.inbox}"\n'
+                     f'destination = "{self.dest}"\n')
+        self.mt = time.time() - 1000
+        self.write(self.good)
+        self.now = [time.time() + 100]
+        self.logs = []
+
+    def write(self, text):
+        self.cfg.write_text(text)
+        self.mt += 10                                  # distinct mtime even on coarse clocks
+        os.utime(self.cfg, (self.mt, self.mt))
+
+    def daemon(self):
+        dm = self.watchd.WatchDaemon(self.cfg, self.sdir, log=self.logs.append, clock=lambda: self.now[0])
+        dm.start()
+        return dm
+
+    def tick(self, dm, n=1):
+        for _ in range(n):
+            self.now[0] += 2
+            dm.tick()
+
+    def watched(self, dm):
+        return sorted(e.path.name for _, e, _ in dm.loop.entries.values())
+
+    def state(self):
+        return self.watchd.read_state(self.sdir)
+
+    def test_bad_edit_falls_back_then_fix_recovers_and_updates_last_good(self):
+        dm = self.daemon()
+        self.tick(dm)
+        lg = self.sdir / "watch-config.last-good.toml"
+        self.assertEqual(lg.read_text(), self.good)
+        self.assertEqual(oct(lg.stat().st_mode & 0o777), "0o600")
+        before = self.cfg.read_bytes()
+
+        self.write("[watch\nbroken")
+        self.tick(dm)                                  # first sight of the change: debounce
+        self.assertEqual(dm.mode, "config")
+        self.tick(dm)
+        self.assertEqual(dm.mode, "fallback")
+        self.assertEqual(self.watched(dm), ["inbox"])  # still watching via last-known-good
+        st = self.state()
+        self.assertEqual(st["mode"], "fallback")
+        self.assertIn("TOML syntax error", st["reason"])
+        text = "\n".join(self.watchd.state_lines(st))
+        self.assertRegex(text, r"running on fallback config since \S+: .*TOML syntax error")
+        self.assertTrue(any("running on last-known-good config" in m for m in self.logs))
+        write_3mf(self.inbox / "a.3mf")               # imports keep working on fallback
+        self.tick(dm, 3)
+        self.assertTrue((self.dest / "Example-Box-v2-final").is_dir())
+        self.assertEqual(self.cfg.read_bytes(), b"[watch\nbroken")   # user file never rewritten
+        self.assertEqual(lg.read_text(), self.good)    # fallback mode never overwrites last-good
+
+        n = len(self.logs)
+        self.now[0] += self.watchd.RETRY + 1           # periodic retry, same error: no new noise
+        dm.tick()
+        self.assertEqual(dm.mode, "fallback")
+        self.assertFalse([m for m in self.logs[n:] if "error" in m])
+
+        fixed = self.good + f'[[watch.dir]]\npath = "{self.inbox2}"\ndestination = "{self.dest}"\n'
+        self.write(fixed)
+        self.tick(dm, 2)
+        self.assertEqual(dm.mode, "config")
+        self.assertEqual(self.watched(dm), ["inbox", "inbox2"])
+        self.assertEqual(lg.read_text(), fixed)        # updated after a successful poll
+        self.assertEqual(self.state()["mode"], "config")
+        self.assertIsNotNone(before)
+
+    def test_invalid_schema_and_unusable_dirs_fall_back(self):
+        dm = self.daemon()
+        self.tick(dm)
+        self.write(self.good.replace("settle = 0", "setle = 0"))
+        self.tick(dm, 2)
+        self.assertEqual(dm.mode, "fallback")
+        self.assertIn("unknown key", dm.state["reason"])
+        self.write(f'[[watch.dir]]\npath = "{self.d}/missing"\ndestination = "{self.dest}"\n')
+        self.tick(dm, 2)
+        self.assertEqual(dm.mode, "fallback")
+        self.assertIn("no watched directory is usable", dm.state["reason"])
+        self.assertEqual(self.watched(dm), ["inbox"])
+        (self.d / "missing").mkdir()                   # the folder appears: periodic retry
+        self.now[0] += self.watchd.RETRY + 1
+        dm.tick()
+        self.assertEqual(dm.mode, "config")
+        self.assertEqual(self.watched(dm), ["missing"])
+
+    def test_no_last_good_stays_idle_then_recovers(self):
+        self.write("[watch]\nbogus = true\n")
+        dm = self.daemon()
+        self.assertEqual(dm.mode, "idle")
+        self.assertIn("no last-known-good config saved yet", dm.state["reason"])
+        self.assertEqual(dm.loop.entries, {})
+        self.tick(dm, 3)                               # alive, idle, nothing raised
+        self.assertEqual(self.state()["mode"], "idle")
+        self.assertIn("idle since", "\n".join(self.watchd.state_lines(self.state())))
+        self.assertFalse((self.sdir / "watch-config.last-good.toml").exists())
+        self.write(self.good)
+        self.tick(dm, 2)
+        self.assertEqual(dm.mode, "config")
+        self.assertTrue((self.sdir / "watch-config.last-good.toml").exists())
+
+    def test_missing_config_without_last_good_is_idle(self):
+        self.cfg.unlink()
+        dm = self.daemon()
+        self.assertEqual(dm.mode, "idle")
+        self.assertIn("config file not found", dm.state["reason"])
+
+    def test_corrupt_last_good(self):
+        self.sdir.mkdir(mode=0o700)
+        (self.sdir / "watch-config.last-good.toml").write_bytes(b"\x00garbage[[[")
+        self.write("[watch\n")
+        dm = self.daemon()
+        self.assertEqual(dm.mode, "idle")
+        self.assertIn("last-known-good config is unusable too", dm.state["reason"])
+        self.write(self.good)
+        self.tick(dm, 2)
+        self.assertEqual(dm.mode, "config")
+        self.assertEqual((self.sdir / "watch-config.last-good.toml").read_text(), self.good)
+
+    def test_valid_reload_keeps_memory_of_handled_files(self):
+        write_3mf(self.inbox / "a.3mf")
+        dm = self.daemon()
+        self.tick(dm, 3)
+        created = [m for m in self.logs if m.startswith("created")]
+        self.assertEqual(len(created), 1)
+        self.write(self.good.replace("interval = 1", "interval = 1.5"))
+        self.tick(dm, 4)
+        self.assertTrue(any("changed; reloaded" in m for m in self.logs))
+        self.assertFalse([m for m in self.logs if m.startswith("exists")])
+        self.assertEqual(next(iter(dm.loop.entries.values()))[1].interval, 1.5)
+
+    def test_check_config_cli(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(cli.main(["watch", "--check-config", str(self.cfg)]), 0)
+            self.assertEqual(cli.main(["watch", "--config", str(self.cfg), "--check-config"]), 0)
+            self.assertEqual(cli.main(["config", "check", str(self.cfg)]), 0)
+        self.assertIn("valid:", out.getvalue())
+        self.assertIn(str(self.inbox), out.getvalue())
+        self.write("[watch]\nnope = 1\n")
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            self.assertEqual(cli.main(["watch", "--check-config", str(self.cfg)]), 2)
+        self.assertIn("unknown key", err.getvalue())
+        self.assertFalse(self.sdir.exists())          # validation writes nothing
+
+    def test_show_last_good(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(cli.main(["config", "show-last-good", "--state-dir", str(self.sdir)]), 1)
+        self.assertIn("no last-known-good", err.getvalue())
+        dm = self.daemon()
+        self.tick(dm)
+        self.write(self.good.replace("interval = 1", "interval = 2"))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(cli.main(["config", "show-last-good", "--state-dir", str(self.sdir)]), 0)
+        self.assertIn("interval = 1", out.getvalue())
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cli.main(["config", "show-last-good", "--diff", "--state-dir", str(self.sdir),
+                      "--config", str(self.cfg)])
+        self.assertIn("-interval = 1\n+interval = 2", out.getvalue())
+
+    def test_cli_loop_survives_broken_config(self):
+        """The real process with a broken config and no last-good stays up (no launchd loop)."""
+        import signal
+        self.write("[watch\n")
+        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent))
+        p = subprocess.Popen([sys.executable, "-m", "tulda", "watch", "--from-config", "--config",
+                              str(self.cfg), "--state-dir", str(self.sdir)], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            end = time.time() + 15
+            while time.time() < end and not (self.sdir / "watch.json").exists():
+                time.sleep(0.1)
+            time.sleep(0.5)
+            self.assertIsNone(p.poll())
+            self.assertEqual(self.watchd.read_state(self.sdir)["mode"], "idle")
+            p.send_signal(signal.SIGTERM)
+            out, _ = p.communicate(timeout=15)
+            self.assertEqual(p.returncode, 0)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        self.assertIn("idle until", out)
+
+
 class ZipConfigNeverExtracted(unittest.TestCase):
     """A config inside a downloaded zip could inject adapter commands via the walk-up project
     config lookup used by `render`; it must never be extracted."""
