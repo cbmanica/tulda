@@ -359,14 +359,37 @@ def detect(src: Path) -> tuple[bool, str]:
 @contextlib.contextmanager
 def dest_lock(dest: Path):
     """Exclusive advisory lock on DEST/.tulda-project.lock, so a manual `project create` and the
-    watch service never pick the same name or import the same source twice."""
-    fd = os.open(Path(dest) / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o644)
+    watch service never pick the same name or import the same source twice.
+
+    The lock file exists only while the lock is held: it is unlinked before the lock is released,
+    so it never lingers as an untracked file in the user's folder (a SIGKILL can leave one; the
+    next lock holder removes it). Waiters may have opened the old inode, so after flock returns we
+    check that the path still names the inode we locked and start over if it does not."""
+    path = Path(dest) / LOCK_NAME
+    while True:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            st = os.fstat(fd)
+            try:
+                cur = os.stat(path, follow_symlinks=False)
+            except FileNotFoundError:
+                cur = None
+        except BaseException:
+            os.close(fd)
+            raise
+        if cur is not None and (cur.st_dev, cur.st_ino) == (st.st_dev, st.st_ino):
+            break
+        os.close(fd)                       # unlinked or replaced while we waited: retry
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+        try:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)            # still ours: nobody else holds the lock
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
 
 def clean_stale_staging(dest: Path, now: float | None = None) -> int:

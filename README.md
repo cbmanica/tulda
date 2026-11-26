@@ -327,8 +327,8 @@ server: the server never imports the import code (its only write, the Render but
 Behaviour:
 - Polling, settle and partial-download rules are those of `tulda watch` above. Each project is
   built in a hidden staging folder and renamed into place under a lock file
-  (`<destination>/.tulda-project.lock`), so a manual `tulda project create` and the service
-  never import the same file twice.
+  (`<destination>/.tulda-project.lock`, removed again when the import finishes), so a manual
+  `tulda project create` and the service never import the same file twice.
 - SIGTERM (`tulda service stop watch`) finishes the current file and exits 0; launchd does not
   restart a clean exit. A crash is restarted after 10 s.
 - Config changes are picked up automatically (the file's mtime is checked on every poll;
