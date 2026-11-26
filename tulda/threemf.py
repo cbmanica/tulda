@@ -19,6 +19,7 @@ multi-plate filtering, texture/colorgroup extensions."""
 
 from __future__ import annotations
 
+import json
 import re
 import zipfile
 from array import array
@@ -331,6 +332,20 @@ _CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 def _clean(v: str | None) -> str | None:
     v = _CTRL.sub("", v or "").strip()
+    if v[:1] == "[" and v[-1:] == "]" or v[:1] == "{" and v[-1:] == "}":
+        # Bambu writes an empty list for unset fields ("[]"); an empty container is no value.
+        # A non-empty list of strings reads as its items joined with ", ".
+        try:
+            js = json.loads(v)
+        except ValueError:
+            js = None
+        if isinstance(js, dict) and not js:
+            return None
+        if isinstance(js, list):
+            if not js:
+                return None
+            if all(isinstance(x, str) for x in js):
+                v = ", ".join(x.strip() for x in js if x.strip())
     return v[:MAX_META_VALUE] or None
 
 

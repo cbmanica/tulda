@@ -163,6 +163,10 @@ def cmd_info(args) -> int:
     code = 0
     for f in args.files:
         src = Path(f).expanduser()
+        if not src.exists():
+            print(f"error: {src.name}: no such file", file=sys.stderr)
+            code = 1
+            continue
         if src.suffix.lower() != ".3mf" or not src.is_file():
             print(f"error: {src.name}: not a .3mf file", file=sys.stderr)
             code = 2

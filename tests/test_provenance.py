@@ -253,6 +253,37 @@ class Recorded(unittest.TestCase):
         self.assertEqual(dict(it["prov"])["Licence"], "Example Licence")
 
 
+class EmptyContainers(unittest.TestCase):
+    def test_empty_json_containers_are_no_value(self):
+        xml = model(md("Copyright", "[]") + md("CopyRight", "[ ]") + md("Designer", " {} ")
+                    + md("License", "[\n]") + md("Title", "[draft]"))
+        p = threemf.read_provenance(write(tmpdir() / "j.3mf", xml))
+        self.assertIsNone(p["copyright"])
+        self.assertIsNone(p["designer"])
+        self.assertIsNone(p["license"])
+        self.assertEqual(p["title"], "[draft]")          # not JSON: kept as written
+
+    def test_empty_copyright_falls_through_to_second_spelling(self):
+        xml = model(md("Copyright", "[]"), md("CopyRight", "(c) Example"))
+        p = threemf.read_provenance(write(tmpdir() / "k.3mf", xml))
+        self.assertEqual(p["copyright"], "(c) Example")
+
+    def test_non_empty_string_list_is_joined(self):
+        xml = model(md("Copyright", '["(c) A", "CC-BY"]'))
+        p = threemf.read_provenance(write(tmpdir() / "l.3mf", xml))
+        self.assertEqual(p["copyright"], "(c) A, CC-BY")
+
+    def test_info_hides_empty_copyright_line(self):
+        f = write(tmpdir() / "m.3mf", model(md("Copyright", "[]") + md("License", "CC-BY")))
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(["info", str(f)])
+        self.assertEqual(code, 0)
+        self.assertIn("Licence:", out.getvalue())
+        self.assertNotIn("Copyright", out.getvalue())
+        self.assertNotIn("[]", out.getvalue())
+
+
 class InfoCli(unittest.TestCase):
     def run_cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -276,6 +307,10 @@ class InfoCli(unittest.TestCase):
         (d / "x.scad").write_text("cube(1);")
         (d / "bad.3mf").write_bytes(b"nope")
         self.assertEqual(self.run_cli("info", str(d / "x.scad"))[0], 2)
+        code, _, err = self.run_cli("info", str(d / "missing.3mf"))
+        self.assertEqual(code, 1)
+        self.assertEqual(err.strip(), "error: missing.3mf: no such file")
+        self.assertNotIn("not a .3mf", err)
         code, _, err = self.run_cli("info", str(d / "bad.3mf"))
         self.assertEqual(code, 1)
         self.assertIn("bad.3mf", err)
