@@ -271,7 +271,8 @@ class WatchDaemon:
         if self.mode in ("fallback", "idle") and self.state["reason"] is not None \
                 and self.state["reason"].startswith(reason):
             return                                   # same problem: already handled and logged
-        self.log(f"error: config {self.cfg_path}: {reason}")
+        self.log(f"error: {reason}" if str(self.cfg_path) in reason
+                 else f"error: config {self.cfg_path}: {reason}")
         if self.last_good.exists():
             try:
                 raw, cfg = wc.read_config(self.last_good)
