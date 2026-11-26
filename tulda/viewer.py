@@ -49,6 +49,11 @@ border:1px solid var(--line);border-radius:12px;padding:6px 10px;z-index:2;font-
 #parts label{display:flex;align-items:center;gap:7px;padding:4px 0;min-height:30px;overflow-wrap:anywhere}
 #parts .sw{width:14px;height:14px;border-radius:3px;border:1px solid #0005;flex:none}
 #parts .o{color:var(--mut);font-size:11px;margin-top:6px;overflow-wrap:anywhere}
+#dimov{position:absolute;top:8px;left:8px;max-width:min(300px,60vw);background:var(--panel);border:1px solid var(--line);
+border-radius:10px;padding:5px 10px;z-index:5;font-size:13px;font-variant-numeric:tabular-nums;pointer-events:none}
+#dimov b{font-weight:600}#dimov .m{color:var(--mut);font-size:12px}
+.dl{position:absolute;z-index:1;transform:translate(-50%,-50%);font:600 12px/1.2 system-ui,sans-serif;padding:1px 5px;border-radius:6px;
+background:var(--panel);color:var(--fg);border:1px solid var(--line);pointer-events:none;white-space:nowrap;font-variant-numeric:tabular-nums}
 #tt{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:var(--stage);z-index:4;padding:8px}
 #tt img{max-width:100%;max-height:calc(100% - 90px);object-fit:contain;touch-action:pan-y;user-select:none;-webkit-user-drag:none;cursor:grab;background:#fff}
 #tt img:active{cursor:grabbing}
@@ -62,6 +67,7 @@ __TABS__
 <div id="stage">
 <canvas id="cv" tabindex="0" aria-label="3D model viewer. Drag to rotate, scroll or pinch to zoom, right-drag or two fingers to pan."></canvas>
 <div id="msg" role="status" __MSGHIDE__>__NOJS__</div>
+__DIMS__
 <details id="parts" hidden open><summary>Parts</summary><div id="plist"></div></details>
 <div class="tools" id="ui" hidden>
 <div class="grp" role="group" aria-label="Camera"><button class="b" id="reset" type="button">Reset view</button>
@@ -70,7 +76,8 @@ __TABS__
 <button class="b" data-preset="back" type="button">Back</button><button class="b" data-preset="left" type="button">Left</button>
 <button class="b" data-preset="right" type="button">Right</button></div>
 <div class="grp" role="group" aria-label="Display"><button class="b" id="wire" type="button" aria-pressed="false">Wireframe</button>
-<button class="b" id="grid" type="button" aria-pressed="true">Grid</button><button class="b" id="theme" type="button">Dark background</button>
+<button class="b" id="grid" type="button" aria-pressed="true">Grid</button>
+<button class="b" id="scale" type="button" aria-pressed="true">Scale</button><button class="b" id="theme" type="button">Dark background</button>
 <button class="b" id="full" type="button">Full screen</button></div>
 </div>
 <div id="tt" hidden></div>
@@ -93,7 +100,7 @@ def viewer_data(r: dict) -> dict:
     d = {"kind": r["kind"], "project": r["project"], "file": r["file"], "vendor": VENDOR,
          "info": {k: v for k, v in info.items() if k in
                   ("triangles", "bbox", "parts", "bed", "warnings", "frames", "format", "frames_dir")},
-         "glb": None, "turntable": None, "source": r.get("source")}
+         "glb": None, "turntable": None, "source": r.get("source"), "dims": r.get("dims")}
     if r["kind"] == "mesh":
         d["glb"] = r["url"]
     tt = r if r["kind"] == "turntable" else r.get("turntable")
@@ -108,6 +115,24 @@ def viewer_data(r: dict) -> dict:
     return d
 
 
+def dims_html(r: dict) -> str:
+    """The scale overlay (server-rendered, escaped): shown over the 3D view and over the
+    no-WebGL turntable fallback alike. viewer.js adds the grid step to #gstep."""
+    from . import dims
+    d = r.get("dims")
+    if not d:
+        return f'<div id="dimov" role="note"><b>{escape(dims.UNKNOWN)}</b></div>'
+    lines = [f'<b>{escape(dims.size_text(d["size"]))}</b> <span class="m">X \u00d7 Y \u00d7 Z</span>']
+    sc = dims.scope_text(d)
+    if sc:
+        lines.append(f'<div class="m">{escape(sc)}</div>')
+    for p in (d.get("plates") or [])[:8]:
+        lines.append(f'<div class="m">plate {int(p["plate"])}: '
+                     f'{escape(dims.size_text(p["size"])) if p.get("size") else "empty"}</div>')
+    lines.append('<div class="m" id="gstep"></div>')
+    return '<div id="dimov" role="note">' + "".join(lines) + "</div>"
+
+
 def render_viewer(r: dict) -> str:
     data = viewer_data(r)
     title = r.get("source") or r["file"]
@@ -115,6 +140,8 @@ def render_viewer(r: dict) -> str:
     gt = r.get("group_title")
     sub_bits = [r["file"]]
     inf = r.get("info") or {}
+    from . import dims
+    sub_bits.append(dims.fmt(r.get("dims")))
     if inf.get("triangles"):
         sub_bits.append(f"{inf['triangles']:,} triangles")
     if inf.get("frames"):
@@ -128,6 +155,6 @@ def render_viewer(r: dict) -> str:
     im = {"imports": {"three": VENDOR + "build/three.module.js"}}
     subs = {"__IMPORTMAP__": _json(im), "__TITLE__": escape(title), "__HEADING__": heading,
             "__LINKS__": "".join(links), "__SUB__": escape("  |  ".join(sub_bits)),
-            "__TABCSS__": TAB_CSS, "__TABS__": tabs_html("gallery"), "__MSGHIDE__": "",
+            "__TABCSS__": TAB_CSS, "__DIMS__": dims_html(r), "__TABS__": tabs_html("gallery"), "__MSGHIDE__": "",
             "__NOJS__": "This page needs JavaScript.", "__DATA__": _json(data)}
     return re.sub(r"__[A-Z]+__", lambda m: subs.get(m.group(0), m.group(0)), PAGE)

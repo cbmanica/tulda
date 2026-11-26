@@ -71,6 +71,16 @@ def cmd_db(args) -> int:
         before = cat.path.stat().st_size
         cat.vacuum()
         print(f"vacuumed: {before} -> {cat.path.stat().st_size} bytes")
+    elif args.db_cmd == "dims":
+        from .dims import backfill
+        st = backfill(cat.root, scad=not args.no_scad, dry_run=args.dry_run,
+                      log=lambda m: print(m, file=sys.stderr))
+        added = st["source"] + st["glb"] + st["sibling"]
+        print(f"{st['renders']} renders: {st['had']} already measured, {added} "
+              f"{'would be ' if args.dry_run else ''}added (source {st['source']}, glb {st['glb']}, "
+              f"sibling {st['sibling']}), {st['unknown']} size unknown, {st['errors']} errors")
+        if not args.dry_run:
+            cat.sync(force=True)
     elif args.db_cmd == "check":
         cat.sync()
         probs = cat.check()
@@ -195,6 +205,11 @@ def add_manage_parsers(sub, common) -> None:
                     ("stats", "counts and schema version"), ("vacuum", "compact the database"),
                     ("check", "integrity check plus index-vs-disk comparison")):
         common(ds.add_parser(name, help=h))
+    dm = ds.add_parser("dims", help="measure model dimensions for renders whose sidecar has none "
+                       "(from the unchanged source file, the render's GLB, or a sibling render)")
+    dm.add_argument("--dry-run", action="store_true", help="count only; write nothing")
+    dm.add_argument("--no-scad", action="store_true", help="do not run OpenSCAD to measure .scad sources")
+    common(dm)
     d.set_defaults(fn=cmd_db)
 
     ls = sub.add_parser("ls", help="list request groups (newest first)")

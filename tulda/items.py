@@ -174,4 +174,16 @@ def read_item(root: Path, pdir: Path, png: Path) -> dict | None:
         "source_sha256": _text(meta.get("source_sha256"), 80),
         "view": _text(meta.get("view"), 40), **group_fields(meta, st.st_mtime),
         "provenance": clean_provenance(meta.get("provenance")),
+        "dims": item_dims(meta, info, png.suffix.lower()),
     }
+
+
+def item_dims(meta: dict, info: dict | None, ext: str) -> dict | None:
+    """The sidecar's `dims`; for older mesh renders without one, the bbox their sidecar `info`
+    recorded (a 3mf's GLB holds every plate, so that one is labelled the whole build)."""
+    from . import dims
+    d = dims.clean(meta.get("dims"))
+    if d is None and ext == ".glb" and info:
+        d = dims.from_bbox(info.get("bbox"), "build" if meta.get("source_type") == "3mf" else "model",
+                           "glb")
+    return d

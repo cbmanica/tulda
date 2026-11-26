@@ -80,6 +80,19 @@ MakerWorld page is authoritative. Parsing is stdlib-only and refuses DTDs/entiti
 members. To print it without rendering:
 
     tulda info model.3mf            # Licence: <licence>, Designer: <designer>, Title: <title>, ...
+
+Dimensions: every render's sidecar records the model's bounding box in millimetres under `dims`
+(`size` X/Y/Z, `min`, `max`, `scope`). `.stl` is measured from its triangles; `.3mf` from the build
+with the `unit` attribute and every build-item and component transform applied (normal parts only;
+Bambu/Orca projects with several plates are measured per plate, the render's `plate` option or
+plate 1, and list every plate); `.scad` from the interactive render's mesh, else an OpenSCAD STL
+export (only in chains that already run OpenSCAD). Cards, the group page, the lightbox caption, the
+Watcher tab and the 3D viewer show `60.0 × 46.8 × 13.8 mm` ("size unknown" when not measured). The
+viewer adds a toggleable scale reference: the bounding box with its edge lengths, and a ground grid
+in round steps (1/5/10/50/100 mm) chosen from the model size. PNGs get no drawn scale bar: both
+renderers use perspective cameras fitted to the model, so no single mm-per-pixel figure is true.
+`tulda db dims` measures older renders from their source file (only while its sha256 still matches
+the sidecar), their GLB, or another render of the same request and source.
     tulda info --json model.3mf
 
 ### Project folders for MakerWorld downloads
@@ -211,6 +224,7 @@ Watcher tab's Render buttons, all changes happen in the CLI:
     tulda prune ... --yes                 # really deletes; starred groups are kept by default
     tulda trash empty [--yes]
     tulda db reindex|stats|vacuum|check   # reindex keeps all metadata
+    tulda db dims [--dry-run] [--no-scad] # measure renders recorded before dimensions existed
 
 Tags: every group automatically gets one tag per distinct source file of its renders, the
 file stem lower-cased (`nfc_holder_body_pizza.scad` -> `nfc_holder_body_pizza`, `x.3mf` -> `x`). These

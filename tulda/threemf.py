@@ -98,7 +98,7 @@ class Obj:
 @dataclass
 class Model:
     objects: dict = field(default_factory=dict)     # (file, id) -> Obj
-    build: list = field(default_factory=list)       # [(file, objectid, transform)]
+    build: list = field(default_factory=list)       # [(file, objectid, transform, instance)]
     materials: dict = field(default_factory=dict)   # (file, pid) -> [(name, "#RRGGBB", alpha)]
     unit_scale: float = 1.0
     title: str | None = None
@@ -132,11 +132,14 @@ def _parse_model(z, model: Model, name: str, main: bool) -> None:
                 elif rt == "object":
                     model.objects[(name, r.get("id"))] = _parse_object(r, name)
         elif tag == "build" and main:
+            seen: dict = {}
             for it in el:
                 if _local(it.tag) == "item":
+                    # instance = n-th build item of this object (Bambu plates name instances so)
+                    inst = seen[it.get("objectid")] = seen.get(it.get("objectid"), -1) + 1
                     if it.get("printable") == "0":
                         continue
-                    model.build.append((name, it.get("objectid"), parse_transform(it.get("transform"))))
+                    model.build.append((name, it.get("objectid"), parse_transform(it.get("transform")), inst))
 
 
 def _parse_object(el, fname: str) -> Obj:
@@ -178,24 +181,25 @@ class Leaf:
     xf: tuple
     top: tuple                  # (file, id) of the build item's top-level object
     comp_id: str | None         # id of the component object when reached through a component
+    item: int = 0               # index into Model.build
 
 
 def _flatten(model: Model):
     leaves: list[Leaf] = []
 
-    def walk(key, xf, top, comp_id, depth):
+    def walk(key, xf, top, comp_id, depth, item):
         if depth > 16:
             raise MeshError("component nesting too deep (cycle?)")
         o = model.objects.get(key)
         if o is None:
             raise MeshError(f"component refers to unknown object {key[1]} in {key[0]}")
         if o.is_mesh:
-            leaves.append(Leaf(o, xf, top, comp_id))
+            leaves.append(Leaf(o, xf, top, comp_id, item))
         for f, oid, cxf in o.components:
-            walk((f, oid), compose(cxf, xf), top, oid if depth == 0 else comp_id, depth + 1)
+            walk((f, oid), compose(cxf, xf), top, oid if depth == 0 else comp_id, depth + 1, item)
 
-    for f, oid, xf in model.build:
-        walk((f, oid), xf, (f, oid), None, 0)
+    for i, (f, oid, xf, _inst) in enumerate(model.build):
+        walk((f, oid), xf, (f, oid), None, 0, i)
     return leaves
 
 
@@ -417,6 +421,115 @@ def read_provenance(path) -> dict:
     return out
 
 
+def _load_model(z: zipfile.ZipFile) -> Model:
+    """The root model plus the production extension's component files."""
+    main = main_model_name(z)
+    model = Model()
+    _parse_model(z, model, main, True)
+    seen = {main}
+    todo = [c[0] for o in list(model.objects.values()) for c in o.components]
+    while todo:
+        f = todo.pop()
+        if f in seen:
+            continue
+        seen.add(f)
+        _parse_model(z, model, f, False)
+        todo += [c[0] for o in model.objects.values() if o.file == f for c in o.components]
+    if not model.build:
+        raise MeshError("3mf has no printable build items")
+    return model
+
+
+def _leaf_subtype(model: Model, cfg: Config, lf: Leaf) -> str:
+    ocfg = cfg.objects.get(model.objects[lf.top].id) or {}
+    pcfg = (ocfg.get("parts") or {}).get(lf.comp_id) if lf.comp_id else None
+    return (pcfg or {}).get("subtype") or "normal_part"
+
+
+def read_plates(z: zipfile.ZipFile) -> list[tuple[int, set]]:
+    """Bambu/Orca plates from Metadata/model_settings.config: [(plate number,
+    {(object id, instance index)})] in plate order. [] when the file has none."""
+    raw = _opt_text(z, "Metadata/model_settings.config")
+    out = []
+    if not raw:
+        return out
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return out
+    for pl in root:
+        if _local(pl.tag) != "plate":
+            continue
+        n = _int(_meta(pl).get("plater_id"))
+        if n is None:
+            continue
+        inst = set()
+        for mi in pl:
+            if _local(mi.tag) == "model_instance":
+                md = _meta(mi)
+                try:
+                    inst.add((md.get("object_id"), int(md.get("instance_id") or 0)))
+                except ValueError:
+                    continue
+        out.append((n, inst))
+    return sorted(out, key=lambda p: p[0])
+
+
+def _union(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return [[min(a[0][k], b[0][k]) for k in range(3)], [max(a[1][k], b[1][k]) for k in range(3)]]
+
+
+def build_bboxes(path) -> dict:
+    """Bounding boxes in millimetres (unit and every transform applied) of the printable
+    geometry (normal parts; modifiers and blockers are left out, as in the viewer):
+    {"build": [[min], [max]] of all build items, "plates": [(n, bbox or None)] for Bambu/Orca
+    plates (empty when the file has none)}. Raises MeshError for unreadable files."""
+    try:
+        z = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError) as e:
+        raise MeshError(f"not a readable 3mf: {e}") from e
+    with z:
+        model = _load_model(z)
+        cfg = read_config(z)
+        plates = read_plates(z)
+        leaves = _flatten(model)
+    s = model.unit_scale
+    per_item: dict[int, list] = {}
+    for lf in leaves:
+        o = lf.obj
+        if not o.tris or not o.verts or _leaf_subtype(model, cfg, lf) != "normal_part":
+            continue
+        m = lf.xf
+        used = {i for t in o.tris for i in t[:3]}
+        try:
+            pts = [o.verts[i] for i in used]
+        except IndexError:
+            raise MeshError(f"object {o.id}: triangle refers to a missing vertex") from None
+        lo, hi = [], []
+        for k in range(3):
+            vals = [x * m[k] + y * m[3 + k] + z * m[6 + k] + m[9 + k] for x, y, z in pts]
+            lo.append(min(vals) * s)
+            hi.append(max(vals) * s)
+        per_item[lf.item] = _union(per_item.get(lf.item), [lo, hi])
+    build = None
+    for bb in per_item.values():
+        build = _union(build, bb)
+    if build is None:
+        raise MeshError("no printable geometry in the 3mf")
+    out_plates = []
+    for n, inst in plates:
+        bb = None
+        for i, (_f, oid, _xf, k) in enumerate(model.build):
+            if (oid, k) in inst:
+                bb = _union(bb, per_item.get(i))
+        out_plates.append((n, bb))
+    return {"build": build, "plates": out_plates}
+
+
 def load(path) -> Scene:
     """Read a .3mf into a Scene: one Part per mesh instance (per material)."""
     try:
@@ -424,21 +537,7 @@ def load(path) -> Scene:
     except (zipfile.BadZipFile, OSError) as e:
         raise MeshError(f"not a readable 3mf: {e}") from e
     with z:
-        main = main_model_name(z)
-        model = Model()
-        _parse_model(z, model, main, True)
-        # production-extension component files
-        seen = {main}
-        todo = [c[0] for o in list(model.objects.values()) for c in o.components]
-        while todo:
-            f = todo.pop()
-            if f in seen:
-                continue
-            seen.add(f)
-            _parse_model(z, model, f, False)
-            todo += [c[0] for o in model.objects.values() if o.file == f for c in o.components]
-        if not model.build:
-            raise MeshError("3mf has no printable build items")
+        model = _load_model(z)
         cfg = read_config(z)
         leaves = _flatten(model)
     scene = Scene()

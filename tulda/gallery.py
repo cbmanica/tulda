@@ -72,6 +72,8 @@ font-size:13px;line-height:1.35}.sl b{display:block;font-size:14px;margin-bottom
 .prov .cav{font-size:11px;font-style:italic;margin-top:2px}
 .provs{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 10px}.provs .prov{margin:0;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);flex:1 1 240px}
 .provs h3{font-size:13px;margin:0 0 3px;color:var(--fg);overflow-wrap:anywhere}
+.dim{color:var(--fg);font-variant-numeric:tabular-nums;margin-top:2px}.dim.unk{color:var(--mut);font-style:italic}
+.dims{display:flex;flex-wrap:wrap;gap:4px 14px;margin:0 0 8px;font-size:13px}.dims b{font-weight:500;color:var(--mut)}
 .badge{position:absolute;top:6px;left:6px;background:var(--acc);color:#fff;font-size:12px;font-weight:600;
 padding:1px 8px;border-radius:10px}
 .empty{color:var(--mut);padding:24px 0}
@@ -171,6 +173,14 @@ function groupProv(g){const seen=new Set(),w=el('div','provs');
  g.items.forEach(i=>{if(!i.prov||!i.prov.length)return;const k=(i.source||'')+'\n'+(i.source_sha256||'');
   if(seen.has(k))return;seen.add(k);w.append(provBlock(i.prov,D.prov_caveat,i.source||i.file))});
  return seen.size?w:null}
+// dimensions: server-formatted text ('60.0 × 46.8 × 13.8 mm', 'size unknown'); plates in the tooltip
+function dimEl(i){const d=el('div','dim'+(i.dims?'':' unk'),i.dims_text||'size unknown');
+ const t=i.dims?['model bounding box X × Y × Z']:['no measurement recorded'];
+ if(i.dims&&i.dims.plates)i.dims.plates.forEach(p=>t.push('plate '+p.plate+': '+(p.size?p.size.map(x=>x.toFixed(1)).join(' × ')+' mm':'empty')));
+ if(i.dims&&i.dims.from==='sibling')t.push('(from another render of the same source in this request)');
+ d.title=t.join('\n');return d}
+function groupDims(g){const m=new Map();g.items.forEach(i=>{const k=i.source||i.file;
+ if(i.dims&&(!m.has(k)||m.get(k)===null))m.set(k,i.dims_text);else if(!m.has(k))m.set(k,null)});return m}
 function card(i,g){const c=el('div','card');c._i=i;c.tabIndex=0;c.setAttribute('role','button');
  if(i.kind==='mesh'){const t=link('t3d','3D',i.viewer_url);t.append(el('small','','open interactive viewer'));
   t.tabIndex=-1;t.onclick=e=>e.stopPropagation();c.append(t)}
@@ -180,6 +190,7 @@ function card(i,g){const c=el('div','card');c._i=i;c.tabIndex=0;c.setAttribute('
  const m=el('div','m');m.append(el('b','',i.source||i.file),el('div','',i.adapter+' / '+i.stage+(ctx.project?'':' / '+i.project)));
  const tb=trg(g);if(tb)m.append(tb);
  if(i.tag)m.append(tagLink(i.tag,'src'));
+ m.append(dimEl(i));
  if(i.prov&&i.prov.length)m.append(provBlock(i.prov,D.prov_caveat_short));
  c.append(m);const go=()=>viewable(i)?(location.href=i.viewer_url):i.kind==='slice'?(location.href=i.url):compare?pick(i):openCard(c);c.onclick=go;
  c.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();go()}};return c}
@@ -196,13 +207,16 @@ function groupEl(g,first){
  const au=g.auto_tags||[];au.forEach(t=>h.append(tagLink(t,'src')));g.tags.filter(t=>!au.includes(t)).forEach(t=>h.append(tagLink(t,'')));
  const srcs=g.sources.length||new Set(g.items.map(i=>i.source).filter(Boolean)).size;
  const when=tm(g.created||new Date(g.mtime*1000).toISOString()),ts=el('span','t');
- ts.append(when,' | '+srcs+' source'+(srcs==1?'':'s')+' | '+g.items.length+' image'+(g.items.length==1?'':'s'));h.append(ts);
+ ts.append(when,' | '+srcs+' source'+(srcs==1?'':'s')+' | '+g.items.length+' image'+(g.items.length==1?'':'s'));
+ const gd=groupDims(g),known=[...new Set([...gd.values()].filter(Boolean))];
+ if(gd.size===1&&known.length===1)ts.append(' | '+known[0]);h.append(ts);
  if(!single){h.append(link('o','open','/_g/'+encodeURIComponent(g.id)+'/'));
   const th=el('span','ths');th.setAttribute('aria-hidden','true');
   g.items.filter(i=>!special(i)).slice(0,3).forEach(i=>{const im=el('img');im.src=i.url;im.loading='lazy';im.decoding='async';im.alt='';th.append(im)});h.append(th)}
  const b=el('div','bd');root.append(h,b);
  if(g.sources.length){const r=el('div','src');g.sources.forEach(x=>r.append(el('span','',x)));b.append(r)}
  if(g.cmd&&single)b.append(el('div','cmd',g.cmd));
+ if(gd.size){const r=el('div','dims');gd.forEach((t,k)=>{const x=el('span','');x.append(el('b','',k+': '),t||'size unknown');r.append(x)});b.append(r)}
  if(g.trigger_note&&single){const r=el('div','rnote');r.append(el('b','','Note ('+(g.trigger||'unknown trigger')+'): '),g.trigger_note);b.append(r)}
  if(g.notes)b.append(el('div','note',g.notes));
  const pv=groupProv(g);if(pv)b.append(pv);
@@ -231,6 +245,7 @@ function pick(i){const k=picks.indexOf(i);if(k>=0)picks.splice(k,1);else{picks.p
  markPicks();if(picks.length===2)openCmp()}
 function caption(i){const bits=[i.file,i.adapter+' / '+i.stage+(i.view?' / '+i.view:'')];
  if(i.source)bits.push('source '+i.source+(i.git_sha?' @'+i.git_sha+(i.git_dirty?'*':''):''));
+ bits.push(i.dims_text||'size unknown');
  if(i.tool_version)bits.push(i.tool_version);if(i.created_utc)bits.push(tm(i.created_utc).textContent);return bits.join('  |  ')}
 function openCmp(){const p=$('pair');p.textContent='';picks.forEach(i=>{const f=el('figure');const im=el('img');im.src=i.url;im.alt=i.file;
  f.append(im,el('div','cap',caption(i)));p.append(f)});$('cmp').classList.add('open')}
@@ -283,6 +298,12 @@ def noscript_list(data: dict) -> str:
         when = time_html(g.get("created") or (utc_from_ts(mt) if mt else None))
         note = (f' <span class=rnote><b>Note:</b> {_esc(g["trigger_note"])}</span>'
                 if g.get("trigger_note") else "")
+        sizes = {}
+        for i in g.get("items") or []:
+            if i.get("dims"):
+                sizes.setdefault(i.get("source") or i.get("file") or "", i.get("dims_text"))
+        dims = "; ".join(f"{k}: {t}" for k, t in sizes.items())
+        note += f' <span class=dim>{_esc(dims)}</span>' if dims else ""
         out.append(f'<li><a href="/_g/{_esc(urllib.parse.quote(g["id"], safe=""))}/">{_esc(title)}</a> '
                    f'{when} {trigger_badge(g.get("trigger"), g.get("trigger_note"))} '
                    f'({int(g.get("n_renders") or len(g.get("items") or []))} renders){note}</li>')

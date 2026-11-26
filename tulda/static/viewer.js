@@ -6,6 +6,7 @@ const stage = $('stage'), msg = $('msg');
 let T = null;                      // THREE namespace once loaded
 let scene, camera, renderer, controls, root, grid, bedMesh, bbox, center, radius;
 let wire = false, queued = false;
+let boxHelper = null, scaleOn = true, labels = [];   // scale reference: bbox edges + mm labels
 
 function say(text, bad) { msg.textContent = text; msg.hidden = !text; msg.classList.toggle('bad', !!bad); }
 function hasWebGL() {
@@ -33,7 +34,7 @@ function applyTheme() {
 function render() {
   if (!renderer || queued) return;
   queued = true;
-  requestAnimationFrame(() => { queued = false; renderer.render(scene, camera); });
+  requestAnimationFrame(() => { queued = false; renderer.render(scene, camera); placeLabels(); });
 }
 
 function size() {
@@ -71,16 +72,25 @@ function recolorGrid() {
   if (m[1]) m[1].color.set(dark ? 0x6a6a78 : 0x8c909a);
 }
 
+// Grid squares in a round step (1/5/10/50/100 mm) chosen from the model size: about 5-25
+// squares across the model.
+const STEPS = [1, 5, 10, 50, 100, 500];
+function gridStep(maxDim) { return STEPS.find(s => maxDim / s <= 25) || STEPS[STEPS.length - 1]; }
 function buildGrid() {
   const bed = D.info && D.info.bed;           // [x0, y0, x1, y1] in CAD mm
+  const s = new T.Vector3(); bbox.getSize(s);
+  let step = gridStep(Math.max(s.x, s.y, s.z, 0.001));
   let cx, cz, w, d;
   if (bed) { w = bed[2] - bed[0]; d = bed[3] - bed[1]; cx = (bed[0] + bed[2]) / 2; cz = -(bed[1] + bed[3]) / 2; }
   else {
-    const s = new T.Vector3(); bbox.getSize(s);
-    w = d = Math.ceil(Math.max(s.x, s.z) * 2 / 10) * 10 || 10; cx = center.x; cz = center.z;
+    w = d = Math.ceil(Math.max(s.x, s.z) * 2 / step) * step || step; cx = center.x; cz = center.z;
   }
-  const n = Math.max(1, Math.round(Math.max(w, d) / 10));
-  grid = new T.GridHelper(Math.max(w, d), n, 0x8c909a, 0xb0b4bc);
+  let size = Math.max(w, d);
+  while (size / step > 400) step = STEPS.find(x => x > step) || step * 10;   // keep big beds light
+  if (bed) size = Math.ceil(size / step) * step;
+  const n = Math.max(1, Math.round(size / step));
+  grid = new T.GridHelper(size, n, 0x8c909a, 0xb0b4bc);
+  const gs = $('gstep'); if (gs) gs.textContent = 'grid: ' + step + ' mm squares';
   grid.position.set(cx, -0.02, cz);
   if (bed) {
     const g = new T.Mesh(new T.PlaneGeometry(w, d), new T.MeshBasicMaterial(
@@ -89,6 +99,42 @@ function buildGrid() {
   }
   scene.add(grid);
   recolorGrid();
+}
+
+// ---- scale reference: the visible parts' bounding box with its edge lengths in mm.
+// glTF space is Y-up: CAD X = x, CAD Y = -z, CAD Z = y.
+function mm(v) { return v.toFixed(1) + ' mm'; }
+function buildScale() {
+  if (boxHelper) { scene.remove(boxHelper); boxHelper.geometry.dispose(); }
+  labels.forEach(l => l.el.remove()); labels = [];
+  const b = visibleBox();
+  if (b.isEmpty()) return;
+  boxHelper = new T.Box3Helper(b, dark ? 0x4fc58a : 0x2e8b57);
+  boxHelper.visible = scaleOn; scene.add(boxHelper);
+  const s = b.getSize(new T.Vector3()), c = b.getCenter(new T.Vector3());
+  [['X ' + mm(s.x), new T.Vector3(c.x, b.min.y, b.max.z)],
+   ['Y ' + mm(s.z), new T.Vector3(b.max.x, b.min.y, c.z)],
+   ['Z ' + mm(s.y), new T.Vector3(b.max.x, c.y, b.max.z)]].forEach(([text, at]) => {
+    const el = document.createElement('div'); el.className = 'dl'; el.textContent = text; el.hidden = !scaleOn;
+    stage.append(el); labels.push({ el, at });
+  });
+}
+function placeLabels() {
+  if (!labels.length || !scaleOn) return;
+  const w = stage.clientWidth, h = stage.clientHeight, v = new T.Vector3();
+  labels.forEach(l => {
+    v.copy(l.at).project(camera);
+    const off = v.z > 1 || v.z < -1;
+    l.el.hidden = off;
+    if (!off) { l.el.style.left = ((v.x + 1) / 2 * w) + 'px'; l.el.style.top = ((1 - v.y) / 2 * h) + 'px'; }
+  });
+}
+function setScale(on) {
+  scaleOn = on;
+  if (boxHelper) boxHelper.visible = on;
+  labels.forEach(l => { l.el.hidden = !on; });
+  $('scale').setAttribute('aria-pressed', on);
+  render();
 }
 
 function setWire(on) {
@@ -130,7 +176,7 @@ function buildParts() {
       t.textContent = (u.name || m.name) + (u.subtype ? ' (' + u.subtype.replace(/_/g, ' ') + ')' : '') +
         (u.extruder ? '  \u00b7 filament ' + u.extruder : '');
       lab.append(cb, sw, t); list.append(lab);
-      cb.onchange = () => { m.visible = cb.checked; render(); };
+      cb.onchange = () => { m.visible = cb.checked; if (boxHelper) buildScale(); render(); };
     });
   });
   $('parts').hidden = false;
@@ -188,6 +234,7 @@ async function main() {
   center = bbox.getCenter(new T.Vector3());
   radius = bbox.getBoundingSphere(new T.Sphere()).radius || 1;
   buildGrid();
+  buildScale();
   say('');
   new ResizeObserver(size).observe(stage);
   size();
@@ -197,6 +244,7 @@ async function main() {
   $('reset').onclick = () => preset('iso');
   $('wire').onclick = () => setWire(!wire);
   $('grid').onclick = () => setGrid(!(grid && grid.visible));
+  $('scale').onclick = () => setScale(!scaleOn);
   const fs = $('full');
   if (stage.requestFullscreen || stage.webkitRequestFullscreen) {
     fs.onclick = () => { document.fullscreenElement ? document.exitFullscreen() : (stage.requestFullscreen || stage.webkitRequestFullscreen).call(stage); };
@@ -205,6 +253,7 @@ async function main() {
     if (e.target.closest && e.target.closest('input,button,summary')) return;
     if (e.key === 'r') preset('iso'); else if (e.key === 'w') setWire(!wire);
     else if (e.key === 'g') setGrid(!(grid && grid.visible));
+    else if (e.key === 's') setScale(!scaleOn);
   });
   window.tuldaReady = true;
 }

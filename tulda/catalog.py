@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import dims as dims_mod
 from .errors import TuldaError
 from .items import (GROUP_ID, RENDER_EXTS, TRIGGERS, clean_provenance, is_project_dir, provenance_lines,
                     read_item, render_url, viewer_url)
@@ -79,6 +80,27 @@ def _load_info(text):
 
 def iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _dims_fields(text) -> dict:
+    d = dims_mod.clean(_load_info(text))
+    return {"dims": d, "dims_text": dims_mod.fmt(d)}
+
+
+def _inherit_dims(items: list[dict]) -> None:
+    """Renders of one request made from the same source content share its size: an item
+    without dims (an old PNG) takes a sibling's, unless that one measured a single plate."""
+    known = {}
+    for i in items:
+        d = i.get("dims")
+        if d and i.get("source_sha256") and d.get("scope") != "plate":
+            known.setdefault((i.get("source"), i["source_sha256"]), d)
+    for i in items:
+        if not i.get("dims") and i.get("source_sha256"):
+            d = known.get((i.get("source"), i["source_sha256"]))
+            if d:
+                i["dims"] = {**d, "from": "sibling"}
+                i["dims_text"] = dims_mod.fmt(d)
 
 
 # ---- schema / migrations ------------------------------------------------------
@@ -152,7 +174,14 @@ def _m6(c: sqlite3.Connection) -> None:
     c.execute("ALTER TABLE groups ADD COLUMN trigger_note TEXT")
 
 
-MIGRATIONS = [_m1, _m2, _m3, _m4, _m5, _m6]
+def _m7(c: sqlite3.Connection) -> None:
+    """Dimensions: the sidecar's `dims` object (model bounding box in mm, see tulda.dims) as
+    JSON; NULL = size unknown. Backfilled by the forced re-sync after upgrade (from `dims`, or
+    the bbox an older mesh render's `info` recorded); `tulda db dims` measures the rest."""
+    c.execute("ALTER TABLE renders ADD COLUMN dims TEXT")
+
+
+MIGRATIONS = [_m1, _m2, _m3, _m4, _m5, _m6, _m7]
 SCHEMA_VERSION = len(MIGRATIONS)
 
 
@@ -388,8 +417,8 @@ class Catalog:
                     affected.add(old[0])
                 c.execute("""INSERT INTO renders(path,project,file,group_id,seq,adapter,stage,view,source,
                     source_type,source_sha256,tool_version,git_sha,git_dirty,has_sidecar,size,mtime,
-                    sidecar_mtime,created_utc,kind,info,provenance,missing)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
+                    sidecar_mtime,created_utc,kind,info,provenance,dims,missing)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
                     ON CONFLICT(path) DO UPDATE SET group_id=excluded.group_id, seq=excluded.seq,
                     adapter=excluded.adapter, stage=excluded.stage, view=excluded.view,
                     source=excluded.source, source_type=excluded.source_type,
@@ -397,7 +426,8 @@ class Catalog:
                     git_sha=excluded.git_sha, git_dirty=excluded.git_dirty,
                     has_sidecar=excluded.has_sidecar, size=excluded.size, mtime=excluded.mtime,
                     sidecar_mtime=excluded.sidecar_mtime, created_utc=excluded.created_utc,
-                    kind=excluded.kind, info=excluded.info, provenance=excluded.provenance, missing=0""",
+                    kind=excluded.kind, info=excluded.info, provenance=excluded.provenance,
+                    dims=excluded.dims, missing=0""",
                           (path, it["project"], it["file"], it["group_id"], it["seq"], it["adapter"],
                            it["stage"], it["view"], it["source"], it["source_type"], it["source_sha256"],
                            it["tool_version"], it["git_sha"],
@@ -406,7 +436,8 @@ class Catalog:
                            it["created_utc"], it["kind"],
                            json.dumps(it["info"], separators=(",", ":")) if it["info"] else None,
                            json.dumps(it["provenance"], separators=(",", ":"))
-                           if it.get("provenance") else None))
+                           if it.get("provenance") else None,
+                           json.dumps(it["dims"], separators=(",", ":")) if it.get("dims") else None))
                 groups.setdefault(it["group_id"], it)
             for gid, it in groups.items():
                 created = it["group_created_utc"]
@@ -654,7 +685,7 @@ class Catalog:
             for i in range(0, len(shas), 400):
                 chunk = shas[i:i + 400]
                 rows = c.execute(
-                    "SELECT r.source_sha256 AS sha, r.group_id, r.project, r.view, g.title, "
+                    "SELECT r.source_sha256 AS sha, r.group_id, r.project, r.view, r.dims, g.title, "
                     "g.user_title, g.trashed_utc, g.last_mtime, g.trigger FROM renders r "
                     "JOIN groups g ON g.id = r.group_id WHERE r.missing=0 AND r.source_sha256 IN "
                     f"({','.join('?' * len(chunk))}) ORDER BY g.last_mtime DESC, g.id DESC", chunk).fetchall()
@@ -664,8 +695,12 @@ class Catalog:
                     if g is None:
                         g = {"id": r["group_id"], "title": r["user_title"] or r["title"],
                              "project": r["project"], "views": [], "trashed": bool(r["trashed_utc"]),
-                             "trigger": r["trigger"]}
+                             "trigger": r["trigger"], "dims": None, "dims_text": None}
                         lst.append(g)
+                    if r["dims"] and g["dims"] is None:
+                        g.update(_dims_fields(r["dims"]))
+                        if g["dims"] is None:
+                            g["dims_text"] = None
                     if r["view"] and r["view"] not in g["views"]:
                         g["views"].append(r["view"])
         return out
@@ -702,6 +737,8 @@ class Catalog:
                     (f" AND {rc}" if rc else "") + " ORDER BY r.seq, r.mtime, r.file"
                 for r in c.execute(q, [*part, *ra]):
                     items[r["group_id"]].append(self._render_dict(r))
+        for lst in items.values():
+            _inherit_dims(lst)
         out = []
         for r in rows:
             try:
@@ -728,7 +765,7 @@ class Catalog:
                 "tool_version": r["tool_version"], "source_sha256": r["source_sha256"],
                 "group_id": r["group_id"], "seq": r["seq"], "size": r["size"],
                 "tag": source_tag(r["source"]), "kind": r["kind"],
-                "info": _load_info(r["info"]),
+                "info": _load_info(r["info"]), **_dims_fields(r["dims"]),
                 "prov": provenance_lines(clean_provenance(_load_info(r["provenance"]))),
                 "viewer_url": viewer_url(r["project"], r["file"]) if r["kind"] in ("mesh", "turntable") else None}
 
@@ -744,6 +781,12 @@ class Catalog:
             d["group_title"] = (c.execute("SELECT COALESCE(user_title,title) FROM groups WHERE id=?",
                                           (r["group_id"],)).fetchone() or [None])[0]
             d["turntable"] = None
+            if not d["dims"] and r["source_sha256"]:
+                sib = c.execute("""SELECT dims FROM renders WHERE group_id=? AND missing=0 AND dims IS NOT NULL
+                    AND source IS ? AND source_sha256=? ORDER BY kind='mesh' DESC, seq LIMIT 1""",
+                                (r["group_id"], r["source"], r["source_sha256"])).fetchone()
+                if sib:
+                    d.update(_dims_fields(sib[0]))
             if r["kind"] == "mesh":
                 t = c.execute("""SELECT * FROM renders WHERE group_id=? AND missing=0 AND kind='turntable'
                     AND source IS ? ORDER BY seq LIMIT 1""", (r["group_id"], r["source"])).fetchone()

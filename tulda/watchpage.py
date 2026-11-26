@@ -115,6 +115,9 @@ def _file_row(f: dict, token: str) -> str:
                          f'{", trashed" if g.get("trashed") else ""})</span></div>')
         if len(f["rendered"]) > 3:
             links.append(f'<div class=m>+{len(f["rendered"]) - 3} more</div>')
+        size = next((g["dims_text"] for g in f["rendered"] if g.get("dims_text")), None)
+        if size:
+            links.append(f'<div class=dim>size {_e(size)}</div>')
         if missing:
             links.append(f'<div class=m>missing views: {_e(", ".join(missing))}</div>')
         state = "".join(links) + (f"<div>{state}</div>" if state else "")
@@ -172,7 +175,7 @@ pre{{white-space:pre-wrap;word-break:break-all;margin:4px 0;padding:6px 8px;bord
 .proj{{margin:0 0 14px;padding:8px 12px;border:1px solid var(--line);border-radius:10px}}
 .proj h3{{font-size:15px;margin:0;overflow-wrap:anywhere}}.proj:target{{border-color:var(--acc)}}
 .pf td.f{{word-break:break-all}}.pf td.a{{width:1%;white-space:nowrap}}.pf form{{margin:0}}
-.ok{{color:var(--ok)}}.bad{{color:var(--bad)}}.busy{{color:var(--acc);font-weight:600}}
+.dim{{font-variant-numeric:tabular-nums}}.ok{{color:var(--ok)}}.bad{{color:var(--bad)}}.busy{{color:var(--acc);font-weight:600}}
 .rb{{padding:6px 14px;min-height:36px;border:1px solid var(--acc);border-radius:16px;background:var(--acc);color:#fff;font:inherit;font-size:14px;cursor:pointer}}
 .rb:focus-visible{{outline:2px solid var(--acc);outline-offset:2px}}
 .note{{padding:8px 12px;border:1px solid var(--acc);border-radius:8px;margin:0 0 12px}}

@@ -230,6 +230,9 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
                 sidecar["info"] = info
         for st in steps:
             st.pop("render_info", None)
+        dm = render_dims(chain, src, sidecar["source_sha256"], opts, sidecar.get("info"))
+        if dm:
+            sidecar["dims"] = dm
         if group:
             sidecar.update(group_id=group["id"], group_title=group.get("title"),
                            group_sources=group.get("sources"), request_cmd=group.get("command"),
@@ -253,6 +256,26 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
         return png
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def render_dims(chain: list[Adapter], src: Path, sha: str | None, opts: dict,
+                info: dict | None) -> dict | None:
+    """Model dimensions for the sidecar (tulda.dims). Never fails the render: a source that
+    cannot be measured gets no `dims` (shown as "size unknown") and a warning on stderr.
+    .scad sources are exported to STL only by chains that already run OpenSCAD."""
+    import sys
+    from . import dims
+    from .mesh import MeshError
+    scad = any("openscad" in (a.requires or []) for a in chain)
+    bbox = (info or {}).get("bbox")
+    ext = src.suffix.lower()
+    if not (ext in (".3mf", ".stl") or (ext == ".scad" and scad) or dims.from_bbox(bbox)):
+        return None
+    try:
+        return dims.compute(src, sha, dims.plate_option(opts), bbox, scad)
+    except (MeshError, OSError, ValueError) as e:
+        print(f"warning: model size not measured ({e})", file=sys.stderr)
+        return None
 
 
 def source_provenance(src: Path) -> dict | None:
