@@ -55,6 +55,17 @@ def request_command(args, names: list[str]) -> str:
     return shlex.join(parts)
 
 
+def default_project(src: Path) -> str:
+    """Renders-root project for a source without --project: the enclosing tulda project folder
+    (the nearest of the 4 closest ancestors holding tulda-project.json, so
+    <project>/files/x.3mf goes to <project>, not to "files"), else the parent folder's name."""
+    from .projects import MANIFEST
+    for d in list(src.parents)[:4]:
+        if d.name and not d.name.startswith(".") and (d / MANIFEST).is_file():
+            return d.name
+    return src.parent.name
+
+
 def cmd_render(args) -> int:
     srcs = [Path(f).expanduser().resolve() for f in args.files]
     for src in srcs:
@@ -72,7 +83,7 @@ def cmd_render(args) -> int:
         reg = load_registry(src, Path(args.config) if args.config else None)
         root = renders_root(args, reg)
         port = args.port or int(reg.defaults.get("port", DEFAULT_PORT))
-        project = args.project or src.parent.name
+        project = args.project or default_project(src)
         opts = parse_opts(args.opt)
         try:
             jobs = plan_jobs(reg, src, args.adapter, args.stage, args.all, views)
@@ -259,15 +270,17 @@ def cmd_serve(args) -> int:
     root = renders_root(args, reg)
     magic = tailscale_dnsname() if args.tailscale else None
     names = [bonjour_name(), *local_host_names(magic), *args.allow_host]
+    from .watchconfig import user_config_path
     srv = MultiServer(root, hosts, port, names, args.verbose,
-                      log=lambda m: print(m, flush=True), sync_interval=args.sync_interval)
+                      log=lambda m: print(m, flush=True), sync_interval=args.sync_interval,
+                      watch_config=user_config_path())
     if not srv.servers:
         print("error: could not bind any address; exiting for launchd retry", file=sys.stderr, flush=True)
         return 1
     bound = srv.port
     print(f"tulda {__version__} pid={os.getpid()} bind={','.join(hosts)} port={bound} root={srv.root}", flush=True)
     for h in srv.servers:
-        print(f"serving {srv.root} (read-only) on http://{h}:{bound}/", flush=True)
+        print(f"serving {srv.root} (read-only except POST /api/render) on http://{h}:{bound}/", flush=True)
     print(f"LAN URL: http://{bonjour_name()}:{bound}/", flush=True)
     if "tailscale" in auto and auto["tailscale"]:
         print(f"Tailscale URL: http://{(magic if args.tailscale and magic else auto['tailscale'])}:{bound}/", flush=True)

@@ -11,6 +11,7 @@ import urllib.parse
 from html import escape
 
 from .items import STATIC_PREFIX, render_url
+from .tabs import CSS as TAB_CSS, tabs_html
 
 THREE_VERSION = "0.187.0"
 VENDOR = f"/{STATIC_PREFIX}/vendor/three-{THREE_VERSION}/"
@@ -54,7 +55,9 @@ border:1px solid var(--line);border-radius:12px;padding:6px 10px;z-index:2;font-
 #tt .bar{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;justify-content:center;color:var(--mut);font-size:13px}
 #tt .note{margin-top:6px;font-size:12px;color:var(--mut);max-width:90%;text-align:center}
 #tt input[type=range]{width:min(60vw,320px)}
+__TABCSS__
 </style></head><body>
+__TABS__
 <header><h1>__HEADING__</h1>__LINKS__<div class="sub">__SUB__</div></header>
 <div id="stage">
 <canvas id="cv" tabindex="0" aria-label="3D model viewer. Drag to rotate, scroll or pinch to zoom, right-drag or two fingers to pan."></canvas>
@@ -125,5 +128,6 @@ def render_viewer(r: dict) -> str:
     im = {"imports": {"three": VENDOR + "build/three.module.js"}}
     subs = {"__IMPORTMAP__": _json(im), "__TITLE__": escape(title), "__HEADING__": heading,
             "__LINKS__": "".join(links), "__SUB__": escape("  |  ".join(sub_bits)),
-            "__MSGHIDE__": "", "__NOJS__": "This page needs JavaScript.", "__DATA__": _json(data)}
+            "__TABCSS__": TAB_CSS, "__TABS__": tabs_html("gallery"), "__MSGHIDE__": "",
+            "__NOJS__": "This page needs JavaScript.", "__DATA__": _json(data)}
     return re.sub(r"__[A-Z]+__", lambda m: subs.get(m.group(0), m.group(0)), PAGE)

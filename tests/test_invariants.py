@@ -1,4 +1,5 @@
-"""Repo invariants: read-only server, no wildcard bind, vendored files intact, licence files."""
+"""Repo invariants: read-only server (one exception: POST /api/render), no wildcard bind,
+vendored files intact, licence files."""
 import ast
 import hashlib
 import http.client
@@ -46,6 +47,24 @@ class ReadOnlyServer(unittest.TestCase):
                 c.close()
                 self.assertEqual(r.status, 405, (method, path))
 
+    def test_post_render_is_the_only_non_get_route(self):
+        # POST /api/render without Origin/token is refused (403), never 405 and never 2xx/3xx
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.putrequest("POST", "/api/render", skip_host=True, skip_accept_encoding=True)
+        c.putheader("Host", f"127.0.0.1:{self.port}")
+        c.putheader("Content-Length", "0")
+        c.endheaders()
+        r = c.getresponse()
+        r.read()
+        c.close()
+        self.assertEqual(r.status, 403)
+        from tulda.server import Handler
+        overridden = {m for m in ("do_POST", "do_PUT", "do_DELETE", "do_PATCH", "do_OPTIONS",
+                                  "do_TRACE", "do_CONNECT") if getattr(Handler, m) is not Handler._deny}
+        self.assertEqual(overridden, {"do_POST"})
+        src = (PKG / "server.py").read_text()
+        self.assertEqual(src.count('"/api/render"'), 1, "exactly one write route")
+
     def test_server_module_has_no_write_or_service_paths(self):
         tree = ast.parse((PKG / "server.py").read_text())
         for node in ast.walk(tree):
@@ -60,6 +79,22 @@ class ReadOnlyServer(unittest.TestCase):
             if isinstance(node, ast.Attribute):
                 self.assertNotIn(node.attr, {"write_text", "write_bytes", "unlink", "rmtree", "rmdir"},
                                  "server.py must not modify the filesystem")
+
+    def test_webrender_writes_nothing_itself(self):
+        """The render exception's module only reads; renders are written by the `tulda render`
+        subprocess it starts. It must not import the service/management/watch code."""
+        tree = ast.parse((PKG / "webrender.py").read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level:
+                self.assertNotIn((node.module or "").split(".")[0],
+                                 {"manage", "service", "runner", "projects", "watchd", "cli"})
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "open":
+                mode = node.args[1] if len(node.args) > 1 else None
+                self.assertIsInstance(mode, ast.Constant)
+                self.assertFalse(set(str(mode.value)) & set("wax+"))
+            if isinstance(node, ast.Attribute):
+                self.assertNotIn(node.attr, {"write_text", "write_bytes", "unlink", "rmtree", "rmdir",
+                                             "rename", "replace", "mkdir", "system"})
 
 
 class NoWildcardBind(unittest.TestCase):

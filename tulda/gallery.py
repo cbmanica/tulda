@@ -14,14 +14,14 @@ PAGE = r"""<!doctype html>
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif}
 header{padding:12px 16px;border-bottom:1px solid var(--line)}
 .top{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px}
-h1{font-size:18px;margin:0}h1 a{color:inherit;text-decoration:none}
+__TABCSS__
 form.s{display:flex;gap:6px;flex:1 1 220px;max-width:420px}
 form.s input{flex:1;min-width:0;padding:6px 10px;border:1px solid var(--line);border-radius:16px;
 background:var(--card);color:var(--fg);font:inherit;font-size:14px}
-nav,.chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
-nav a,.chip,.btn{padding:6px 12px;border:1px solid var(--line);border-radius:16px;color:var(--fg);
+#nav,.chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
+#nav a,.chip,.btn{padding:6px 12px;border:1px solid var(--line);border-radius:16px;color:var(--fg);
 text-decoration:none;background:var(--card);font:inherit;font-size:14px;cursor:pointer;user-select:none}
-nav a.on,.chip.on,.btn.on{background:var(--acc);border-color:var(--acc);color:#fff}
+#nav a.on,.chip.on,.btn.on{background:var(--acc);border-color:var(--acc);color:#fff}
 a:focus-visible,.btn:focus-visible,summary:focus-visible,input:focus-visible,.card:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
 .lbl{color:var(--mut);font-size:12px;align-self:center;margin-right:2px}
 .dates{margin:6px 0;font-size:14px}.dates>summary{cursor:pointer;color:var(--mut)}
@@ -81,8 +81,8 @@ font-size:22px;padding:8px 14px;cursor:pointer}
 .pair img{width:100%;max-height:70vh;object-fit:contain;background:#fff1}
 @media (max-width:600px){.pair{flex-direction:column;overflow:auto}.pair img{max-height:36vh}.grp{padding:0 8px}}
 </style></head><body>
-<header><div class="top"><h1><a href="/">tulda</a></h1>
-<form class="s" action="/search" method="get" role="search"><input type="search" name="q" id="q" placeholder="Search requests, sources, tags" aria-label="Search" maxlength="100"><button class="btn" type="submit">Search</button></form><a class="btn" href="/_w/">Watcher</a></div>
+__TABS__
+<header><div class="top"><form class="s" action="/search" method="get" role="search"><input type="search" name="q" id="q" placeholder="Search requests, sources, tags" aria-label="Search" maxlength="100"><button class="btn" type="submit">Search</button></form></div>
 <nav id="nav" aria-label="Projects"></nav><details class="dates" id="dates"><summary>Browse by date (UTC)</summary><div id="dbody"></div></details>
 <div class="chips" id="chips"></div></header>
 <main><a class="btn" id="fresh" href="" hidden>New renders: reload</a>
@@ -250,5 +250,8 @@ def render_index(data: dict) -> str:
     title = {"project": f" - {ctx.get('project')}", "group": f" - request {ctx.get('group')}",
              "day": f" - {ctx.get('day')}", "search": " - search"}.get(ctx["kind"], "")
     from html import escape
+    from .tabs import CSS, tabs_html
     head, tail = PAGE.split("__DATA__", 1)
-    return head.replace("__TITLE__", escape(title)) + blob + tail
+    head = head.replace("__TITLE__", escape(title)).replace("__TABCSS__", CSS) \
+        .replace("__TABS__", tabs_html("gallery"))
+    return head + blob + tail

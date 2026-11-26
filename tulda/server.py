@@ -1,4 +1,9 @@
-"""Read-only gallery server over a renders root (GET/HEAD only)."""
+"""Gallery server over a renders root: GET/HEAD only, with ONE exception.
+
+The exception is `POST /api/render` (the watcher page's Render buttons): it renders one model
+file of an imported project folder in the configured watch destinations, identified by an
+opaque id, after Host, Origin and per-process token checks. All validation, the queue and the
+render subprocess live in webrender.py; see its docstring. Every other method or path is 405."""
 
 from __future__ import annotations
 
@@ -20,7 +25,8 @@ from .viewer import THREE_VERSION, render_viewer
 from .items import (DATE_PREFIX, STATIC_PREFIX, VIEWER_PREFIX, GROUP_ID, GROUP_PREFIX, RESERVED_DIRS, group_fields,  # noqa: F401
                     WATCH_PREFIX, is_project_dir, read_item)
 from .watchevents import default_state_dir, display_events, watcher_status
-from .watchpage import render_watch_page
+from .watchpage import RESULT_CODES, render_watch_page
+from . import webrender
 
 WATCH_EVENTS_SHOWN = 300
 
@@ -131,27 +137,27 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- helpers
     def _send(self, status: int, body: bytes = b"", ctype="text/plain; charset=utf-8",
-              head=False, extra=None):
+              head=False, extra=None, referrer="no-referrer"):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Referrer-Policy", referrer)
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
         if not head:
             self.wfile.write(body)
 
-    def _send_page(self, html: str, head: bool, viewer: bool = False):
+    def _send_page(self, html: str, head: bool, viewer: bool = False, referrer: str = "no-referrer"):
         # The viewer page also loads same-origin ES modules (/_s/) and fetches the GLB.
         csp = ("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
                "script-src 'self' 'unsafe-inline'; connect-src 'self'" if viewer else
                "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
-               "script-src 'unsafe-inline'; connect-src 'self'")
+               "script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'")
         return self._send(200, html.encode(), "text/html; charset=utf-8", head, {
             "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Content-Security-Policy": csp})
+            "Content-Security-Policy": csp, "X-Frame-Options": "DENY"}, referrer=referrer)
 
     def _static(self, rel: str, head: bool):
         ctype = STATIC_FILES.get(rel)
@@ -243,13 +249,19 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/watch":
             sdir = self.server.watch_state_dir
             return self._json({"status": watcher_status(sdir),
-                               "events": display_events(sdir, WATCH_EVENTS_SHOWN)}, head)
+                               "events": display_events(sdir, WATCH_EVENTS_SHOWN),
+                               "projects": self._projects()}, head)
         if gparts and gparts[0] == WATCH_PREFIX:
             if len(gparts) != 1:
                 return self._send(404, b"not found\n", head=head)
             sdir = self.server.watch_state_dir
-            return self._send_page(render_watch_page(watcher_status(sdir),
-                                                     display_events(sdir, WATCH_EVENTS_SHOWN)), head)
+            code = (q.get("r") or [""])[0]
+            html = render_watch_page(watcher_status(sdir), display_events(sdir, WATCH_EVENTS_SHOWN),
+                                     self._projects(), self.server.render_token,
+                                     code if code in RESULT_CODES else None,
+                                     self.server.render_queue.active())
+            # same-origin (not no-referrer) so the browser sends a real Origin with the form POST
+            return self._send_page(html, head, referrer="same-origin")
         if route == "/search":
             f = parse_filters(q)
             return self._page({"kind": "search", "q": f.q or ""}, f, head)
@@ -315,7 +327,79 @@ class Handler(BaseHTTPRequestHandler):
     def _deny(self):
         self._send(405, b"read-only server\n", extra={"Allow": "GET, HEAD"})
 
-    do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = _deny
+    do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = _deny
+
+    # -- the single write exception: POST /api/render (see webrender.py)
+    def _projects(self) -> list[dict]:
+        srv = self.server
+        cands = webrender.candidates(webrender.watch_destinations(srv.watch_config), srv.render_secret)
+        return webrender.describe(cands, srv.catalog, srv.render_queue.snapshot())
+
+    def _origin_ok(self) -> bool:
+        """Origin must be present and equal to this request's own (already allow-listed) Host
+        origin. A browser POST from any other page carries that page's origin (or "null")."""
+        origin = (self.headers.get("Origin") or "").strip().lower()
+        host = (self.headers.get("Host") or "").strip().lower()
+        if not origin or not host or origin != f"http://{host}":
+            return False
+        site = self.headers.get("Sec-Fetch-Site")
+        return site is None or site.strip().lower() == "same-origin"
+
+    def _refuse(self, status: int, msg: str):
+        self.server.log(f"web render refused ({status}): {msg}")
+        return self._send(status, (msg + "\n").encode(), extra={"Cache-Control": "no-store"})
+
+    def do_POST(self):
+        raw = self.path.partition("?")[0]
+        if raw != "/api/render":
+            return self._deny()
+        if not self._host_ok():
+            return self._refuse(403, "bad host")
+        if not self._origin_ok():
+            return self._refuse(403, "bad or missing Origin")
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/x-www-form-urlencoded":
+            return self._refuse(415, "form data expected")
+        try:
+            n = int(self.headers.get("Content-Length") or "-1")
+        except ValueError:
+            n = -1
+        if not 0 < n <= 4096:
+            return self._refuse(400, "bad length")
+        try:
+            body = self.rfile.read(n).decode("ascii")
+            form = urllib.parse.parse_qs(body, strict_parsing=True, max_num_fields=4)
+        except (UnicodeDecodeError, ValueError):
+            return self._refuse(400, "bad form")
+        if not webrender.token_ok(self.server.render_token, (form.get("token") or [None])[0]):
+            return self._refuse(403, "bad or missing token")
+        srv = self.server
+        projects = webrender.candidates(webrender.watch_destinations(srv.watch_config), srv.render_secret)
+        hit = webrender.find(projects, (form.get("id") or [None])[0])
+        if hit is None:
+            return self._refuse(404, "not an eligible file")
+        project, f = hit
+        facts = webrender.file_facts(f["path"], fresh=True)
+        hold = webrender.hold_reason(project, f, facts)
+        if hold:
+            return self._result("held", project, None, hold)
+        try:
+            done = srv.catalog.groups_by_source_sha([facts["sha256"]]).get(facts["sha256"] or "")
+        except sqlite3.Error:
+            done = None
+        if done and not webrender.missing_views(f["ext"], done):
+            return self._result("rendered", project, None, "already rendered")
+        code, job = srv.render_queue.submit(project, f)
+        return self._result(code, project, job, None)
+
+    def _result(self, code: str, project: dict, job, reason):
+        accept = (self.headers.get("Accept") or "").lower()
+        if "application/json" in accept:
+            status = {"queued": 202, "duplicate": 202, "full": 503, "held": 409, "rendered": 409}[code]
+            return self._send(status, json.dumps({"result": code, "reason": reason, "job": job}).encode(),
+                              "application/json", extra={"Cache-Control": "no-store"})
+        loc = f"/{WATCH_PREFIX}/?r={urllib.parse.quote(code)}#{urllib.parse.quote(project['anchor'])}"
+        return self._send(303, b"", extra={"Location": loc, "Cache-Control": "no-store"})
 
 
 class Server(ThreadingHTTPServer):
@@ -331,7 +415,8 @@ class Server(ThreadingHTTPServer):
 
 
 def make_server(root: Path, host: str, port: int, allowed_hosts=(), verbose=False,
-                catalog: Catalog | None = None, log=print, watch_state_dir: Path | None = None) -> Server:
+                catalog: Catalog | None = None, log=print, watch_state_dir: Path | None = None,
+                watch_config: Path | None = None, render: dict | None = None) -> Server:
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     srv = Server((host, port), Handler)
@@ -341,11 +426,22 @@ def make_server(root: Path, host: str, port: int, allowed_hosts=(), verbose=Fals
     srv.sync_min_interval = 2.0
     # The watcher's state dir (watch.json, watch-events.jsonl): read only, for /_w/.
     srv.watch_state_dir = Path(watch_state_dir) if watch_state_dir else default_state_dir()
+    # Render buttons: the config whose [[watch.dir]] destinations hold eligible projects (None =
+    # no buttons), and the per-process secret, CSRF token and queue (shared by MultiServer).
+    srv.watch_config = Path(watch_config) if watch_config else None
+    render = render or new_render_state(root, log)
+    srv.render_secret, srv.render_token, srv.render_queue = render["secret"], render["token"], render["queue"]
     srv.catalog = catalog or Catalog(root, log=log)
     if catalog is None:
         srv.catalog.sync()
     srv.allowed_hosts = {h.lower() for h in allowed_hosts} | {"127.0.0.1", "localhost", host.lower()}
     return srv
+
+
+def new_render_state(root: Path, log=print, run=None) -> dict:
+    root = Path(root).resolve()
+    return {"secret": webrender.new_secret(), "token": webrender.new_token(),
+            "queue": webrender.RenderQueue(run or (lambda p, f: webrender.cli_render(p, f, root)), log=log)}
 
 
 class MultiServer:
@@ -354,7 +450,7 @@ class MultiServer:
     seconds while the others keep serving."""
 
     def __init__(self, root, hosts, port, allowed_hosts=(), verbose=False,
-                 retry_interval=15.0, log=print, sync_interval=30.0):
+                 retry_interval=15.0, log=print, sync_interval=30.0, watch_config=None):
         import threading
         self.root = Path(root).resolve()
         self.port = port
@@ -363,6 +459,8 @@ class MultiServer:
         self.log = log
         self.sync_interval = sync_interval
         self.catalog = Catalog(self.root, log=log)
+        self.render = new_render_state(self.root, log)
+        self.watch_config = watch_config
         self._initial_sync()
         self.allowed = {h.lower() for h in allowed_hosts} | {"localhost", "127.0.0.1"}
         self.servers: dict[str, Server] = {}
@@ -395,7 +493,8 @@ class MultiServer:
         with self._lock:
             for h in list(self.pending):
                 try:
-                    srv = make_server(self.root, h, self.port, (), self.verbose, self.catalog, self.log)
+                    srv = make_server(self.root, h, self.port, (), self.verbose, self.catalog, self.log,
+                                      render=self.render, watch_config=self.watch_config)
                 except OSError as e:
                     if self.errors.get(h) != str(e):
                         self.log(f"cannot bind {h}:{self.port}: {e}; will retry")

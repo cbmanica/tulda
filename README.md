@@ -131,11 +131,23 @@ least `--settle` seconds old, ignores `.crdownload`/`.part`/`.download`/`.tmp` f
 with a `NAME.part` sibling), logs `created`/`exists`/`skip`/`held`/`error` per file and keeps
 going on errors. With `--from-config` it also appends each outcome to
 `~/.local/state/tulda/watch-events.jsonl` (capped at 512 KiB, one older generation kept), which
-`tulda serve` shows at `/_w/` ("Watcher" button on the main page; JSON at `/api/watch`): newest
+`tulda serve` shows in its "Watcher" tab (`/_w/`; JSON at `/api/watch`): newest
 first, with the watcher's running status and last poll. Folder and file names only; absolute
 paths in error text are reduced to their last component. `--render` (off by default) also renders `.3mf`/`.scad`/`.stl` into the renders root; it is
 off because rendering is slow and because the gallery shows renders to everyone who can reach
 `tulda serve`.
+
+The Watcher tab also lists every imported project folder in the `[[watch.dir]] destination`s of
+the user config, with its model files (`.3mf`/`.stl`/`.scad` in `files/`, or the bare 3mf in
+`source/`). A file already rendered (matched by sha256 against the catalog, so it does not
+matter which project or group name it was rendered under) links to its gallery group (and
+gets a "Render all views" button when some of the views below are missing); any other file
+has a **Render** button. It queues one background render (one at a time, through
+the same `tulda render` CLI path, views `iso,bottom,interactive`; `.stl` gets `interactive`
+only; the group and the renders-root project are named after the project folder) and the
+page shows queued / rendering / done / failed. Files whose 3mf carries a post-processing script
+that was not approved, or projects containing a `tulda.toml`, show "held" and cannot be
+rendered from the page.
 
 Licences: MakerWorld's default Standard Digital File License forbids sharing, hosting or
 distributing the files or derivatives. Keep the destination user-local. tulda warns (and changes
@@ -172,10 +184,12 @@ renders so the pages stay fast with thousands of groups. PNGs and sidecars remai
 of truth; the DB is rebuilt automatically if missing or corrupt, and also holds your stars,
 tags, title edits, notes and trash flags. Design notes: [docs/PLAN.md](docs/PLAN.md).
 
-Web (read-only): group cards fold/unfold (newest open, state remembered per browser, "Expand
+Web: two tabs at the top of every page, **Gallery** (everything below; the search box sits in
+its header, since search is a filter of the gallery) and **Watcher** (above). Group cards fold/unfold (newest open, state remembered per browser, "Expand
 all"/"Collapse all"); "Load more requests"; `/_d/2026-11/` and `/_d/2026-11-24/` (UTC dates,
 picker under "Browse by date"); `/search?q=`; chips filter by adapter, stage, view, tag,
-starred, "show trash". JSON: `/api/groups`, `/api/dates`, `/api/latest`. All changes happen in the CLI:
+starred, "show trash". JSON: `/api/groups`, `/api/dates`, `/api/latest`. Apart from the
+Watcher tab's Render buttons, all changes happen in the CLI:
 
     tulda ls [--project P] [--since 7d|DATE] [--until DATE] [--tag T] [--starred] [--trashed]
     tulda group show|star|unstar|trash|restore <id or unique prefix>
@@ -258,8 +272,8 @@ label is `com.tulda.server`; the plist goes to `~/Library/LaunchAgents/`.
 ## Watching an inbox as a service (com.tulda.watch)
 
 A second, independent LaunchAgent runs `tulda watch --from-config`. It is not part of the
-server: the server stays read-only, never imports the import code, and keeps running if the
-watcher is stopped (and vice versa).
+server: the server never imports the import code (its only write, the Render button, runs
+`tulda render` in a subprocess) and keeps running if the watcher is stopped (and vice versa).
 
 1. Make an inbox folder **outside** `~/Downloads`, `~/Desktop` and `~/Documents`, for example
    `~/MakerWorld-inbox`, and point your browser's "ask where to save" (or Bambu Studio's
@@ -366,22 +380,49 @@ supported; `func(ctx) -> Result`.
 
 ## Security notes
 
-- The server is read-only (GET/HEAD; everything else is 405), never runs
-  adapters, and only serves the renders root.
+- The server is read-only (GET/HEAD; everything else is 405) with one exception,
+  `POST /api/render` (the Watcher tab's Render button). It never runs adapters itself and
+  only serves the renders root. The exception, precisely:
+  - It renders one model file of a project folder (a directory holding `tulda-project.json`)
+    directly inside a `[[watch.dir]] destination` of the user config, nothing else. No upload,
+    no path: the form sends an opaque id (HMAC of destination, folder and relative path under
+    a per-process secret) that must match the eligible list the server recomputes on every
+    request. Eligible: `.3mf`/`.stl`/`.scad` named by the manifest or under `files/`; the
+    project folder is a real directory (not a symlink), the file's resolved path equals its
+    lexical path (no symlink anywhere below the project), it is a regular file, and no path
+    part starts with `.`.
+  - CSRF: the Host must pass the allow-list below, `Origin` must be present and equal to
+    `http://<that Host>` (so one of the server's own host:port origins; `null`, missing or any
+    other origin is refused), `Sec-Fetch-Site`, when sent, must be `same-origin`, and the form
+    must carry the per-process random token embedded in the Watcher page. The page is sent
+    with `Referrer-Policy: same-origin` (browsers send `Origin: null` under `no-referrer`),
+    `frame-ancestors 'none'` and `X-Frame-Options: DENY`. Body: form-encoded, at most 4 KiB.
+  - Refused with the reason shown: a post-processing script the manifest records as not
+    approved, or that a fresh scan of the 3mf finds and the manifest did not approve (an
+    unreadable 3mf counts as unscannable and is refused); a `tulda.toml` in the project folder
+    (it would add adapters); a file already rendered in every view the button makes.
+  - One background worker renders one file at a time (at most 8 waiting; a file already
+    queued or rendering is not queued again) by running `python -P -m tulda render -- FILE`
+    (argv list, cwd = renders root). The request thread only queues and redirects (303) back
+    to the Watcher tab; it works without JavaScript.
+  - Anyone who can reach the server (LAN, and the tailnet with `--tailscale`) can load the
+    page and press Render. It can only render files that are already in your project folders.
 - Binds to the default interface's LAN IPv4, else 127.0.0.1; `--host` (repeatable)
   replaces that and `--tailscale` adds the tailnet IPv4. Loopback 127.0.0.1 is always
   bound too. Never 0.0.0.0: only the listed addresses; `--host` rejects wildcard/empty values (`0.0.0.0`, `::`, `0`, blank) with an error. There is no authentication:
   anyone on the LAN can view the renders, and with `--tailscale` so can every device
-  on your whole tailnet (not just the home LAN). Still read-only.
+  on your whole tailnet (not just the home LAN). Still read-only apart from the Render
+  button.
 - Host header must be one of: any bound address, 127.0.0.1, localhost, the
   Bonjour name, this machine's bare short names (`LocalHostName`, `gethostname()`, and the MagicDNS short name with `--tailscale`) and their `.local` forms, the full MagicDNS name (with `--tailscale`), or `--allow-host`, with a matching port (DNS-rebinding guard).
 - Every path is percent-decoded once, rejected if any segment starts with `.`,
   resolved, and required to stay under the root; symlinks that escape are
   refused. Only png, jpg, svg, json, stl files are served.
 - `/_w/` and `/api/watch` read the watcher's `watch.json` and `watch-events.jsonl` from the
-  state dir (read-only). File names there come from downloads and are untrusted: every value
-  is HTML-escaped, the page has no script, and anyone who can reach the server can see the
-  names of files dropped into watched folders.
+  state dir and list the project folders of the watch destinations. File names there come
+  from downloads and are untrusted: every value is HTML-escaped, the page has no script, and
+  anyone who can reach the server can see the names of files dropped into watched folders and
+  of imported projects.
 - Config files execute commands as you; treat `tulda.toml` like a Makefile.
 
 ## Bambu Studio and licensing

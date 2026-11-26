@@ -625,6 +625,33 @@ class Catalog:
                 return None
             return self._hydrate(c, [row], f or Filters(), True)[0]
 
+    def groups_by_source_sha(self, shas) -> dict[str, list[dict]]:
+        """{sha256: [{id, title, project, views, trashed}], newest group first} for present
+        renders whose source had that sha256. Matching by content, not name: the same file
+        renders under any project or group name."""
+        shas = sorted({s for s in shas if isinstance(s, str) and re.fullmatch(r"[0-9a-f]{64}", s)})
+        out: dict[str, list[dict]] = {}
+        if not shas:
+            return out
+        with self.conn() as c:
+            for i in range(0, len(shas), 400):
+                chunk = shas[i:i + 400]
+                rows = c.execute(
+                    "SELECT r.source_sha256 AS sha, r.group_id, r.project, r.view, g.title, "
+                    "g.user_title, g.trashed_utc, g.last_mtime FROM renders r "
+                    "JOIN groups g ON g.id = r.group_id WHERE r.missing=0 AND r.source_sha256 IN "
+                    f"({','.join('?' * len(chunk))}) ORDER BY g.last_mtime DESC, g.id DESC", chunk).fetchall()
+                for r in rows:
+                    lst = out.setdefault(r["sha"], [])
+                    g = next((x for x in lst if x["id"] == r["group_id"]), None)
+                    if g is None:
+                        g = {"id": r["group_id"], "title": r["user_title"] or r["title"],
+                             "project": r["project"], "views": [], "trashed": bool(r["trashed_utc"])}
+                        lst.append(g)
+                    if r["view"] and r["view"] not in g["views"]:
+                        g["views"].append(r["view"])
+        return out
+
     def resolve_group(self, ident: str) -> dict:
         """Exact id, else a unique prefix; raises CatalogError otherwise."""
         with self.conn() as c:

@@ -6,7 +6,13 @@ This is a public Apache-2.0 repo. Stdlib-only Python; no new runtime dependencie
   emails into any file, test, commit message or branch name. Use placeholders
   (`host.example`, `192.0.2.1`, `/Users/you`). Deliberate exceptions carry a `guard:ok` marker.
 - The server is read-only: GET/HEAD only, everything else 405. It must never bind
-  `0.0.0.0` or `::`. Mutations happen only through the CLI.
+  `0.0.0.0` or `::`. Mutations happen only through the CLI, with ONE exception:
+  `POST /api/render` (tulda/webrender.py, the Watcher tab's Render button) queues a
+  `tulda render` subprocess for one model file of a project folder in a configured watch
+  destination, chosen by opaque server-side id (no client paths, symlinks refused), after
+  Host + Origin == Host origin + per-process token checks, refusing unapproved
+  post-processing scripts. Do not add other write routes or widen this one without the
+  user's explicit request; keep README "Security notes" and tests/test_invariants.py in sync.
 - Commit by explicit path: `git commit -m "..." -- path1 path2`. Never `git add -A`,
   `git add .`, `git add -u` or `git commit -a`. Another agent may be editing the same tree.
 - Do not push unless the user asks. Never force-push (including `--force-with-lease`),
