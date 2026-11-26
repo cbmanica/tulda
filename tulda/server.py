@@ -25,6 +25,8 @@ from .timefmt import LOCAL_HASH, script_hash
 from .viewer import THREE_VERSION, render_viewer
 from .items import (DATE_PREFIX, STATIC_PREFIX, VIEWER_PREFIX, GROUP_ID, GROUP_PREFIX, RESERVED_DIRS, group_fields,  # noqa: F401
                     PROJECTS_PREFIX, TRIGGERS, WATCH_PREFIX, is_project_dir, read_item)
+from .projectdetail import build as build_detail, render_project_detail
+from .projectfiles import folder_summary
 from .projectspage import parse_sort, project_rows, render_projects_page, sort_rows, source_destinations, source_projects
 from .watchevents import default_state_dir, display_events, watcher_status
 from .watchpage import RESULT_CODES, render_watch_page
@@ -271,7 +273,19 @@ class Handler(BaseHTTPRequestHandler):
                                "projects": self._projects()}, head)
         if route == "/api/projects":
             return self._json({"sort": parse_sort(q), "projects": self._project_list(parse_sort(q))}, head)
+        if route.startswith("/api/projects/"):
+            if len(gparts) != 3:
+                return self._send(404, b"not found\n", head=head)
+            data = self._project_detail(gparts[2])
+            if data is None:
+                return self._send(404, b"no such project\n", head=head)
+            return self._json(data, head)
         if gparts and gparts[0] == PROJECTS_PREFIX:
+            if len(gparts) == 2:
+                data = self._project_detail(gparts[1])
+                if data is None:
+                    return self._send(404, b"no such project\n", head=head)
+                return self._send_page(render_project_detail(data), head)
             if len(gparts) != 1:
                 return self._send(404, b"not found\n", head=head)
             sort = parse_sort(q)
@@ -358,7 +372,21 @@ class Handler(BaseHTTPRequestHandler):
         """Projects tab rows: catalog projects plus project folders of the configured
         destinations (folder names only, no absolute paths), sorted."""
         srcs = source_projects(source_destinations(self.server.watch_config))
+        for src in srcs.values():
+            src["summary"] = folder_summary(src["path"])
         return sort_rows(project_rows(self.server.catalog.project_summary(), srcs), sort)
+
+    def _project_detail(self, name: str) -> dict | None:
+        """The project page's data, or None when no source folder and no renders-root project
+        has exactly this name. The name is only ever looked up, never joined to a path."""
+        if not name or name.startswith(".") or "\x00" in name or len(name) > 255:
+            return None
+        srcs = source_projects(source_destinations(self.server.watch_config))
+        cat = self.server.catalog
+        in_cat = any(p["name"] == name for p in cat.project_summary())
+        if name not in srcs and not in_cat:
+            return None
+        return build_detail(name, srcs.get(name), cat, in_cat)
 
     # -- the single write exception: POST /api/render (see webrender.py)
     def _projects(self) -> list[dict]:

@@ -3,12 +3,13 @@
 Bambu Studio slices a COPY of the model in a scratch directory (the source file and its
 repository are never touched):
 
-    BambuStudio --slice 1 --export-3mf sliced.3mf --outputdir <abs workdir/out> <copy>.3mf
+    BambuStudio --slice N --export-3mf sliced.3mf --outputdir <abs workdir/out> <copy>.3mf
 
-`--export-3mf` is relative to --outputdir. The result contains Metadata/plate_1.gcode and
-Metadata/slice_info.config, which tulda.slicesummary parses. The slicer logs a benign
-"Invalid T command (T65535)" error and may exit non-zero; success is judged by the output
-file, retrying once with --no-check (skips the printable-area / validity pre-checks).
+N is the `plate` option (default 1; `tulda render --plates` sets it per plate). `--export-3mf`
+is relative to --outputdir. The result contains Metadata/plate_N.gcode and
+Metadata/slice_info.config, which tulda.slicesummary parses; the summary records the plate.
+The slicer logs a benign "Invalid T command (T65535)" error and may exit non-zero; success is
+judged by the output file, retrying once with --no-check (skips the printable-area / validity pre-checks).
 
 Embedded post-processing scripts: a 3mf's Metadata/project_settings.config may carry
 `post_process`, a list of shell commands that the Bambu Studio / OrcaSlicer GUI runs after
@@ -33,11 +34,8 @@ from ..threemf import SCRIPT_KEYS     # config keys holding shell commands run b
 from .api import Context, Result
 
 DEFAULT_BIN = "/Applications/BambuStudio.app/Contents/MacOS/BambuStudio"
-GCODE = "Metadata/plate_1.gcode"
+GCODE = "Metadata/plate_{}.gcode"
 INFO = "Metadata/slice_info.config"
-
-
-
 
 class UnsafeProject(Exception):
     pass
@@ -78,12 +76,14 @@ def safe_copy(src: Path, dst: Path) -> list[str]:
     return changed
 
 
-def _slice(binary: str, copy: Path, out_dir: Path, timeout: float, extra: list[str]) -> tuple[Path | None, str]:
-    argv = [binary, "--slice", "1", *extra, "--export-3mf", "sliced.3mf",
+def _slice(binary: str, copy: Path, out_dir: Path, timeout: float, extra: list[str],
+           plate: int = 1) -> tuple[Path | None, str]:
+    argv = [binary, "--slice", str(plate), *extra, "--export-3mf", "sliced.3mf",
             "--outputdir", str(out_dir), str(copy)]
     try:
+        # own session and no stdin: the Studio CLI can crash when attached to a terminal
         p = subprocess.run(argv, capture_output=True, text=True, errors="replace",
-                           timeout=timeout, start_new_session=True)
+                           stdin=subprocess.DEVNULL, timeout=timeout, start_new_session=True)
     except subprocess.TimeoutExpired:
         return None, f"slicer timed out after {timeout:g}s"
     except OSError as e:
@@ -97,6 +97,9 @@ def _slice(binary: str, copy: Path, out_dir: Path, timeout: float, extra: list[s
 def bambu_slice(ctx: Context) -> Result:
     binary = str(ctx.options.get("bambu_bin") or DEFAULT_BIN)
     timeout = float(ctx.options.get("slice_timeout", 180))
+    from ..dims import plate_option
+    plate = plate_option(ctx.options) or 1
+    gcode = GCODE.format(plate)
     src = ctx.in_path
     if not zipfile.is_zipfile(src):
         return Result(False, "not a 3MF (zip) file")
@@ -111,23 +114,24 @@ def bambu_slice(ctx: Context) -> Result:
         return Result(False, str(e))
     except (zipfile.BadZipFile, OSError, RuntimeError, NotImplementedError) as e:
         return Result(False, f"cannot copy the 3MF for slicing: {e}")
-    sliced, err = _slice(binary, copy, outdir, timeout, [])
+    sliced, err = _slice(binary, copy, outdir, timeout, [], plate)
     if sliced is None and "timed out" not in err and "cannot run" not in err:
-        sliced, err2 = _slice(binary, copy, outdir, timeout, ["--no-check"])
+        sliced, err2 = _slice(binary, copy, outdir, timeout, ["--no-check"], plate)
         err = err2 or err
     if sliced is None:
         return Result(False, "slicing failed: " + err)
     try:
         with zipfile.ZipFile(sliced) as z:
-            with z.open(GCODE) as g:
+            with z.open(gcode) as g:
                 parsed = slicesummary.parse_gcode(io.TextIOWrapper(g, encoding="utf-8", errors="replace"))
             try:
-                info = slicesummary.parse_slice_info(z.read(INFO).decode("utf-8", "replace"))
+                info = slicesummary.parse_slice_info(z.read(INFO).decode("utf-8", "replace"), plate)
             except KeyError:
                 info = {}
     except (KeyError, zipfile.BadZipFile) as e:
-        return Result(False, f"slicer output has no {GCODE}: {e}")
+        return Result(False, f"slicer output has no {gcode}: {e}")
     summary = slicesummary.summarize(parsed, info)
+    summary["plate"] = plate
     ctx.out_path.write_text(slicesummary.render_html(summary, src.stem), encoding="utf-8")
     return Result(meta={"render_info": {"format": "slice-summary", **summary}})
 

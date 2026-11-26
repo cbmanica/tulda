@@ -180,7 +180,8 @@ def make_group(title: str | None, sources: list[Path], command: str,
 def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path,
               project: str, cli_opts: dict | None = None, keep: bool = False,
               group: dict | None = None, view: str | None = None,
-              view_opts: dict | None = None, seq: int = 0) -> Path:
+              view_opts: dict | None = None, seq: int = 0, suffix: str = "") -> Path:
+    """suffix: appended to the output file stem (`-p2` for plate 2 of `--plates`)."""
     cli_opts = {**(view_opts or {}), **(cli_opts or {})}
     src = src.resolve()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -189,11 +190,11 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
     proj_dir.mkdir(parents=True, exist_ok=True)
     ext = {"glb": ".glb", "htm": ".htm"}.get(term.produces, ".png")
     prefix = f"{stamp}-{term.id}" + (f"-{view}" if view else "")
-    base = f"{prefix}-{src.stem}"
+    base = f"{prefix}-{src.stem}{suffix}"
     n = 1
     while (proj_dir / f"{base}{ext}").exists() or (proj_dir / f"{base}.fail.json").exists():
         n += 1
-        base = f"{prefix}-{src.stem}-{n}"
+        base = f"{prefix}-{src.stem}{suffix}-{n}"
     scratch = Path(tempfile.mkdtemp(prefix="tulda-"))
     steps: list[dict] = []
     try:

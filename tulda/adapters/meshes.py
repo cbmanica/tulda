@@ -94,7 +94,10 @@ def scad_mesh(ctx: Context) -> Result:
 
 
 def threemf_mesh(ctx: Context) -> Result:
-    return _publish(ctx, threemf.load(ctx.in_path))
+    """The whole build, or one plate when the `plate` option is set (`tulda render --plates`);
+    the plate is then recorded in the sidecar info."""
+    from ..dims import plate_option
+    return _publish(ctx, threemf.load(ctx.in_path, plate_option(ctx.options)))
 
 
 def stl_mesh(ctx: Context) -> Result:

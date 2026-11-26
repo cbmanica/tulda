@@ -118,6 +118,7 @@ timeout  = 240
 [adapter.slice-bambu.options]
 bambu_bin = "/Applications/BambuStudio.app/Contents/MacOS/BambuStudio"
 slice_timeout = 180
+plate = 1                 # `tulda render --plates all` sets it per plate (--slice N)
 
 # ---- turntable stage: .scad -> 36 PNG frames (no-WebGL fallback + drag-to-rotate widget) ----
 # Selected by the `turntable` view only. OpenSCAD renders ~0.25 s per 800x600 frame (4 in

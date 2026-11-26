@@ -50,6 +50,8 @@ def request_command(args, names: list[str]) -> str:
         parts += ["--views", ",".join(views)]
     for o in args.opt or []:
         parts += ["--opt", o]
+    if getattr(args, "plates", None):
+        parts += ["--plates", args.plates]
     if args.project:
         parts += ["--project", args.project]
     return shlex.join(parts)
@@ -66,11 +68,60 @@ def default_project(src: Path) -> str:
     return src.parent.name
 
 
+# Views rendered per plate by `--plates` when no --view/--views is given: a picture, Bambu
+# Studio's slice estimate (print time, filament g/m) and the 3D viewer.
+PLATE_VIEWS = ["iso", "slice", "interactive"]
+
+
+def parse_plates(spec: str | None) -> list[int] | str | None:
+    """--plates value: None, "all", or a list of plate numbers ("1,3")."""
+    if spec is None:
+        return None
+    spec = spec.strip().lower()
+    if spec == "all":
+        return "all"
+    out: list[int] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part.isdigit() or int(part) < 1:
+            raise TuldaError(f"--plates expects 'all' or plate numbers like 1,3; got {spec!r}")
+        if int(part) not in out:
+            out.append(int(part))
+    if not out:
+        raise TuldaError("--plates: no plate given")
+    return out
+
+
+def source_plates(src: Path, want) -> list[int | None]:
+    """The plates to render for one source: [None] (no per-plate runs) unless --plates was
+    given and the source is a .3mf. A 3mf without Bambu/Orca plates has plate 1 only."""
+    if want is None or src.suffix.lower() != ".3mf":
+        return [None]
+    import zipfile
+    from .mesh import MeshError
+    from .threemf import read_plates
+    try:
+        with zipfile.ZipFile(src) as z:
+            have = [n for n, _ in read_plates(z)] or [1]
+    except (zipfile.BadZipFile, OSError, MeshError) as e:
+        raise TuldaError(f"{src.name}: not a readable 3mf ({e})") from e
+    if want == "all":
+        return have
+    bad = [n for n in want if n not in have]
+    if bad:
+        raise TuldaError(f"{src.name} has no plate {', '.join(map(str, bad))} "
+                         f"(plates: {', '.join(map(str, have))})")
+    return list(want)
+
+
 def cmd_render(args) -> int:
     srcs = [Path(f).expanduser().resolve() for f in args.files]
     for src in srcs:
         if not src.is_file():
             raise TuldaError(f"no such file: {src}")
+    plates_want = parse_plates(getattr(args, "plates", None))
+    if plates_want is not None and "plate" in parse_opts(args.opt):
+        raise TuldaError("use either --plates or --opt plate=N, not both")
     views = parse_views(args.view, args.views)
     group = make_group(args.title, srcs, request_command(args, [f.name for f in srcs]),
                        trigger=args.trigger, note=args.note)
@@ -87,26 +138,31 @@ def cmd_render(args) -> int:
         project = args.project or default_project(src)
         opts = parse_opts(args.opt)
         try:
-            jobs = plan_jobs(reg, src, args.adapter, args.stage, args.all, views)
+            plates = source_plates(src, plates_want)
+            jobs = plan_jobs(reg, src, args.adapter, args.stage, args.all,
+                             views or (list(PLATE_VIEWS) if plates != [None] else views))
         except TuldaError as e:
             print(f"error [{src.name}]: {e}", file=sys.stderr)
             code = code or e.code
             continue
-        for job in jobs:
-            try:
-                png = run_chain(reg, job.chain, src, root, project, opts, args.keep,
-                                group=group, view=job.view, view_opts=job.options,
-                                seq=seq)
-            except TuldaError as e:
-                print(f"error [{job.label}] {src.name}: {e}", file=sys.stderr)
-                code = code or e.code
-                continue
-            finally:
-                seq += 1
-            ok_any = True
-            if project not in projects:
-                projects.append(project)
-            print(f"rendered {png}  ({job.label})")
+        for plate in plates:
+            popts = opts if plate is None else {**opts, "plate": plate}
+            for job in jobs:
+                label = job.label + (f" [plate {plate}]" if plate is not None else "")
+                try:
+                    png = run_chain(reg, job.chain, src, root, project, popts, args.keep,
+                                    group=group, view=job.view, view_opts=job.options,
+                                    seq=seq, suffix=f"-p{plate}" if plate is not None else "")
+                except TuldaError as e:
+                    print(f"error [{label}] {src.name}: {e}", file=sys.stderr)
+                    code = code or e.code
+                    continue
+                finally:
+                    seq += 1
+                ok_any = True
+                if project not in projects:
+                    projects.append(project)
+                print(f"rendered {png}  ({label})")
     if ok_any:
         hosts = [f"http://{bonjour_name()}:{port}"]
         from .service import configured_tailscale_host
@@ -337,6 +393,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--stage", choices=["source", "built", "sliced", "mesh"])
     r.add_argument("--all", action="store_true", help="render with every satisfiable terminal adapter")
     r.add_argument("--opt", action="append", metavar="K=V", help="override option, e.g. w=800")
+    r.add_argument("--plates", metavar="all|N,M",
+                   help="render each plate of a .3mf separately ('all' or plate numbers); "
+                        "default views per plate: " + ",".join(PLATE_VIEWS) +
+                        " (picture, Bambu Studio slice estimate, 3D viewer)")
     r.add_argument("--project")
     r.add_argument("--keep", action="store_true", help="keep intermediates in build/ beside the renders root")
     r.add_argument("--port", type=int, help="port used in the printed URL")

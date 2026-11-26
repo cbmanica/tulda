@@ -102,16 +102,25 @@ def parse_gcode(lines) -> dict:
             "features": features, "tool_mm": tool_mm}
 
 
-def parse_slice_info(xml_text: str) -> dict:
-    """slice_info.config -> {"prediction_s", "weight_g", "support_used", "filaments": [...]}.
-    Returns {} if it is missing or malformed."""
+def parse_slice_info(xml_text: str, plate_no: int | None = None) -> dict:
+    """slice_info.config -> {"prediction_s", "weight_g", "support_used", "filaments": [...]} of
+    plate `plate_no` (its `index` metadata), else of the first plate. Returns {} if it is
+    missing or malformed."""
+    if not isinstance(xml_text, str) or "<!DOCTYPE" in xml_text or "<!ENTITY" in xml_text:
+        return {}
     try:
         root = ET.fromstring(xml_text)
     except (ET.ParseError, TypeError):
         return {}
-    plate = root.find("plate")
-    if plate is None:
+    plates = root.findall("plate")
+    if not plates:
         return {}
+    plate = plates[0]
+    for p in plates:
+        if plate_no is not None and any(m.get("key") == "index" and m.get("value") == str(plate_no)
+                                        for m in p.findall("metadata")):
+            plate = p
+            break
     meta = {m.get("key"): m.get("value") for m in plate.findall("metadata")}
     fils = []
     for f in plate.findall("filament"):
@@ -243,7 +252,7 @@ table{{border-collapse:collapse;width:100%}}td,th{{text-align:left;padding:3px 8
 .m{{color:var(--mut);font-size:13px}}
 </style></head><body>
 <h1>{e(title)}</h1>
-<div class="m">Slice summary (Bambu Studio, plate 1, as sliced from the model's embedded settings)</div>
+<div class="m">Slice summary (Bambu Studio, plate {int(s.get('plate') or 1)}, as sliced from the model's embedded settings)</div>
 <div class="v {cls}"><b>{e(s['headline'])}</b></div>
 <table>
 <tr><th>Print time</th><td>{e(str(s.get('print_time') or '?'))}</td></tr>

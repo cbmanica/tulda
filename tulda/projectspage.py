@@ -13,8 +13,10 @@ Rows come from two read-only sources:
 Sorting is a plain query parameter (`?sort=date`, the default: newest activity first, i.e. the
 newest render, else the project's creation time; `?sort=name`: case-insensitive name), so it
 works without JavaScript. Names come from file and folder names and are untrusted: every value
-is escaped. The only script is timefmt.LOCAL_JS (allowed by hash), which shows the UTC <time>
-elements in the browser's zone."""
+is escaped. Rows with a source folder also show a compact file summary (counts by type, 3mf
+plates, a post-processing-script flag; projectfiles.folder_summary) and link to the project
+page `/_p/<project>/` (projectdetail.py). The only script is timefmt.LOCAL_JS (allowed by
+hash), which shows the UTC <time> elements in the browser's zone."""
 
 from __future__ import annotations
 
@@ -82,9 +84,25 @@ def source_projects(dests: list[Path]) -> dict[str, dict]:
             if man is None:
                 continue
             created = man.get("created_utc")
+            # "path" is private: used to list the folder, never put in a page or JSON
             out[name] = {"source": f"{dest.name}/{name}",
-                         "created": created if parse_ts(created) else None}
+                         "created": created if parse_ts(created) else None, "path": proj}
     return out
+
+
+def detail_url(name: str) -> str:
+    return f"/{PROJECTS_PREFIX}/{urllib.parse.quote(name, safe='')}/"
+
+
+def _files(src: dict) -> dict | None:
+    """The row's compact file summary (projectfiles.folder_summary of the source folder, put
+    in src["summary"] by the caller): type counts, 3mf plates, post-processing flag."""
+    s = src.get("summary")
+    if not s:
+        return None
+    from .projectfiles import summary_text
+    return {"text": summary_text(s), "counts": s["counts"], "threemf": s["threemf"],
+            "plates": s["plates"], "post_process": s["post_process"]}
 
 
 def project_rows(summary: list[dict], sources: dict[str, dict]) -> list[dict]:
@@ -93,16 +111,17 @@ def project_rows(summary: list[dict], sources: dict[str, dict]) -> list[dict]:
     for s in summary:
         src = sources.get(s["name"]) or {}
         rows.append({"name": s["name"], "url": f"/{urllib.parse.quote(s['name'], safe='')}/",
+                     "detail": detail_url(s["name"]),
                      "renders": s["renders"], "requests": s["requests"],
                      "last": utc_from_ts(s["mtime"]) if s.get("mtime") else None,
                      "trigger": s.get("trigger"), "thumb": s.get("thumb"),
-                     "source": src.get("source"), "created": src.get("created")})
+                     "source": src.get("source"), "created": src.get("created"), "files": _files(src)})
     seen = {s["name"] for s in summary}
     for name, src in sources.items():
         if name not in seen:
-            rows.append({"name": name, "url": None, "renders": 0, "requests": 0, "last": None,
-                         "trigger": None, "thumb": None, "source": src["source"],
-                         "created": src["created"]})
+            rows.append({"name": name, "url": None, "detail": detail_url(name), "renders": 0,
+                         "requests": 0, "last": None, "trigger": None, "thumb": None,
+                         "source": src["source"], "created": src["created"], "files": _files(src)})
     return rows
 
 
@@ -144,6 +163,14 @@ def _row_html(r: dict) -> str:
         extra.append(f"created {time_html(r['created'])}")
     if extra:
         lines.append(f'<div class=m>{" · ".join(extra)}</div>')
+    f = r.get("files")
+    if f is not None:
+        lines.append(f'<div class=m>files: {_e(f["text"])}</div>')
+        if f["post_process"]:
+            lines.append('<div class=pp>post-processing script in a 3mf</div>')
+    if r.get("detail"):
+        lines.append(f'<div class=m><a href="{_e(r["detail"])}">'
+                     f'{"files, plates and print settings" if r.get("source") else "project page"}</a></div>')
     return f'<li class=pr>{thumb}<div class=pi><h3>{title}</h3>{"".join(lines)}</div></li>'
 
 
@@ -183,6 +210,7 @@ a:focus-visible{{outline:2px solid var(--acc);outline-offset:2px}}
 .th img{{width:100%;height:100%;object-fit:contain;display:block}}
 .pi{{min-width:0;flex:1}}.pi h3{{font-size:16px;margin:0 0 2px;overflow-wrap:anywhere}}
 .src{{font-family:ui-monospace,monospace;font-size:13px;overflow-wrap:anywhere}}
+.pp{{display:inline-block;font-size:13px;font-weight:600;color:#b42318;border:2px solid #b42318;border-radius:6px;padding:0 6px;margin:2px 0}}
 .trg{{font-size:11px;padding:0 7px;border-radius:9px;border:1px dashed var(--mut);color:var(--mut);white-space:nowrap}}
 .trg-web{{border-style:solid;border-color:#3b82f6;color:#3b82f6}}.trg-watch{{border-style:solid;border-color:#a855f7;color:#a855f7}}
 @media (max-width:480px){{main{{padding:10px 12px}}.th{{width:64px;height:48px}}.pr{{gap:10px}}}}

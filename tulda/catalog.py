@@ -103,6 +103,21 @@ def _inherit_dims(items: list[dict]) -> None:
                 i["dims_text"] = dims_mod.fmt(d)
 
 
+def render_plate(d: dict) -> int | None:
+    """The 3mf plate a render shows: the plate its sidecar info records (per-plate slice and
+    mesh renders), else the plate its dimensions were measured on (a multi-plate 3mf's PNGs);
+    a mesh without either holds the whole build (None); anything else shows plate 1 (the
+    Bambu adapters' default)."""
+    info = d.get("info") or {}
+    p = info.get("plate")
+    if isinstance(p, int) and not isinstance(p, bool) and p > 0:
+        return p
+    dm = d.get("dims") or {}
+    if dm.get("scope") == "plate" and isinstance(dm.get("plate"), int) and d.get("kind") != "mesh":
+        return dm["plate"]
+    return None if d.get("kind") == "mesh" else 1
+
+
 # ---- schema / migrations ------------------------------------------------------
 
 def _m1(c: sqlite3.Connection) -> None:
@@ -714,6 +729,28 @@ class Catalog:
                             g["dims_text"] = None
                     if r["view"] and r["view"] not in g["views"]:
                         g["views"].append(r["view"])
+        return out
+
+    def renders_by_source_sha(self, shas, limit: int = 400) -> dict[str, list[dict]]:
+        """{sha256: [render dict + "plate"]}, newest first, for present renders in untrashed
+        groups whose source had that sha256 (the project page's per-plate renders and slice
+        estimates). "plate" is the plate a render shows (see render_plate)."""
+        shas = sorted({s for s in shas if isinstance(s, str) and re.fullmatch(r"[0-9a-f]{64}", s)})
+        out: dict[str, list[dict]] = {}
+        if not shas:
+            return out
+        with self.conn() as c:
+            for i in range(0, len(shas), 400):
+                chunk = shas[i:i + 400]
+                rows = c.execute(
+                    "SELECT r.* FROM renders r JOIN groups g ON g.id = r.group_id WHERE r.missing=0 "
+                    "AND g.trashed_utc IS NULL AND r.source_sha256 IN "
+                    f"({','.join('?' * len(chunk))}) ORDER BY r.mtime DESC, r.file DESC LIMIT ?",
+                    [*chunk, limit]).fetchall()
+                for r in rows:
+                    d = self._render_dict(r)
+                    d["plate"] = render_plate(d)
+                    out.setdefault(r["source_sha256"], []).append(d)
         return out
 
     def resolve_group(self, ident: str) -> dict:

@@ -68,6 +68,17 @@ the source is never modified) and stores a summary page (`.htm`) plus the same d
 sidecar `info`: print time, layers, filament g/m per filament, extrusion per `; FEATURE:` type,
 and explicit yes/no for supports, brim, skirt and prime tower ("No supports needed" when none).
 The group page shows it as a text card. It slices with the settings embedded in the 3mf.
+It slices plate 1 unless the `plate` option says otherwise (`--opt plate=2`).
+
+Multi-plate projects: `--plates all` (or `--plates 1,3`) renders each plate of a `.3mf`
+separately, in one request. Per plate it makes, unless `--view`/`--views` says otherwise, `iso`
+(Bambu Studio `--export-png N`), `slice` (Bambu Studio `--slice N`: print time and filament g/m
+for that plate) and `interactive` (a GLB holding only that plate's objects). Files get a `-pN`
+suffix and each sidecar records the plate (`options.plate`, the slice and mesh `info.plate`, and
+`dims` measured on that plate). A 3mf without Bambu/Orca plates has plate 1 only; other source
+types in the same command ignore `--plates`. `--plates` and `--opt plate=N` cannot be combined.
+
+    tulda render model.3mf --plates all
 
 Provenance: for every `.3mf` source, whatever views are rendered, the sidecar records the
 file's self-reported `<metadata>` from its root model (`Title`, `Designer`, `License`,
@@ -224,10 +235,35 @@ manual/web/watch), plus the project folders (holding `tulda-project.json`) in th
 `[[watch.dir]] destination`s and `[projects] default_destination` of the user config. A folder
 with the same name as a renders project adds its source, shown as `<destination name>/<folder>`
 (folder names only, never an absolute path), and its creation time; one with no renders yet is
-listed as "no renders yet". `?sort=date` (default: newest activity first, i.e. newest render,
+listed as "no renders yet". Rows of project folders also show a compact file summary (for
+example `files: 1 × 3mf (3 plates), 9 × scad, 1 × text`), flag a 3mf carrying a post-processing
+script, and link to the project page. `?sort=date` (default: newest activity first, i.e. newest render,
 else creation time) or `?sort=name` (case-insensitive). Plain links and server-rendered HTML,
 so it works without JavaScript; times are UTC without it. `_p` is reserved, like `_g`, `_d`,
-`_v`, `_s` and `_w`: a renders folder of that name is not listed. Group cards fold/unfold (newest open, state remembered per browser, "Expand
+`_v`, `_s` and `_w`: a renders folder of that name is not listed.
+
+The **project page** (`/_p/<project>/`; JSON at `/api/projects/<project>`) lists the project
+folder's files (path relative to the folder, type, size, modified time; dot entries and
+symlinks skipped, at most 4 levels and 400 files) and, for each `.3mf` (up to 20):
+
+- a prominent warning with the command text when it carries a post-processing script;
+- every plate (number, name, objects, the filaments it uses, per-plate setting overrides) with
+  its newest render as a thumbnail linking to its request, a link to the plate's 3D viewer
+  (else a whole-build one), and Bambu Studio's estimate: print time, total grams and grams/metres
+  per filament. The estimate is the one stored in `Metadata/slice_info.config` when the file
+  was saved after slicing, else the newest `slice` render of that plate. Without either the page
+  says to run `tulda render <file> --plates all`;
+- filaments (number, colour swatch, type, profile, which plate/object uses each, and colour
+  changes that switch to it);
+- colour changes, pauses and custom G-code per layer (`Metadata/custom_gcode_per_layer.xml`);
+- key process settings from `Metadata/project_settings.config` (profiles, printer, nozzle, bed,
+  layer heights, walls, top/bottom layers, infill, supports, brim, elephant-foot, hole and
+  contour compensation, seam, prime tower, ...), the settings changed from the process profile,
+  and per-object/per-part overrides from `Metadata/model_settings.config`.
+
+Renders are matched to a 3mf by its sha256, so renders made under any project or group name
+count and renders of an older version of the file do not. The page is read-only: it never
+renders or slices; per-plate renders and estimates come from `tulda render --plates`. Group cards fold/unfold (newest open, state remembered per browser, "Expand
 all"/"Collapse all"); "Load more requests"; `/_d/2026-11/` and `/_d/2026-11-24/` (UTC dates,
 picker under "Browse by date"); `/search?q=`; chips filter by adapter, stage, view, tag,
 starred, "show trash". JSON: `/api/groups`, `/api/dates`, `/api/latest`. Apart from the
@@ -470,6 +506,13 @@ supported; `func(ctx) -> Result`.
 - `/_p/` and `/api/projects` read the catalog and list the folders of the configured project
   destinations (names and manifest creation times only). Names are untrusted and HTML-escaped;
   the page's only script is the fixed local-time script.
+- `/_p/<project>/` and `/api/projects/<project>` look the name up among those folders and the
+  renders-root projects (404 otherwise; the name is never joined to a path) and list the folder's
+  files by relative path, never by absolute path. 3mf files are read with per-member size limits
+  (only the small metadata members, never meshes or G-code), XML with DTDs or entity
+  declarations is ignored, and every value from a file is HTML-escaped (colours are used only
+  when they are `#RRGGBB`). Post-processing scripts are shown, never run: the `slice` view blanks
+  them in the copy it slices.
 - Gallery, Projects and Watcher pages send `script-src` with sha256 hashes of their two fixed inline
   scripts (the gallery script and the local-time script) and no `'unsafe-inline'`, so no other
   inline script can run; page data is a non-executed JSON block. The 3D viewer page keeps its own

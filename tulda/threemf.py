@@ -15,7 +15,7 @@ Colours (verified against Bambu Studio 02.09.01.70 project files):
     `pid`/`p1` (per triangle). Triangles are split into one part per material.
   * Neither: a default palette indexed by extruder.
 Not handled: Bambu paint-on colours (`paint_color` per triangle; absent in every file checked),
-multi-plate filtering, texture/colorgroup extensions."""
+texture/colorgroup extensions. `load(path, plate=N)` keeps one Bambu/Orca plate."""
 
 from __future__ import annotations
 
@@ -530,8 +530,10 @@ def build_bboxes(path) -> dict:
     return {"build": build, "plates": out_plates}
 
 
-def load(path) -> Scene:
-    """Read a .3mf into a Scene: one Part per mesh instance (per material)."""
+def load(path, plate: int | None = None) -> Scene:
+    """Read a .3mf into a Scene: one Part per mesh instance (per material). plate: keep only the
+    build items of that Bambu/Orca plate (a file without plates has just plate 1); MeshError
+    when the file has no such plate."""
     try:
         z = zipfile.ZipFile(path)
     except (zipfile.BadZipFile, OSError) as e:
@@ -540,6 +542,15 @@ def load(path) -> Scene:
         model = _load_model(z)
         cfg = read_config(z)
         leaves = _flatten(model)
+        plates = read_plates(z) if plate is not None else []
+    if plate is not None and (plates or plate != 1):
+        inst = next((s for n, s in plates if n == plate), None)
+        if inst is None:
+            raise MeshError(f"the 3mf has no plate {plate}")
+        keep = {i for i, (_f, oid, _xf, k) in enumerate(model.build) if (oid, k) in inst}
+        leaves = [lf for lf in leaves if lf.item in keep]
+        if not leaves:
+            raise MeshError(f"plate {plate} is empty")
     scene = Scene()
     scene.extras["source"] = {"title": model.title, "application": model.application}
     sources: set[str] = set()
@@ -576,6 +587,8 @@ def load(path) -> Scene:
         scene.parts.append(Part(name=name, obj=obj_name, extruder=extruder, color=col, alpha=alpha,
                                 tris=_tri_array(o, list(range(len(o.tris))), lf.xf, scale),
                                 subtype=subtype, visible=subtype == "normal_part"))
+    if plate is not None:
+        scene.extras["plate"] = plate
     scene.extras["colors"] = sorted(sources)
     if "palette" in sources:
         scene.warnings.append("no usable filament_colour for some extruders; used a default palette")
