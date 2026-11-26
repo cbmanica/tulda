@@ -426,6 +426,138 @@ def create_project(src: Path, dest: Path, force: bool = False,
     return "created", target
 
 
+# ---- new original project -----------------------------------------------------------------
+
+README_NAME = "README.md"
+
+
+def scad_stem(folder: str) -> str:
+    """snake_case file stem from a project folder name: 'Cable-Clip.v2' -> 'cable_clip_v2'."""
+    return re.sub(r"_+", "_", re.sub(r"[-.\s]+", "_", folder.casefold())).strip("_") or "model"
+
+
+def scad_template(stem: str, title: str) -> str:
+    return f"""// {stem}.scad - {title} (original design; untested, not yet printed)
+//
+// Axes: X = width, Y = depth, Z = height. Bed face at z = 0.
+// Print orientation: TODO (which face goes on the bed, and why; supports or none).
+// Material / profile: TODO (e.g. PETG; name the overlay, e.g. overlays/<material>.toml, if a print
+// target uses one).
+//
+// part: "main" | add selectors here (e.g. "body", "lid") and thin wrapper files that only set `part`
+//       after including this file.
+
+$fn = 48;
+
+part = "main";
+
+// ---- parameters (mm) ---------------------------------------------------------------
+width  = 20;     // outside width  (X)
+depth  = 20;     // outside depth  (Y)
+height = 10;     // outside height (Z)
+
+// ---- modules -----------------------------------------------------------------------
+module main() {{
+    // Placeholder solid so the file renders; replace with the real model.
+    cube([width, depth, height]);
+}}
+
+// ---- render ------------------------------------------------------------------------
+if (part == "main") main();
+"""
+
+
+def readme_template(stem: str, title: str) -> str:
+    return f"""# {title} (untested, not yet printed)
+
+Original design. Licence: TODO (also set `licence` in `tulda-project.json`).
+
+## Print orientation
+
+TODO: which face goes on the bed, supports, material and layer height.
+
+| File | Purpose |
+|---|---|
+| `{stem}.scad` | the model; `part = "main"` |
+
+## Parameters and why
+
+- `width`, `depth`, `height`: placeholders (20 x 20 x 10 mm); replace with the real dimensions and
+  say where each number comes from (measured part, clearance, layer multiple).
+
+## Notes
+
+-
+
+## Print target (optional)
+
+If the model is built with a print manifest, a target could look like:
+
+    [targets.{stem}]
+    scad = ["{stem}.scad"]
+    overlays = []             # e.g. overlays/<material>.toml
+    output = "build/{stem}.3mf"
+"""
+
+
+def projects_default_destination(config: Path | None = None) -> Path | None:
+    """[projects] default_destination from the user config (or an explicit --config)."""
+    import tomllib
+    from .watchconfig import config_path
+    path = config_path(config)
+    try:
+        data = tomllib.loads(path.read_text("utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        raise ProjectError(f"cannot read {path}: {e}") from e
+    sect = data.get("projects", {})
+    if not isinstance(sect, dict):
+        raise ProjectError(f"{path}: projects must be a table ([projects])")
+    v = sect.get("default_destination")
+    if v is None:
+        return None
+    if not isinstance(v, str) or not v.strip():
+        raise ProjectError(f"{path}: [projects] default_destination must be a non-empty string")
+    d = Path(v).expanduser()
+    if not d.is_absolute():
+        raise ProjectError(f"{path}: [projects] default_destination must be absolute or start with ~")
+    return d
+
+
+def new_project(name: str, dest: Path, now: datetime | None = None) -> Path:
+    """Create DEST/<name>/ for an original design: <stem>.scad skeleton, README.md stub and a
+    manifest with origin "own". Same naming and collision rules as create_project; built in a
+    staging dir and renamed under the destination lock. Returns the project dir."""
+    folder = sanitize_name(name)
+    if not folder:
+        raise ProjectError(f"{name!r}: no usable characters for a folder name")
+    title = " ".join(name.split()) or folder
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=dest))
+    try:
+        with dest_lock(dest):
+            target = unique_dir(dest, folder)
+            stem = scad_stem(target.name)
+            (staging / f"{stem}.scad").write_text(scad_template(stem, title), "utf-8")
+            (staging / README_NAME).write_text(readme_template(stem, title), "utf-8")
+            now = now or datetime.now(timezone.utc)
+            manifest = {
+                "tulda_project": 1, "name": target.name, "title": title,
+                "created_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "origin": "own", "licence": "", "designer": "",
+                "files": [f"{stem}.scad", README_NAME],
+                "note": "Original design. Fill in licence and designer; no third-party provenance.",
+            }
+            (staging / MANIFEST).write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", "utf-8")
+            os.rename(staging, target)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return target
+
+
 # ---- git publication warning ---------------------------------------------------------------
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess | None:
@@ -617,6 +749,21 @@ def cmd_project_create(args) -> int:
     return code
 
 
+def cmd_project_new(args) -> int:
+    dest = Path(args.destination).expanduser() if args.destination \
+        else projects_default_destination(args.config)
+    if dest is None:
+        raise ProjectError("no destination: pass --destination DIR or set [projects] "
+                           "default_destination in the user config")
+    proj = new_project(args.name, dest)
+    print(f"created {proj}")
+    for f in json.loads((proj / MANIFEST).read_text("utf-8"))["files"]:
+        print(f"  {f}")
+    if args.render:
+        return render_project(proj)
+    return 0
+
+
 def cmd_watch(args) -> int:
     if getattr(args, "check_config", None) is not None or getattr(args, "from_config", False):
         from .watchd import cmd_watch_config
@@ -663,6 +810,14 @@ def add_project_parsers(sub) -> None:
     c.add_argument("--render", action="store_true",
                    help="also render .3mf/.scad/.stl into the renders root (off by default)")
     c.set_defaults(fn=cmd_project_create)
+    n = ps.add_parser("new", help="start an original design: DEST/<name>/ with a starter .scad, "
+                      "README.md and a manifest marked origin = own")
+    n.add_argument("name", help="project name (sanitised like `project create`; clashes get -2, -3)")
+    n.add_argument("--destination", "-d", metavar="DIR",
+                   help="parent directory (default: [projects] default_destination in the user config)")
+    n.add_argument("--config", metavar="PATH", help="config to read default_destination from")
+    n.add_argument("--render", action="store_true", help="also render the starter model (needs OpenSCAD)")
+    n.set_defaults(fn=cmd_project_new)
     w = sub.add_parser("watch", help="poll a folder (e.g. Downloads) and make projects for finished "
                        "MakerWorld .3mf/.zip downloads; originals are never moved")
     w.add_argument("directory", nargs="?", help="folder to poll (ad-hoc mode; ignores the config)")

@@ -352,3 +352,69 @@ class NoNetwork(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NewProject(unittest.TestCase):
+    def setUp(self):
+        self.d = tmpdir()
+        self.addCleanup(shutil.rmtree, self.d)
+        self.dest = self.d / "designs"
+
+    def test_contents(self):
+        proj = projects.new_project("Cable Clip (v2)", self.dest,
+                                    now=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc))
+        self.assertEqual(proj.name, "Cable-Clip-v2")
+        self.assertEqual(sorted(p.name for p in proj.iterdir()),
+                         ["README.md", "cable_clip_v2.scad", "tulda-project.json"])
+        m = json.loads((proj / "tulda-project.json").read_text())
+        self.assertEqual((m["origin"], m["licence"], m["title"]), ("own", "", "Cable Clip (v2)"))
+        self.assertEqual(m["files"], ["cable_clip_v2.scad", "README.md"])
+        for k in ("source", "models", "detection", "provenance"):
+            self.assertNotIn(k, m)
+        scad = (proj / "cable_clip_v2.scad").read_text()
+        self.assertTrue(scad.startswith("// cable_clip_v2.scad - Cable Clip (v2)"))
+        for want in ('part = "main";', "module main()", 'if (part == "main") main();', "// ---- parameters"):
+            self.assertIn(want, scad)
+        self.assertEqual(scad.count("{"), scad.count("}"))
+        self.assertIn("[targets.cable_clip_v2]", (proj / "README.md").read_text())
+        self.assertFalse(list(self.dest.glob(projects.STAGING_PREFIX + "*")))
+        self.assertIsNone(projects.find_existing(self.dest, "0" * 64))   # no source: never matches
+
+    def test_collisions_and_unicode(self):
+        a = projects.new_project("Box", self.dest)
+        b = projects.new_project("box", self.dest)
+        self.assertEqual((a.name, b.name), ("Box", "box-2"))
+        self.assertTrue((b / "box_2.scad").is_file())
+        c = projects.new_project("收纳盒", self.dest)
+        self.assertEqual(c.name, "收纳盒")
+        with self.assertRaises(projects.ProjectError):
+            projects.new_project("!!!", self.dest)
+
+    def test_cli_default_destination_from_config(self):
+        cfg = self.d / "config.toml"
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertNotEqual(cli.main(["project", "new", "x", "--config", str(cfg)]), 0)
+        self.assertIn("default_destination", err.getvalue())
+        cfg.write_text(f'[projects]\ndefault_destination = "{self.dest}"\n')
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(cli.main(["project", "new", "Hook", "--config", str(cfg)]), 0)
+        self.assertTrue((self.dest / "Hook" / "hook.scad").is_file())
+        cfg.write_text('[projects]\ndefault_destination = "relative"\n')
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertNotEqual(cli.main(["project", "new", "y", "--config", str(cfg)]), 0)
+        other = self.d / "other"
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(cli.main(["project", "new", "Hook", "-d", str(other), "--config", str(cfg)]), 0)
+        self.assertTrue((other / "Hook").is_dir())
+
+    def test_scad_renders_with_openscad(self):
+        exe = shutil.which("openscad") or ("/Applications/OpenSCAD.app/Contents/MacOS/OpenSCAD"
+                                           if os.path.exists("/Applications/OpenSCAD.app/Contents/MacOS/OpenSCAD") else None)
+        if not exe:
+            self.skipTest("OpenSCAD not installed")
+        proj = projects.new_project("Probe", self.dest)
+        r = subprocess.run([exe, "-o", str(self.d / "p.stl"), str(proj / "probe.scad")],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertGreater((self.d / "p.stl").stat().st_size, 0)

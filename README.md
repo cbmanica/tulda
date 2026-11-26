@@ -110,6 +110,28 @@ nothing) when the destination is inside a git work tree and not ignored; add the
 `.gitignore` line before committing. The licence metadata is self-reported; the model's
 MakerWorld page is authoritative. Not legal advice.
 
+### New original designs
+
+    tulda project new "Cable Clip" [-d ~/designs] [--render]
+
+creates `<destination>/Cable-Clip/` (same name sanitising and `-2`, `-3` collision rules as
+`project create`) with:
+
+- `cable_clip.scad`: a valid OpenSCAD starter (header comment for axes, print orientation and
+  material/overlay, `$fn`, a `part` selector, a `// ---- parameters` block, `module main()`
+  with a placeholder cube, and the render call), so it renders as soon as it is created;
+- `README.md`: title, licence and print-orientation TODOs, a file table, "Parameters and why",
+  notes, and an optional print-manifest target stub;
+- `tulda-project.json`: `origin = "own"`, empty `licence` and `designer` to fill in, no
+  MakerWorld provenance.
+
+The destination defaults to `default_destination` in the user config:
+
+    [projects]
+    default_destination = "~/designs"
+
+`--render` renders the starter into the renders root (needs OpenSCAD).
+
 ### Catalog, navigation and management
 
 A SQLite catalog at `<renders root>/.tulda/catalog.db` (never served over HTTP) indexes the
