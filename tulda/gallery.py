@@ -260,9 +260,10 @@ $('lb').querySelector('.n').onclick=()=>open(cur+1);
 $('lb').onclick=e=>{if(e.target.id==='lb')close()};
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){$('cmp').classList.remove('open');if(cur>=0)close();return}
  if(cur<0)return;if(e.key==='ArrowLeft')open(cur-1);else if(e.key==='ArrowRight')open(cur+1)});
-// ---- new-render notice (cheap: /api/latest reads one row from the catalog)
+// ---- new-render notice (cheap: /api/latest reads a few catalog rows). renders_rev, not rev: rev
+// also moves on star/tag/trash, reindex and rewritten sidecars, which add nothing new to show
 function poll(){if(document.hidden)return;fetch('/api/latest').then(r=>r.json()).then(j=>{
- if(j.rev!==D.rev){const f=$('fresh');f.href=location.href;f.hidden=false}}).catch(()=>{})}
+ if(j.renders_rev!==D.renders_rev){const f=$('fresh');f.href=location.href;f.hidden=false}}).catch(()=>{})}
 setInterval(poll,15000);
 $('q').value=ctx.q||'';
 nav();chips();dates();addGroups(loaded,!ctx.q);

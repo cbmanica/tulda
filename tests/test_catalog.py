@@ -729,6 +729,35 @@ class LatestStability(unittest.TestCase):
         d2, _ = self.s.page_data()
         self.assertEqual(self.s.api("/api/latest")["rev"], d2["rev"])
 
+    def test_metadata_only_changes_do_not_signal_new_renders(self):
+        # Regression: a sidecar rewritten in place (e.g. `tulda db dims` adding sizes), a star
+        # or a forced reindex bumped the one revision the gallery polled, so it offered
+        # "New renders: reload" and the reloaded page showed the same groups and times.
+        d, _ = self.s.page_data()
+        cat = self.s.srv.catalog
+        side = next((self.root / "p").glob("*.json"))
+        meta = json.loads(side.read_text())
+        meta["dims"] = {"size": [1, 2, 3]}
+        side.write_text(json.dumps(meta))
+        os.utime(side, (time.time() + 5, time.time() + 5))
+        cat.sync()
+        cat.set_starred("20261124T100000Z-a", True)
+        cat.sync(force=True)
+        now = self.s.api("/api/latest")
+        self.assertNotEqual(now["rev"], d["rev"])                 # the catalog did change...
+        self.assertEqual(now["renders_rev"], d["renders_rev"])    # ...but nothing new to show
+        mk(self.root, "p", "20261124T110000Z-b", "2026-11-24T11:00:00Z", "b", title="B")
+        cat.sync()
+        self.assertNotEqual(self.s.api("/api/latest")["renders_rev"], d["renders_rev"])
+        d2, _ = self.s.page_data()
+        self.assertEqual(self.s.api("/api/latest")["renders_rev"], d2["renders_rev"])
+        self.assertEqual(d2["groups"][0]["id"], "20261124T110000Z-b")
+
+    def test_gallery_notice_polls_renders_rev(self):
+        from tulda.gallery import GALLERY_JS
+        self.assertIn("j.renders_rev!==D.renders_rev", GALLERY_JS)
+        self.assertNotIn("j.rev!==D.rev", GALLERY_JS)
+
     def test_hidden_attribute_not_overridden_by_css(self):
         s, b, _ = get(self.s.port, "/")
         self.assertIn("[hidden]{display:none!important}", b.decode())

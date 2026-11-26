@@ -213,7 +213,7 @@ Schema (`PRAGMA user_version`, migrations in `tulda/catalog.py`): v1 = `meta`, `
 
 Concurrency: WAL, `busy_timeout`, short `BEGIN IMMEDIATE` write transactions (500 renders per chunk), a file lock only around create/migrate/rebuild. `tulda render` indexes each new PNG (a failure there is a warning, never a failed render). The server opens `query_only` connections per request and runs an incremental sync at startup, every `--sync-interval` seconds (default 30), and opportunistically (at most every 2 s) on page/API requests; a project directory whose mtime is unchanged (and older than 2 s) is skipped, so a no-op sync is a handful of `stat` calls. This picks up renders copied in or made by older tulda. A missing/corrupt/garbage DB is rebuilt automatically with a log line (`catalog: ... rebuilding from sidecars`). Day buckets, date URLs and "Recent" ordering use UTC; groups are ordered by the mtime of their newest render.
 
-Server (still read-only, GET/HEAD only, same Host and path checks; no write endpoints): `/` (cursor-paginated, 20 groups, "Load more"), `/<project>/`, `/_g/<id>/` (always expanded, shows trashed groups too), `/_d/YYYY-MM/` and `/_d/YYYY-MM-DD/`, `/search?q=`, and JSON `/api/groups?cursor=&limit=&project=&day=&adapter=&stage=&view=&tag=&starred=1&trash=1&q=`, `/api/dates`, `/api/latest` (`{rev, mtime}`: one row from `meta`/`renders`; the page polls it every 15 s and offers a reload link), `/api/index` (flat items, `limit`). Filters (adapter/stage/view/tag chips, starred, "show trash") are query parameters, so every filtered view is a shareable link. Trashed groups are hidden unless `trash=1`. Management is CLI only; the page has no buttons that change anything.
+Server (still read-only, GET/HEAD only, same Host and path checks; no write endpoints): `/` (cursor-paginated, 20 groups, "Load more"), `/<project>/`, `/_g/<id>/` (always expanded, shows trashed groups too), `/_d/YYYY-MM/` and `/_d/YYYY-MM-DD/`, `/search?q=`, and JSON `/api/groups?cursor=&limit=&project=&day=&adapter=&stage=&view=&tag=&starred=1&trash=1&q=`, `/api/dates`, `/api/latest` (`{rev, renders_rev, mtime}`: rows from `meta`/`renders`; the page polls it every 15 s and offers a reload link), `/api/index` (flat items, `limit`). Filters (adapter/stage/view/tag chips, starred, "show trash") are query parameters, so every filtered view is a shareable link. Trashed groups are hidden unless `trash=1`. Management is CLI only; the page has no buttons that change anything.
 
 UI folding: each group is a `<details>`/`<summary>` (keyboard and screen-reader accessible; `aria-expanded` is mirrored on the summary). Header = title, star/trash/tags, time, source count, image count, up to three tiny thumbnails while collapsed (these are the full PNG scaled by the browser, lazy-loaded; there is no thumbnail generation yet), and an "open" link. The grid and its images are only created when a group is first expanded, so collapsed groups fetch nothing but their three header thumbnails. Default: the first (newest) group is open, the rest collapsed; each toggle is remembered in `localStorage` (`tulda.fold.v1`, per browser, capped at 1000 groups); "Expand all"/"Collapse all" in the bar; the group page `/_g/<id>/` is not foldable.
 
@@ -342,9 +342,12 @@ Not found: any existing project that is a LAN image-gallery server for OpenSCAD/
   as an auto tag stays a user tag. Upgrading from v2 forces a full re-sync, which backfills auto tags.
   `untag` refuses auto tags (decision: not removable, to keep the model simple; no hide flag).
 - The project name is not an auto tag: it is already a facet and would add one tag to every group.
-- The page's `rev` is read before the group list and compared with `/api/latest`'s `rev`; both come
-  from `meta.rev`, which only changes when renders are indexed/removed or metadata is edited. A sync
-  with no new files does not bump it. The "new renders" button once showed permanently because
+- The page's `renders_rev` is read before the group list and compared with `/api/latest`'s
+  `renders_rev`; both come from `meta.renders_rev`, which only changes when a render file appears.
+  It used to compare `meta.rev`, which also moves on star/tag/trash, a forced reindex and sidecars
+  rewritten in place (`tulda db dims`), so the page offered "New renders: reload" and the reload
+  showed the same groups and times. `rev` still keys the facet/date caches. A sync with no new
+  files bumps neither. The "new renders" button once showed permanently because
   `#fresh{display:block}` overrode the `hidden` attribute; the stylesheet now has
   `[hidden]{display:none!important}` (same fix for "Load more"). HTML is sent `no-cache, no-store`.
 - `/api/groups` and the page data carry `has_more` (fetch limit+1); the client also stops on an

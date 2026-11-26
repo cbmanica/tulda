@@ -357,9 +357,11 @@ class Catalog:
 
     # -- write helpers (call inside BEGIN IMMEDIATE)
     @staticmethod
-    def _bump(c) -> None:
-        c.execute("INSERT INTO meta(key,value) VALUES('rev','1') ON CONFLICT(key) DO UPDATE "
-                  "SET value=CAST(value AS INTEGER)+1")
+    def _bump(c, key: str = "rev") -> None:
+        """'rev' moves on every catalog change (caches key on it); 'renders_rev' only when a
+        render file appears, which is what the gallery's "New renders" notice compares."""
+        c.execute("INSERT INTO meta(key,value) VALUES(?,'1') ON CONFLICT(key) DO UPDATE "
+                  "SET value=CAST(value AS INTEGER)+1", (key,))
 
     def _refresh_fts(self, c, gids) -> None:
         for gid in set(gids):
@@ -410,11 +412,14 @@ class Catalog:
         try:
             affected: set[str] = set()
             groups: dict[str, dict] = {}
+            added = False       # a render file appeared (not only a re-read sidecar or reindex)
             for it in items:
                 path = f"{it['project']}/{it['file']}"
-                old = c.execute("SELECT group_id FROM renders WHERE path=?", (path,)).fetchone()
+                old = c.execute("SELECT group_id, missing FROM renders WHERE path=?", (path,)).fetchone()
                 if old:
                     affected.add(old[0])
+                if not old or old[1]:
+                    added = True
                 c.execute("""INSERT INTO renders(path,project,file,group_id,seq,adapter,stage,view,source,
                     source_type,source_sha256,tool_version,git_sha,git_dirty,has_sidecar,size,mtime,
                     sidecar_mtime,created_utc,kind,info,provenance,dims,missing)
@@ -466,6 +471,8 @@ class Catalog:
                           dir_state)
             if items or gone:
                 self._bump(c)
+            if added:
+                self._bump(c, "renders_rev")
             c.execute("COMMIT")
         except BaseException:
             try:
@@ -572,16 +579,20 @@ class Catalog:
             self.log(f"catalog: sync failed: {e}")
 
     # -- reading
-    def rev(self) -> int:
+    def rev(self, key: str = "rev") -> int:
         with self.conn() as c:
-            r = c.execute("SELECT value FROM meta WHERE key='rev'").fetchone()
+            r = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
             return int(r[0]) if r else 0
 
     def latest(self) -> dict:
+        """rev: any catalog change (star/tag/trash, re-read sidecars, reindex...).
+        renders_rev: only new render files. The "New renders" notice compares renders_rev, so
+        a metadata-only change never offers a reload that shows nothing new."""
         with self.conn() as c:
             r = c.execute("SELECT max(mtime) FROM renders WHERE missing=0").fetchone()[0]
-            rev = c.execute("SELECT value FROM meta WHERE key='rev'").fetchone()
-            return {"rev": int(rev[0]) if rev else 0, "mtime": r or 0}
+            m = dict(c.execute("SELECT key, value FROM meta WHERE key IN ('rev','renders_rev')").fetchall())
+            return {"rev": int(m.get("rev") or 0), "renders_rev": int(m.get("renders_rev") or 0),
+                    "mtime": r or 0}
 
     def _where(self, f: Filters, alias: str = "g") -> tuple[str, list]:
         w = [f"{alias}.n_renders>0"]

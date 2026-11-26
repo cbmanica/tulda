@@ -206,12 +206,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _page(self, ctx: dict, f: Filters, head: bool, groups=None, nxt=None):
         cat: Catalog = self.server.catalog
-        rev = cat.rev()     # read BEFORE the data: a write in between makes the page look stale, never fresh
+        # read BEFORE the data: a write in between makes the page look stale, never fresh
+        rev, renders_rev = cat.rev(), cat.rev("renders_rev")
         if groups is None:
             groups, nxt = cat.list_groups(f, PAGE_SIZE)
         data = {"ctx": ctx, "groups": groups, "next": nxt, "has_more": nxt is not None,
                 "page_size": PAGE_SIZE, "facets": cat.facets(),
-                "dates": cat.dates(f.trash), "rev": rev, "qs": filters_qs(f),
+                "dates": cat.dates(f.trash), "rev": rev, "renders_rev": renders_rev,
+                "qs": filters_qs(f),
                 "filters": {"adapter": f.adapters, "stage": f.stages, "view": f.views, "tag": f.tags,
                             "trigger": f.triggers,
                             "starred": f.starred, "trash": f.trash}}
