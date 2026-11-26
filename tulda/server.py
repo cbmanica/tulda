@@ -24,7 +24,8 @@ from .gallery import GALLERY_JS, render_index
 from .timefmt import LOCAL_HASH, script_hash
 from .viewer import THREE_VERSION, render_viewer
 from .items import (DATE_PREFIX, STATIC_PREFIX, VIEWER_PREFIX, GROUP_ID, GROUP_PREFIX, RESERVED_DIRS, group_fields,  # noqa: F401
-                    TRIGGERS, WATCH_PREFIX, is_project_dir, read_item)
+                    PROJECTS_PREFIX, TRIGGERS, WATCH_PREFIX, is_project_dir, read_item)
+from .projectspage import parse_sort, project_rows, render_projects_page, sort_rows, source_destinations, source_projects
 from .watchevents import default_state_dir, display_events, watcher_status
 from .watchpage import RESULT_CODES, render_watch_page
 from . import webrender
@@ -266,6 +267,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"status": watcher_status(sdir),
                                "events": display_events(sdir, WATCH_EVENTS_SHOWN),
                                "projects": self._projects()}, head)
+        if route == "/api/projects":
+            return self._json({"sort": parse_sort(q), "projects": self._project_list(parse_sort(q))}, head)
+        if gparts and gparts[0] == PROJECTS_PREFIX:
+            if len(gparts) != 1:
+                return self._send(404, b"not found\n", head=head)
+            sort = parse_sort(q)
+            return self._send_page(render_projects_page(self._project_list(sort), sort), head)
         if gparts and gparts[0] == WATCH_PREFIX:
             if len(gparts) != 1:
                 return self._send(404, b"not found\n", head=head)
@@ -343,6 +351,12 @@ class Handler(BaseHTTPRequestHandler):
         self._send(405, b"read-only server\n", extra={"Allow": "GET, HEAD"})
 
     do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = _deny
+
+    def _project_list(self, sort: str) -> list[dict]:
+        """Projects tab rows: catalog projects plus project folders of the configured
+        destinations (folder names only, no absolute paths), sorted."""
+        srcs = source_projects(source_destinations(self.server.watch_config))
+        return sort_rows(project_rows(self.server.catalog.project_summary(), srcs), sort)
 
     # -- the single write exception: POST /api/render (see webrender.py)
     def _projects(self) -> list[dict]:

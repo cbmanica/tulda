@@ -1,14 +1,14 @@
 """The section tabs shown at the top of every HTML page (static markup, works without script).
 
-Two tabs: Gallery (`/`, every gallery view: recent, project, date, request and search, whose box
-sits in the gallery header) and Watcher (`/_w/`). Colours come from the page's own CSS
+Three tabs: Gallery (`/`, every gallery view: recent, project, date, request and search, whose box
+sits in the gallery header), Projects (`/_p/`) and Watcher (`/_w/`). Colours come from the page's own CSS
 variables (--fg, --mut, --acc, --line, --card), so each page's light/dark handling applies."""
 
 from __future__ import annotations
 
 from html import escape
 
-TABS = (("gallery", "Gallery", "/"), ("watcher", "Watcher", "/_w/"))
+TABS = (("gallery", "Gallery", "/"), ("projects", "Projects", "/_p/"), ("watcher", "Watcher", "/_w/"))
 
 CSS = (".tabs{display:flex;align-items:flex-end;gap:2px;padding:0 12px;border-bottom:1px solid var(--line);"
        "overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}"
