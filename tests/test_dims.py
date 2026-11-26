@@ -12,6 +12,7 @@ from tulda import dims, mesh, runner, viewer
 from tulda.adapters import plan_jobs
 from tulda.catalog import Catalog
 from tulda.gallery import noscript_list
+from tulda.mesh import MeshError
 from tulda.watchpage import _file_row
 
 from tests.test_mesh import UNIT_CUBE_PTS, UNIT_CUBE_TRIS, model_xml, no_user_config, tri_mesh, write_3mf
@@ -124,6 +125,31 @@ class ThreeMF(unittest.TestCase):
         r3 = dims.for_3mf(f, plate=3)                             # empty plate: whole build, labelled
         self.assertEqual((r3["scope"], r3["size"]), ("build", [313.0, 20.0, 5.0]))
         self.assertEqual(dims.fmt(r3), "313.0 × 20.0 × 5.0 mm (whole build)")
+
+
+class ScadCache(unittest.TestCase):
+    def test_wrapper_hash_unchanged_but_include_changed(self):
+        # a wrapper that only includes the model keeps its sha while the model changes size
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "model.scad").write_text("w = 50;\n")
+            w = d / "wrapper.scad"
+            w.write_text("include <model.scad>\npart = 1;\n")
+            sha = "same-wrapper-sha"
+            dims._cache.clear()
+            a = dims.compute(w, sha, mesh_bbox=[[0, 0, 0], [50, 39, 30]])
+            self.assertEqual(a["size"], [50.0, 39.0, 30.0])
+            # a fresh mesh beats a cached record even with identical files
+            b = dims.compute(w, sha, mesh_bbox=[[0, 0, 0], [60, 46.8, 48]])
+            self.assertEqual(b["size"], [60.0, 46.8, 48.0])
+            # cached hit is only reused while every dependency is unchanged
+            self.assertEqual(dims.compute(w, sha)["size"], [60.0, 46.8, 48.0])
+            fp = dims.scad_deps_fingerprint(w)
+            (d / "model.scad").write_text("w = 70;\n")
+            self.assertNotEqual(fp, dims.scad_deps_fingerprint(w))
+            with self.assertRaises(MeshError):
+                dims.compute(w, sha)          # no mesh, no openscad allowed: not the stale value
+            dims._cache.clear()
 
 
 class Records(unittest.TestCase):

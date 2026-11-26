@@ -17,7 +17,9 @@ whole build of a 3mf whose plates are unknown (a GLB backfill). Stdlib only."""
 
 from __future__ import annotations
 
+import hashlib
 import math
+import re
 import tempfile
 from pathlib import Path
 
@@ -183,6 +185,34 @@ def for_scad(path, timeout: float = 180) -> dict:
     return d
 
 
+_SCAD_DEP = re.compile(r"\b(?:include|use)\s*<([^>\n]+)>")
+
+
+def scad_deps_fingerprint(src: Path, limit: int = 200) -> str:
+    """sha256 over the contents of the include<>/use<> files reachable from src (resolved
+    relative to the including file; library paths that do not resolve are named only)."""
+    h = hashlib.sha256()
+    seen, todo = set(), [Path(src)]
+    while todo and len(seen) < limit:
+        f = todo.pop()
+        try:
+            f = f.resolve()
+        except OSError:
+            continue
+        if f in seen:
+            continue
+        seen.add(f)
+        try:
+            data = f.read_bytes()
+        except OSError:
+            h.update(b"missing:" + str(f).encode() + b"\0")
+            continue
+        h.update(str(f).encode() + b"\0" + hashlib.sha256(data).digest())
+        for m in _SCAD_DEP.finditer(data.decode("utf-8", "replace")):
+            todo.append(f.parent / m.group(1).strip())
+    return h.hexdigest()
+
+
 def compute(src: Path, sha: str | None = None, plate: int | None = None,
             mesh_bbox=None, scad: bool = False) -> dict:
     """Dimensions of a source file (cached per path + content hash + plate for one process,
@@ -191,6 +221,16 @@ def compute(src: Path, sha: str | None = None, plate: int | None = None,
     src = Path(src)
     ext = src.suffix.lower()
     key = (str(src), sha, plate if ext == ".3mf" else None)
+    if ext == ".scad":
+        # the source hash does not cover include<>/use<> files: a wrapper that only sets a
+        # parameter keeps its hash while the included model changes. Key on every dependency,
+        # and a mesh this run made always beats the cache.
+        key = (str(src), sha, scad_deps_fingerprint(src))
+        if from_bbox(mesh_bbox):
+            d = from_bbox(mesh_bbox, "model", "mesh")
+            if sha:
+                _cache[key] = dict(d)
+            return d
     if sha and key in _cache:
         return dict(_cache[key])
     if ext == ".3mf":
@@ -289,7 +329,9 @@ def backfill(root: Path, scad: bool = True, dry_run: bool = False, log=print) ->
         if src is not None:
             ext = src.suffix.lower()
             try:
-                if ext in (".3mf", ".stl") or (ext == ".scad" and (scad or from_bbox(info.get("bbox")))):
+                # a .scad render without its own mesh waits for a sibling of its own request
+                # (the source's include<> files may have changed since); see the last resort below
+                if ext in (".3mf", ".stl") or (ext == ".scad" and from_bbox(info.get("bbox"))):
                     d = compute(src, meta.get("source_sha256"), plate_option(meta.get("options")),
                                 info.get("bbox"), scad)
                     how = "source"
@@ -305,6 +347,13 @@ def backfill(root: Path, scad: bool = True, dry_run: bool = False, log=print) ->
             have.setdefault(key, d)
         pending.append((side, meta, d, how, key))
     for side, meta, d, how, key in pending:
+        if d is None and have.get(key) is None and scad:
+            src = paths.get((meta.get("source"), meta.get("source_sha256")))
+            if src is not None and src.suffix.lower() == ".scad":
+                try:
+                    d, how = compute(src, meta.get("source_sha256"), None, None, True), "source"
+                except (MeshError, OSError, ValueError) as e:
+                    log(f"{side.parent.name}/{side.name}: {e}")
         if d is None:
             sib = have.get(key)
             if sib is None:
