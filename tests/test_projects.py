@@ -83,55 +83,94 @@ class Detection(unittest.TestCase):
 
     def test_3mf(self):
         self.assertTrue(detect(write_3mf(self.d / "a.3mf"))[0])
-        self.assertFalse(detect(write_3mf(self.d / "b.3mf", {"Application": "BambuStudio-01"}))[0])
-        (self.d / "c.3mf").write_bytes(b"junk")
-        self.assertFalse(detect(self.d / "c.3mf")[0])
+        # a readable 3mf qualifies with or without MakerWorld metadata
+        self.assertEqual(detect(write_3mf(self.d / "b.3mf", {"Application": "BambuStudio-01"})),
+                         (True, "readable 3mf"))
+        self.assertTrue(detect(write_3mf(self.d / "c.3mf", {"Title": "", "Designer": ""}))[0])
+        (self.d / "junk.3mf").write_bytes(b"junk")
+        ok, reason = detect(self.d / "junk.3mf")
+        self.assertFalse(ok)
+        self.assertTrue(reason.startswith("not a readable 3mf"), reason)
+        self.assertNotIn("not a readable 3mf: not a readable 3mf", reason)
+        zip_no_model = write_zip(self.d / "nomodel.3mf", {"readme.txt": "x"})
+        self.assertFalse(detect(zip_no_model)[0])
 
-    def test_zip_with_mw_3mf(self):
-        z = write_zip(self.d / "x.zip", {"m/a.3mf": threemf_bytes(MW), "readme.txt": "hi"})
-        self.assertTrue(detect(z)[0])
+    def test_bare_stl_not_detected(self):
+        (self.d / "part.stl").write_bytes(b"solid x\nendsolid x\n")
+        self.assertEqual(detect(self.d / "part.stl"), (False, "not a .3mf or .zip"))
+
+    def test_zip_with_3mf_without_metadata(self):
+        # e.g. a Studio project with every MakerWorld field empty except an unrecorded one
+        bare = threemf_bytes({"Title": "", "Designer": "", "License": "", "DesignerUserId": "1"})
+        ok, reason = detect(write_zip(self.d / "x.zip", {"m/a.3mf": bare}))
+        self.assertTrue(ok)
+        self.assertEqual(reason, "zip with 1 model file(s) (.3mf)")
+        z = write_zip(self.d / "y.zip", {"m/a.3mf": threemf_bytes(MW), "readme.txt": "hi"})
+        self.assertEqual(detect(z), (True, "zip with 1 model file(s) (.3mf) and 1 companion file(s)"))
 
     def test_zip_stl_layout(self):
         stl = b"solid x\nendsolid x\n"
-        self.assertTrue(detect(write_zip(self.d / "Thing(maker)_stls.zip", {"a.stl": stl}))[0])
-        self.assertTrue(detect(write_zip(self.d / "plain.zip", {"obj_1_A.stl": stl, "obj_2_B.stl": stl}))[0])
-        # wrong layout or non-model members: not detected
-        self.assertFalse(detect(write_zip(self.d / "plain2.zip", {"a.stl": stl}))[0])
-        self.assertFalse(detect(write_zip(self.d / "App_stls.zip", {"a.stl": stl, "x.dylib": b"x"}))[0])
+        # the zip's name no longer matters, only its listing
+        for name in ("Thing(maker)_stls.zip", "plain.zip", "plain2.zip", "Thing_stls_v2.zip",
+                     "Thing_stls (x).zip", "Cable+Tidy+Box+-+No+Supports.zip"):
+            with self.subTest(name):
+                self.assertTrue(detect(write_zip(self.d / name, {"a.stl": stl}))[0])
+        ok, reason = detect(write_zip(self.d / "App_stls.zip", {"a.stl": stl, "x.dylib": b"x"}))
+        self.assertFalse(ok)
+        self.assertIn("neither models nor", reason)
+        self.assertIn("x.dylib", reason)
         self.assertFalse(detect(write_zip(self.d / "app.zip", {"App.app/Contents/x": b"x"}))[0])
 
     def test_zip_stl_layout_variants(self):
         stl = b"solid x\nendsolid x\n"
         yes = {
-            "Thing_stls (1).zip": {"a.stl": stl},           # Chrome duplicate download
-            "Thing_stls(2).zip": {"a.stl": stl},            # Firefox
-            "Thing_stls-2.zip": {"a.stl": stl},             # Safari
+            "Thing_stls (1).zip": {"a.stl": stl},
             "Thing_STEPS.zip": {"a.step": b"ISO"},
             "T_stls.zip": {"a.stl": stl, "README.md": "x", "LICENSE.txt": "x", "pic.jpg": b"x"},
             "objs.zip": {"obj_1_A.obj": b"v", "obj_1_A.mtl": b"m", "notes.txt": "x"},
             "nest.zip": {"Thing/obj_1_A.stl": stl, "Thing/obj_2_B.stl": stl},
+            "mixed.zip": {"obj_1_A.stl": stl, "b.STL": stl, "c.stp": b"ISO", "manual.pdf": b"%PDF"},
+            "mac.zip": {"a.3mf": threemf_bytes(MW), "__MACOSX/._a.3mf": b"x", ".DS_Store": b"x"},
         }
         for name, members in yes.items():
             with self.subTest(name):
                 self.assertTrue(detect(write_zip(self.d / name, members))[0])
         no = {
-            "only_docs_stls.zip": {"README.md": "x", "pic.png": b"x"},   # no mesh at all
-            "T_stls.zip.zip": {"a.stl": stl, "run.sh": b"x"},
-            "Thing_stls_v2.zip": {"a.stl": stl},           # suffix is not a dup counter
-            "Thing_stls (x).zip": {"a.stl": stl},
-            "mixed.zip": {"obj_1_A.stl": stl, "b.stl": stl},
-            "T2_stls.zip": {"a.stl": stl, "x.exe": b"x"},
+            "only_docs_stls.zip": ({"README.md": "x", "pic.png": b"x"}, "no model file"),
+            "T_stls.zip.zip": ({"a.stl": stl, "run.sh": b"x"}, "run.sh"),
+            "T2_stls.zip": ({"a.stl": stl, "x.exe": b"x"}, "x.exe"),
+            "py.zip": ({"a.stl": stl, "tool.py": b"x"}, "tool.py"),
+            "noext.zip": ({"a.stl": stl, "bin/thing": b"x"}, "bin/thing"),
+            "nested.zip": ({"a.stl": stl, "more.zip": b"PK"}, "more.zip"),
+            "many.zip": ({"a.stl": stl, **{f"x{i}.so": b"x" for i in range(5)}}, "(+2 more)"),
+            "empty.zip": ({}, "zip is empty"),
         }
-        for name, members in no.items():
+        for name, (members, why) in no.items():
             with self.subTest(name):
-                self.assertFalse(detect(write_zip(self.d / name, members))[0])
+                ok, reason = detect(write_zip(self.d / name, members))
+                self.assertFalse(ok)
+                self.assertIn(why, reason)
 
     def test_base_name_strips_dup_suffix(self):
         self.assertEqual(base_name(None, "Kitty(Designer)_stls (1)"), "Kitty-Designer")
         self.assertEqual(base_name(None, "Kitty_steps-3"), "Kitty")
 
+    def test_plus_separated_name(self):
+        self.assertEqual(base_name(None, "Cable+Tidy+Box+-+No+Supports"),
+                         "Cable-Tidy-Box-No-Supports")
+        self.assertEqual(base_name("", "A+B++C"), "A-B-C")
+
+    def test_zip_named_from_stem_when_title_empty(self):
+        bare = threemf_bytes({"Title": "", "Designer": "", "DesignerUserId": "1"})
+        src = write_zip(self.d / "Tidy+Box+-+No+Supports.zip", {"Tidy Box.3mf": bare})
+        state, proj = create_project(src, self.d / "out")
+        self.assertEqual((state, proj.name), ("created", "Tidy-Box-No-Supports"))
+        det = json.loads((proj / projects.MANIFEST).read_text())["detection"]
+        self.assertEqual((det["qualifies"], det["forced"], det["makerworld_metadata"]), (True, False, False))
+        self.assertTrue((proj / "files" / "Tidy Box.3mf").is_file())
+
     def test_force(self):
-        src = write_zip(self.d / "misc.zip", {"a.stl": b"solid"})
+        src = write_zip(self.d / "misc.zip", {"a.stl": b"solid", "setup.sh": b"echo"})
         with self.assertRaises(NotMakerWorld):
             create_project(src, self.d / "out")
         state, proj = create_project(src, self.d / "out", force=True)
@@ -191,7 +230,9 @@ class Create(unittest.TestCase):
         src = write_zip(self.d / "pack.zip", {
             "models/a.3mf": threemf_bytes(MW), "models/b.stl": b"solid", "doc/read me.pdf": b"%PDF",
             "tool.exe": b"MZ", "__MACOSX/._a": b"", "extras.zip": inner.getvalue(), "dir/": b""})
-        _, proj = create_project(src, self.dest)
+        with self.assertRaises(NotMakerWorld):         # .exe and a nested zip: detection says no
+            create_project(src, self.dest)
+        _, proj = create_project(src, self.dest, force=True)
         m = json.loads((proj / projects.MANIFEST).read_text())
         self.assertIn("files/models/a.3mf", m["files"])
         self.assertIn("files/extras/deep.stl", m["files"])
@@ -342,6 +383,304 @@ class WatcherTests(unittest.TestCase):
             rp.return_value = 0
             cli.main(["project", "create", str(src2), "-d", str(self.dest), "--render"])
             rp.assert_called_once()
+
+
+def threemf_with_config(cfg, name="Metadata/project_settings.config", meta=MW) -> bytes:
+    buf = io.BytesIO(threemf_bytes(meta))
+    with zipfile.ZipFile(buf, "a") as z:
+        z.writestr(name, cfg if isinstance(cfg, (bytes, str)) else json.dumps(cfg))
+    return buf.getvalue()
+
+
+PP = {"layer_height": "0.2", "post_process": ["/usr/bin/env python3 /opt/example/fix.py"]}
+
+
+class PostProcessHold(unittest.TestCase):
+    """A 3mf carrying a post-processing script is never imported without explicit approval."""
+
+    def setUp(self):
+        self.d = tmpdir()
+        self.addCleanup(shutil.rmtree, self.d)
+        self.dest = self.d / "out"
+
+    def projects_in_dest(self):
+        return [p.name for p in self.dest.iterdir() if not p.name.startswith(".")] \
+            if self.dest.exists() else []
+
+    def assert_nothing_created(self):
+        self.assertEqual(self.projects_in_dest(), [])
+        if self.dest.exists():
+            self.assertEqual([p for p in self.dest.iterdir() if p.name.startswith(projects.STAGING_PREFIX)], [])
+
+    def test_bare_3mf_held_force_does_not_bypass(self):
+        src = self.d / "a.3mf"
+        src.write_bytes(threemf_with_config(PP))
+        for force in (False, True):
+            with self.assertRaises(projects.PostProcessHeld) as cm:
+                create_project(src, self.dest, force=force)
+            self.assertIn("post-processing script found in Metadata/project_settings.config: "
+                          "/usr/bin/env python3 /opt/example/fix.py", str(cm.exception))
+            self.assert_nothing_created()
+
+    def test_approved_import_records_script_and_keeps_source(self):
+        src = self.d / "a.3mf"
+        src.write_bytes(threemf_with_config(PP))
+        state, proj = create_project(src, self.dest, allow_post_process=True)
+        self.assertEqual(state, "created")
+        self.assertEqual((proj / "source" / "a.3mf").read_bytes(), src.read_bytes())
+        pp = json.loads((proj / projects.MANIFEST).read_text())["post_process"]
+        self.assertEqual((pp["present"], pp["approved"]), (True, True))
+        self.assertEqual(pp["findings"][0]["command"], PP["post_process"][0])
+        self.assertEqual(pp["findings"][0]["config"], "Metadata/project_settings.config")
+
+    def test_empty_post_process_not_held(self):
+        for cfg in ({"post_process": []}, {"post_process": ["", "  "]}, {"post_process": ""}):
+            with self.subTest(cfg):
+                src = self.d / "e.3mf"
+                src.write_bytes(threemf_with_config(cfg, meta={**MW, "Title": json.dumps(cfg)}))
+                state, proj = create_project(src, self.dest)
+                self.assertEqual(state, "created")
+                pp = json.loads((proj / projects.MANIFEST).read_text())["post_process"]
+                self.assertEqual((pp["present"], pp["approved"], pp["findings"]), (False, False, []))
+
+    def test_in_zip(self):
+        src = write_zip(self.d / "Thing.zip", {"models/a.3mf": threemf_with_config(PP), "readme.txt": "x"})
+        with self.assertRaises(projects.PostProcessHeld) as cm:
+            create_project(src, self.dest)
+        self.assertIn("models/a.3mf:Metadata/project_settings.config", str(cm.exception))
+        self.assert_nothing_created()
+
+    def test_in_nested_zip(self):
+        inner = io.BytesIO()
+        with zipfile.ZipFile(inner, "w") as z:
+            z.writestr("deep.3mf", threemf_with_config(PP))
+        src = write_zip(self.d / "pack.zip", {"a.stl": b"solid", "inner.zip": inner.getvalue()})
+        with self.assertRaises(NotMakerWorld):                # nested zip: detection says no
+            create_project(src, self.dest)
+        with self.assertRaises(projects.PostProcessHeld) as cm:
+            create_project(src, self.dest, force=True)
+        self.assertIn("inner/deep.3mf", str(cm.exception))
+        self.assert_nothing_created()
+        state, proj = create_project(src, self.dest, force=True, allow_post_process=True)
+        self.assertEqual(state, "created")
+
+    def test_other_formats(self):
+        cases = {
+            "xml": ('<config><object id="1"><metadata key="post_process" value="/bin/sh x.sh"/>'
+                    '</object></config>', "Metadata/model_settings.config", "/bin/sh x.sh"),
+            "ini": ("; layer_height = 0.2\n; post_process = \"/usr/local/bin/tool\"\n",
+                    "Metadata/Slic3r_PE.config", "/usr/local/bin/tool"),
+            "process json": ({"inherits": "x", "post_process": "perl -e 1"},
+                             "Metadata/process_settings_1.config", "perl -e 1"),
+        }
+        for label, (cfg, name, cmd) in cases.items():
+            with self.subTest(label):
+                src = self.d / f"{label.replace(' ', '_')}.3mf"
+                src.write_bytes(threemf_with_config(cfg, name))
+                with self.assertRaises(projects.PostProcessHeld) as cm:
+                    create_project(src, self.dest)
+                self.assertEqual(cm.exception.findings[0]["command"], cmd)
+                self.assertEqual(cm.exception.findings[0]["config"], name)
+
+    def test_xml_empty_value_not_held(self):
+        src = self.d / "x.3mf"
+        src.write_bytes(threemf_with_config('<config><metadata key="post_process" value=""/></config>',
+                                            "Metadata/model_settings.config"))
+        self.assertEqual(create_project(src, self.dest)[0], "created")
+
+    def test_control_chars_escaped_and_truncated(self):
+        evil = "rm -rf ~\x1b[2K\rcreated Fake <- x.3mf\n" + "A" * 500
+        msg = projects.held_summary([{"file": None, "config": "c", "key": "post_process", "command": evil}])
+        self.assertNotIn("\x1b", msg)
+        self.assertNotIn("\r", msg)
+        self.assertNotIn("\n", msg)
+        self.assertIn("\\x1b[2K\\x0dcreated Fake", msg)
+        self.assertLess(len(msg), 300)
+
+    def test_watcher_holds_once_and_records_event(self):
+        inbox = self.d / "inbox"
+        inbox.mkdir()
+        logs, events = [], []
+        now = time.time() + 100
+        w = Watcher(inbox, self.dest, settle=5, log=logs.append, clock=lambda: now,
+                    force=True, events=lambda *a, **k: events.append((a, k)))
+        src = inbox / "Thing.3mf"
+        src.write_bytes(threemf_with_config(PP))
+        for _ in range(3):
+            w.poll()
+        os.utime(src, (time.time() - 30, time.time() - 30))   # touched: same content, new key
+        for _ in range(3):
+            c = w.poll()
+        held = [m for m in logs if m.startswith("held ")]
+        self.assertEqual(len(held), 1, logs)
+        self.assertTrue(held[0].startswith("held Thing.3mf: post-processing script found in "
+                                           "Metadata/project_settings.config: /usr/bin/env python3"))
+        self.assertIn("--allow-post-process", held[0])
+        self.assert_nothing_created()
+        (args, extra), = events
+        self.assertEqual(args[1:3], ("Thing.3mf", "held"))
+        self.assertIn("/usr/bin/env python3 /opt/example/fix.py", extra["script"])
+        self.assertIn("tulda project create", extra["approve"])
+        self.assertIn("--allow-post-process", extra["approve"])
+
+    def test_cli_exit_codes(self):
+        src = self.d / "a.3mf"
+        src.write_bytes(threemf_with_config(PP))
+        for extra, want in ((["--force"], 3), ([], 3), (["--allow-post-process"], 0)):
+            err, out = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = cli.main(["project", "create", str(src), "-d", str(self.dest), *extra])
+            self.assertEqual(code, want, err.getvalue())
+            if want:
+                self.assertIn("post-processing script found", err.getvalue())
+                self.assertIn("--allow-post-process", err.getvalue())
+                self.assertIn("nothing was imported", err.getvalue())
+                self.assert_nothing_created()
+            else:
+                self.assertIn("approved", out.getvalue())
+
+    def test_info_shows_script(self):
+        src = self.d / "a.3mf"
+        src.write_bytes(threemf_with_config(PP))
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            cli.main(["info", str(src)])
+        self.assertIn("WARNING: post-processing script in Metadata/project_settings.config", out.getvalue())
+        self.assertIn("/opt/example/fix.py", out.getvalue())
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cli.main(["info", "--json", str(src)])
+        self.assertEqual(json.loads(out.getvalue())["post_process"][0]["key"], "post_process")
+
+
+class BacklogBaseline(unittest.TestCase):
+    """backlog = "ignore": files already in a folder when it is first watched are never imported."""
+
+    def setUp(self):
+        self.d = tmpdir()
+        self.addCleanup(shutil.rmtree, self.d)
+        self.inbox, self.dest, self.sdir = self.d / "Downloads", self.d / "projects", self.d / "state"
+        self.inbox.mkdir()
+        self.logs = []
+        self.now = time.time() + 100
+
+    def watcher(self, adopt=False):
+        bl = projects.Baseline(self.sdir, self.inbox, adopt=adopt, log=self.logs.append)
+        return Watcher(self.inbox, self.dest, settle=5, log=self.logs.append,
+                       clock=lambda: self.now, baseline=bl)
+
+    def test_backlog_ignored_new_files_imported(self):
+        write_3mf(self.inbox / "old.3mf")
+        write_zip(self.inbox / "old_stls.zip", {"a.stl": b"solid"})
+        (self.inbox / "own-part.stl").write_bytes(b"solid")
+        w = self.watcher()
+        for _ in range(3):
+            c = w.poll()
+            self.assertEqual((c["created"], c["skipped"]), (0, 0))
+        self.assertFalse(self.dest.exists())
+        self.assertTrue(any("ignoring 3 file(s) already there" in m for m in self.logs))
+        bl = projects.baseline_file(self.sdir, self.inbox)
+        self.assertEqual(oct(bl.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(sorted(json.loads(bl.read_text())["files"]),
+                         ["old.3mf", "old_stls.zip", "own-part.stl"])
+        write_3mf(self.inbox / "new.3mf", {**MW, "Title": "Fresh"})
+        w.poll()
+        w.poll()
+        self.assertIn("created Fresh <- new.3mf", self.logs)
+        # a restart reads the same baseline: the backlog stays ignored
+        w2 = self.watcher()
+        w2.poll()
+        c = w2.poll()
+        self.assertEqual(c["created"], 0)
+        self.assertEqual(c["exists"], 1)                      # new.3mf seen again, not old ones
+
+    def test_old_mtime_and_partial_rename_count_as_new(self):
+        (self.inbox / "x.zip.partial").write_bytes(b"partial")
+        w = self.watcher()
+        w.poll()
+        # Taildrop style: finished by renaming the partial file, with an old mtime
+        part = self.inbox / "x.zip.partial"
+        write_zip(part, {"a.stl": b"solid"})
+        os.utime(part, (time.time() - 10 * 86400, time.time() - 10 * 86400))
+        part.rename(self.inbox / "x.zip")
+        w.poll()
+        w.poll()
+        self.assertTrue(any(m.startswith("created x <- x.zip") for m in self.logs), self.logs)
+
+    def test_replaced_file_same_name_counts_as_new(self):
+        write_3mf(self.inbox / "a.3mf")
+        w = self.watcher()
+        w.poll()
+        tmp = self.d / "a.3mf"
+        write_3mf(tmp, {**MW, "Title": "Replaced"})
+        os.replace(tmp, self.inbox / "a.3mf")             # new inode under the old name
+        w.poll()
+        w.poll()
+        self.assertIn("created Replaced <- a.3mf", self.logs)
+
+    def test_removed_entries_are_pruned(self):
+        write_3mf(self.inbox / "a.3mf")
+        w = self.watcher()
+        w.poll()
+        (self.inbox / "a.3mf").unlink()
+        w.poll()
+        self.assertEqual(json.loads(projects.baseline_file(self.sdir, self.inbox).read_text())["files"], {})
+
+    def test_adopted_folder_keeps_old_behaviour(self):
+        write_3mf(self.inbox / "a.3mf")
+        w = self.watcher(adopt=True)
+        w.poll()
+        w.poll()
+        self.assertTrue(any(m.startswith("created Example-Box") for m in self.logs))
+        self.assertTrue(any("watched before baselines existed" in m for m in self.logs))
+
+    def test_unlistable_folder_records_nothing(self):
+        w = self.watcher()
+        shutil.rmtree(self.inbox)
+        w.poll()
+        self.assertFalse(projects.baseline_file(self.sdir, self.inbox).exists())
+
+    def test_corrupt_baseline_is_rerecorded_not_imported(self):
+        write_3mf(self.inbox / "a.3mf")
+        bl = projects.baseline_file(self.sdir, self.inbox)
+        bl.parent.mkdir(parents=True)
+        bl.write_text("{not json")
+        w = self.watcher()
+        w.poll()
+        w.poll()
+        self.assertFalse(self.dest.exists())
+        self.assertTrue(any("unreadable" in m for m in self.logs))
+
+    def test_events_recorded(self):
+        events = []
+        w = self.watcher()
+        w.events = lambda *a: events.append(a)
+        write_3mf(self.inbox / "old.3mf")
+        w2 = Watcher(self.inbox, self.dest, settle=5, log=self.logs.append, clock=lambda: self.now,
+                     events=lambda *a: events.append(a))
+        w.poll()                                               # baseline: old.3mf ignored
+        write_zip(self.inbox / "app.zip", {"run.sh": b"x"})
+        (self.inbox / "bad.3mf").write_bytes(b"junk")
+        w.poll()
+        w.poll()
+        self.assertEqual(events[0][:3], ("Downloads", "", "backlog"))
+        self.assertIn(("Downloads", "app.zip", "skipped"), [e[:3] for e in events])
+        self.assertIn(("Downloads", "bad.3mf", "skipped"), [e[:3] for e in events])
+        self.assertNotIn("old.3mf", [e[1] for e in events])
+        del w2
+
+    def test_skip_and_create_each_log_one_line(self):
+        w = self.watcher()
+        w.poll()                                               # empty baseline
+        write_zip(self.inbox / "SomeApp.zip", {"App.app/Contents/MacOS/App": b"x"})
+        write_zip(self.inbox / "Tidy+Box.zip", {"Box.3mf": threemf_bytes({"Title": ""})})
+        for _ in range(4):
+            w.poll()
+        self.assertEqual([m for m in self.logs if "SomeApp.zip" in m],
+                         ["skip SomeApp.zip: zip contains 1 file(s) that are neither models nor "
+                          "readme/image/PDF companions: App.app/Contents/MacOS/App"])
+        self.assertEqual([m for m in self.logs if "Tidy+Box.zip" in m],
+                         ["created Tidy-Box <- Tidy+Box.zip"])
 
 
 @unittest.skipUnless(shutil.which("git"), "git not installed")

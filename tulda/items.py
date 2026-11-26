@@ -18,7 +18,8 @@ GROUP_PREFIX = "_g"
 DATE_PREFIX = "_d"
 VIEWER_PREFIX = "_v"       # /_v/<project>/<name>/ is the interactive viewer page
 STATIC_PREFIX = "_s"       # /_s/<path> is vendored viewer assets from the package
-RESERVED_DIRS = {GROUP_PREFIX, DATE_PREFIX, VIEWER_PREFIX, STATIC_PREFIX}
+WATCH_PREFIX = "_w"         # /_w/ is the read-only watcher activity page
+RESERVED_DIRS = {GROUP_PREFIX, DATE_PREFIX, VIEWER_PREFIX, STATIC_PREFIX, WATCH_PREFIX}
 # What a catalog row's primary file may be: a PNG (kind image / turntable poster) or a GLB (kind mesh).
 RENDER_EXTS = (".png", ".glb", ".htm")
 KINDS = ("image", "mesh", "turntable", "slice")

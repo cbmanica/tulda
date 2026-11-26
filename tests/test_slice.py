@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+import unittest.mock
 import zipfile
 from pathlib import Path
 
@@ -136,6 +137,71 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual((a.kind, a.produces), ("slice", "htm"))
         if not a.missing():
             self.assertEqual(plan_special(reg, Path("x.3mf"), "slice")[0].id, "slice-bambu")
+
+
+class PostProcessNeutralised(unittest.TestCase):
+    """Embedded post_process commands are removed from the copy that is sliced; never executed."""
+
+    def make(self, d: Path, cfg_bytes: bytes, name="Metadata/project_settings.config") -> Path:
+        src = d / "in.3mf"
+        with zipfile.ZipFile(src, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("3D/3dmodel.model", "<model/>")
+            z.writestr(name, cfg_bytes)
+            z.writestr("Metadata/plate_1.png", b"\x89PNG")
+        return src
+
+    def test_post_process_emptied(self):
+        from tulda.adapters.slicing import safe_copy
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            cfg = {"layer_height": "0.2", "post_process": ["/bin/sh -c 'echo never-run'"]}
+            src = self.make(d, json.dumps(cfg).encode())
+            changed = safe_copy(src, d / "copy.3mf")
+            self.assertEqual(changed, ["Metadata/project_settings.config"])
+            with zipfile.ZipFile(d / "copy.3mf") as z:
+                out = json.loads(z.read("Metadata/project_settings.config"))
+                self.assertEqual(out, {"layer_height": "0.2", "post_process": []})
+                self.assertEqual(z.read("Metadata/plate_1.png"), b"\x89PNG")
+                self.assertEqual(z.read("3D/3dmodel.model"), b"<model/>")
+            with zipfile.ZipFile(src) as z:                 # the source is untouched
+                self.assertIn(b"never-run", z.read("Metadata/project_settings.config"))
+
+    def test_clean_file_copied_unchanged(self):
+        from tulda.adapters.slicing import safe_copy
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            raw = json.dumps({"post_process": [], "note": "x"}).encode()
+            src = self.make(d, raw)
+            safe_copy(src, d / "copy.3mf")
+            with zipfile.ZipFile(d / "copy.3mf") as z:
+                self.assertEqual(json.loads(z.read("Metadata/project_settings.config"))["post_process"], [])
+
+    def test_non_json_config_mentioning_post_process_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            src = self.make(d, b'<config><metadata key="post_process" value="x"/></config>',
+                            "Metadata/model_settings.config")
+            calls = []
+            with unittest.mock.patch("subprocess.run", side_effect=lambda *a, **k: calls.append(a)):
+                r = bambu_slice(Context(src, d / "o.htm", {"bambu_bin": "/nonexistent"}, d / "w"))
+            self.assertFalse(r.ok)
+            self.assertIn("post_process", r.message)
+            self.assertEqual(calls, [])                     # the slicer was never started
+
+    def test_slicer_gets_neutralised_copy(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            src = self.make(d, json.dumps({"post_process": ["touch /nonexistent/x"]}).encode())
+            seen = {}
+
+            def fake_run(argv, **kw):
+                with zipfile.ZipFile(argv[-1]) as z:
+                    seen["pp"] = json.loads(z.read("Metadata/project_settings.config"))["post_process"]
+                raise OSError("no slicer in tests")
+            with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                r = bambu_slice(Context(src, d / "o.htm", {"bambu_bin": "/nonexistent"}, d / "w"))
+            self.assertFalse(r.ok)
+            self.assertEqual(seen["pp"], [])
 
 
 @unittest.skipUnless(os.access(DEFAULT_BIN, os.X_OK), "Bambu Studio not installed")

@@ -8,6 +8,9 @@ Service behaviour (com.tulda.watch):
   staging dir and renames, so it is all-or-nothing), no further file or render is started, and
   the process exits 0. A second signal aborts the current import (its staging dir is removed).
 - `--log-dir DIR` rotates and redirects stdout/stderr to DIR/watch.log and watch.err.log.
+- Every file handled (created / exists / skipped / error, plus one "backlog" entry when a folder's
+  baseline is recorded) is appended to `<state dir>/watch-events.jsonl` (tulda.watchevents),
+  which `tulda serve` shows at /_w/.
 - A small state file (`<state dir>/watch.json`: pid, config, last poll, last created, last
   error, per-directory status) lets `tulda service status watch` and `doctor` show health
   without parsing logs. It is never served over HTTP.
@@ -34,9 +37,10 @@ from datetime import datetime
 from pathlib import Path
 
 from . import watchconfig as wc
-from .projects import Watcher, git_publish_warning
+from .projects import Baseline, Watcher, git_publish_warning
+from .watchevents import EventLog
 
-COUNT_KEYS = ("created", "exists", "skipped", "errors", "waiting")
+COUNT_KEYS = ("created", "exists", "skipped", "held", "errors", "waiting")
 RETRY = 60.0               # seconds between re-tries of the real config while not on it
 
 
@@ -92,16 +96,43 @@ def pid_alive(pid) -> bool:
     return True
 
 
-def make_watcher(e: wc.WatchEntry, log, clock=time.time) -> Watcher:
+BASELINE_MARK = "backlog_baselines"     # in watch.json: written by a version that keeps baselines
+
+
+def adoptable_dirs(prior: dict | None) -> set:
+    """Folders a pre-baseline watcher already listed successfully (from the previous watch.json).
+    They get an empty baseline once, so upgrading never changes what they import."""
+    if not isinstance(prior, dict) or prior.get(BASELINE_MARK):
+        return set()
+    out = set()
+    for d in prior.get("dirs") or []:
+        if isinstance(d, dict) and isinstance(d.get("path"), str) and not d.get("error"):
+            out.add(d["path"])
+    return out
+
+
+def make_baseline(e: wc.WatchEntry, log, sdir: Path | None, adopt: set) -> Baseline | None:
+    if e.backlog != "ignore" or sdir is None:
+        return None
+    return Baseline(sdir, e.path, adopt=str(e.path) in adopt, log=log)
+
+
+def make_watcher(e: wc.WatchEntry, log, clock=time.time, sdir: Path | None = None,
+                 adopt: set = frozenset(), events=None) -> Watcher:
     return Watcher(e.path, e.destination, settle=e.settle, render=e.render, force=e.force,
-                   include=e.include, log=log, clock=clock)
+                   include=e.include, log=log, clock=clock,
+                   baseline=make_baseline(e, log, sdir, adopt), events=events)
 
 
 class WatchLoop:
-    """Polls each entry when due. `tick()` is one pass over the entries."""
+    """Polls each entry when due. `tick()` is one pass over the entries. With a state dir,
+    entries with backlog = "ignore" keep a per-folder baseline there (see projects.Baseline)."""
 
-    def __init__(self, cfg: wc.WatchConfig | None, log=print, clock=time.time):
+    def __init__(self, cfg: wc.WatchConfig | None, log=print, clock=time.time,
+                 sdir: Path | None = None, adopt: set = frozenset()):
         self.log, self.clock = log, clock
+        self.sdir, self.adopt = sdir, set(adopt)
+        self.events = EventLog(sdir, log).append if sdir is not None else None
         self.entries: dict = {}
         self.totals: dict = {}
         if cfg is not None:
@@ -113,7 +144,10 @@ class WatchLoop:
         old = self.entries
         self.entries = {}
         for e in (cfg.dirs if cfg else []):
-            w = old[e.key][0] if e.key in old else make_watcher(e, self.log, self.clock)
+            w = old[e.key][0] if e.key in old else make_watcher(e, self.log, self.clock,
+                                                                 self.sdir, self.adopt, self.events)
+            if (e.backlog == "ignore") != (w.baseline is not None):
+                w.baseline = make_baseline(e, self.log, self.sdir, self.adopt)
             w.settle, w.render, w.force = e.settle, e.render, e.force
             w.include = list(e.include) if e.include else None
             self.entries[e.key] = [w, e, old[e.key][2] if e.key in old else 0.0]
@@ -163,7 +197,8 @@ class WatchDaemon:
         self.cfg_path, self.sdir, self.persist = Path(cfg_path), Path(sdir), persist
         self.overrides = overrides or {}
         self.log, self.clock = log, clock
-        self.loop = WatchLoop(None, log=log, clock=clock)
+        self.loop = WatchLoop(None, log=log, clock=clock, sdir=self.sdir,
+                              adopt=adoptable_dirs(read_state(self.sdir)))
         self.cfg: wc.WatchConfig | None = None
         self.raw: bytes | None = None          # bytes of the config in use
         self.good_saved = False
@@ -171,7 +206,8 @@ class WatchDaemon:
         self.last_retry = 0.0
         self.state = {"pid": os.getpid(), "started": now_iso(), "config": str(self.cfg_path),
                       "mode": None, "since": None, "reason": None, "last_poll": None,
-                      "last_created": None, "last_error": None, "last_good": None, "dirs": []}
+                      "last_created": None, "last_error": None, "last_good": None, "dirs": [],
+                      BASELINE_MARK: 1}
 
     @property
     def mode(self) -> str | None:
@@ -197,7 +233,8 @@ class WatchDaemon:
         self.loop.apply(cfg)
         for e in (cfg.dirs if cfg else []):
             self.log(f"watching {e.path} every {e.interval:g}s -> {e.destination}"
-                     + (" (render)" if e.render else "") + (" (force)" if e.force else ""))
+                     + (" (render)" if e.render else "") + (" (force)" if e.force else "")
+                     + (" (backlog import)" if e.backlog == "import" else ""))
 
     def start_strict(self) -> None:
         """For --once: raises WatchConfigError on a bad config, no fallback."""
@@ -380,7 +417,7 @@ def state_lines(st: dict | None) -> list[str]:
     for d in st.get("dirs") or []:
         t = d.get("totals") or {}
         out.append(f"watching  : {d['path']} -> {d['destination']}  ("
-                   + ", ".join(f"{k} {t.get(k, 0)}" for k in ("created", "exists", "skipped", "errors"))
+                   + ", ".join(f"{k} {t.get(k, 0)}" for k in ("created", "exists", "skipped", "held", "errors"))
                    + ")")
         if d.get("error"):
             out.append(f"  problem : {d['error']}")
@@ -426,7 +463,7 @@ def check_config(path: Path, overrides: dict | None = None) -> int:
         print("no [[watch.dir]] entries; nothing would be watched")
     for e in cfg.dirs:
         print(f"  {e.path} -> {e.destination}  interval {e.interval:g}s, settle {e.settle:g}s, "
-              f"render {str(e.render).lower()}, force {str(e.force).lower()}"
+              f"render {str(e.render).lower()}, force {str(e.force).lower()}, backlog {e.backlog}"
               + (f", include {', '.join(e.include)}" if e.include else ""))
         why = wc.probe_dir(e.path)
         if why:

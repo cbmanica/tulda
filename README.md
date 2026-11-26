@@ -88,20 +88,52 @@ DesignModelId per 3mf, skipped members) and `LICENCE-NOTE.txt`. The name comes f
 letters (for example CJK titles) are kept; clashes get `-2`, `-3`. Importing the same file
 (same sha256) again reports `exists` and creates nothing.
 
-What counts as a MakerWorld download: a 3mf whose metadata has `DesignModelId`,
-`DesignProfileId`, `DesignRegion` or `Designer`; a zip containing such a 3mf; or a zip of
-STL/STEP/3MF/OBJ files (plus optional readme/licence text, PDFs, images or `.mtl`) whose name ends
-in `_stls`/`_steps` (a browser duplicate suffix like ` (1)` or `-2` is fine) or whose model files
-are all `obj_<n>_<name>.<ext>` (inferred from MakerWorld's STL download; may change). Anything else is
-skipped; `project create --force` imports it anyway. Zips are checked before anything is
+What counts as a MakerWorld download: tulda decides from what a file contains, not from its
+name or its MakerWorld metadata (which is often empty in real downloads).
+
+- A `.3mf` qualifies when it is a readable 3mf, with or without `DesignModelId`/`Designer`.
+- A `.zip` qualifies when, after the safety checks below, its file listing has at least one model
+  file (`.3mf`, `.stl`, `.step`, `.stp`, `.obj`) and every other member is a harmless companion:
+  readme/licence text (`.txt`, `.md`), PDF, images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`) or
+  `.mtl`. Anything else in the zip (programs, `.app` bundles, `.dylib`, scripts, nested zips,
+  unknown types) means it is skipped, so app downloads in the same folder are left alone.
+- Bare `.stl`/`.step` files are never picked up by `tulda watch` (you probably export your own
+  STLs into the same folder).
+
+Skipped files are logged as `skip <file>: <reason>`, for example `skip App.zip: zip contains 2
+file(s) that are neither models nor readme/image/PDF companions: App.app/Contents/MacOS/App, ...`.
+`project create --force` (or `force = true` for a watched folder) imports them anyway. The 3mf
+metadata (title, designer, licence, DesignModelId) is still recorded in `tulda-project.json` and
+`LICENCE-NOTE.txt` and names the project when it has a title; otherwise the file stem is used
+(`Some+Thing+-+v2.zip` becomes `Some-Thing-v2`). Zips are checked before anything is
 written: absolute or `..` paths, symlinks and encrypted members are refused, as are more than
-2000 members, more than 2 GiB uncompressed, or suspicious compression ratios; nested zips are
-unpacked one level deep.
+2000 members, more than 2 GiB uncompressed, or suspicious compression ratios. With `--force`,
+nested zips are unpacked one level deep.
+
+Post-processing scripts: a 3mf can carry `post_process`, shell commands that the Bambu Studio /
+OrcaSlicer / PrusaSlicer GUI runs after exporting G-code. If any 3mf in an import (bare, in the
+zip or in a nested zip) has a non-empty one in any `*.config` member (JSON, XML key/value or
+`key = value` format), the import stops and nothing is created. `project create` exits 3 and
+prints the script plus the command to approve it; the watcher logs `held <file>:
+post-processing script found in <member>: <command>` once per file content and shows the full
+script and the approval command on the activity page. Approve only after reading the script:
+
+    tulda project create <file> -d <destination> --allow-post-process
+
+`--force` does not imply it. An approved import still copies the source byte for byte and
+records the script and the approval under `post_process` in `tulda-project.json`. tulda itself
+never runs these scripts: the `slice` view blanks `post_process` in the temporary copy it
+slices (the Bambu Studio CLI refuses such files anyway). `tulda info file.3mf` prints any
+script it finds.
 
 `tulda watch` polls (no fswatch), waits until a file's size and mtime are stable and it is at
 least `--settle` seconds old, ignores `.crdownload`/`.part`/`.download`/`.tmp` files (and files
-with a `NAME.part` sibling), logs `created`/`exists`/`skip`/`error` per file and keeps going on
-errors. `--render` (off by default) also renders `.3mf`/`.scad`/`.stl` into the renders root; it is
+with a `NAME.part` sibling), logs `created`/`exists`/`skip`/`held`/`error` per file and keeps
+going on errors. With `--from-config` it also appends each outcome to
+`~/.local/state/tulda/watch-events.jsonl` (capped at 512 KiB, one older generation kept), which
+`tulda serve` shows at `/_w/` ("Watcher" button on the main page; JSON at `/api/watch`): newest
+first, with the watcher's running status and last poll. Folder and file names only; absolute
+paths in error text are reduced to their last component. `--render` (off by default) also renders `.3mf`/`.scad`/`.stl` into the renders root; it is
 off because rendering is slow and because the gallery shows renders to everyone who can reach
 `tulda serve`.
 
@@ -241,13 +273,15 @@ watcher is stopped (and vice versa).
        interval = 5                 # seconds between polls
        settle = 5                   # minimum file age before import
        render = false               # renders are visible to everyone who can reach `serve`
-       # force = false              # also import files without MakerWorld markers
+       # force = false              # also import files detection would skip
+       # backlog = "ignore"         # files already in a folder when it is first watched are
+                                    # never imported ("import" to take them too)
        # include = ["*.3mf", "*_stls.zip"]   # optional file-name globs
 
        [[watch.dir]]
        path = "~/MakerWorld-inbox"
        destination = "~/makerworld-projects"
-       # interval / settle / render / force / include may be overridden per entry
+       # interval / settle / render / force / include / backlog may be overridden per entry
 
    Paths must be absolute or start with `~`. Unknown keys, duplicate paths and a destination
    inside its watched path (or the reverse) are errors. Precedence: built-in defaults <
@@ -281,6 +315,16 @@ Behaviour:
   itself. Without a last-known-good copy it stays idle (no restart loop) until the file
   changes. `tulda config show-last-good [--diff]` shows that copy.
 - State for `status` lives in `~/.local/state/tulda/watch.json` (never served over HTTP).
+- Backlog (`backlog = "ignore"`, the default): the first time a folder can be listed, the
+  watcher records the files already in it (name, size and inode, not mtime) in
+  `~/.local/state/tulda/watch-baselines/` and logs `backlog <folder>: ignoring N file(s) already
+  there`. Those files are never imported; files that appear later are, including ones that
+  arrive with an old mtime (Taildrop, unzip) or by renaming a partial download, and a file that
+  replaces an old one under the same name. Adding `~/Downloads` thus does not import old
+  downloads. Set `backlog = "import"` for a folder to import what is already there. A folder
+  the service already watched before this feature existed keeps importing as before. Deleting
+  a folder's baseline file makes the next run record a fresh one. Ad-hoc `tulda watch DIR`
+  (without `--from-config`) keeps no baseline and handles every file.
 
 Watching `~/Downloads` instead (opt-in): the service needs Full Disk Access for the real
 interpreter binary (not the venv symlink). `tulda doctor` prints its path. System Settings >
@@ -334,6 +378,10 @@ supported; `func(ctx) -> Result`.
 - Every path is percent-decoded once, rejected if any segment starts with `.`,
   resolved, and required to stay under the root; symlinks that escape are
   refused. Only png, jpg, svg, json, stl files are served.
+- `/_w/` and `/api/watch` read the watcher's `watch.json` and `watch-events.jsonl` from the
+  state dir (read-only). File names there come from downloads and are untrusted: every value
+  is HTML-escaped, the page has no script, and anyone who can reach the server can see the
+  names of files dropped into watched folders.
 - Config files execute commands as you; treat `tulda.toml` like a Makefile.
 
 ## Bambu Studio and licensing

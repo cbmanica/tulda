@@ -13,22 +13,24 @@ Layout of DIR/<name>/:
   tulda-project.json            manifest: source name, sha256, time, per-3mf provenance
   LICENCE-NOTE.txt              licence summary + "MakerWorld page is authoritative" reminder
 
-Naming: the 3mf Title (first qualifying 3mf for a zip), else the file stem. Unicode letters and
+Naming: the 3mf Title (a 3mf with MakerWorld metadata first), else the file stem ('+' and
+other punctuation, as in URL-style names, become separators). Unicode letters and
 digits are kept (NFKC-normalised, so APFS/ext4 handle them and a Chinese title stays readable);
 everything else becomes a separator; runs of separators collapse to "-". If nothing is left,
 the stem is tried, then "project". Names compare case-insensitively (APFS default) and collide
 to "-2", "-3", ... The same source (by sha256) is never imported twice into one destination.
 
-MakerWorld detection (conservative; `--force` overrides for `project create`):
-  * .3mf: root-model metadata has DesignModelId, DesignProfileId, DesignRegion or Designer.
-    Application=BambuStudio alone does not count (that is every Studio project).
-  * .zip: contains such a .3mf (not looked for inside nested zips), or looks like MakerWorld's
-    STL/STEP download: at least one mesh/CAD member (.stl/.step/.stp/.3mf/.obj), every other
-    member a harmless companion (readme/licence text, PDF, images, .mtl), AND either the zip
-    stem ends in _stls/_steps (a browser duplicate suffix such as " (1)" or "-2" is allowed
-    after it) or every mesh/CAD member is named obj_<n>_<name>.<ext>.
-    This was inferred from observed downloads and may change; it is deliberately narrow so
-    that app bundles and other zips in a Downloads folder are skipped."""
+Detection (what `tulda watch` imports; `--force` overrides it for `project create`). It looks at
+what a file IS, not at its name or its MakerWorld metadata (that metadata is often empty):
+  * .3mf: qualifies when it is a readable 3mf (a zip with a root 3D model part that parses).
+  * .zip: after the safety checks below, the file listing must contain at least one model file
+    (MODEL_EXT: .3mf/.stl/.step/.stp/.obj) and nothing but model files and harmless companions
+    (COMPANION_EXT: readme/licence text, Markdown, PDF, images, .mtl). Anything else (programs,
+    .app bundles, libraries, scripts, nested zips, unknown types) means the zip is skipped.
+  * Bare .stl/.step files are never imported by the watcher (people export their own STLs into
+    the same folders); `project create` accepts only .3mf and .zip.
+Self-reported provenance (Title, Designer, License, DesignModelId, ...) is still recorded in the
+manifest and LICENCE-NOTE.txt; it only names the project, it never decides whether to import."""
 
 from __future__ import annotations
 
@@ -41,6 +43,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -71,7 +74,6 @@ MAX_RATIO = 200                      # compression ratio refused for members abo
 RATIO_MIN = 16 * 1024 ** 2
 MAX_NAME = 80                        # characters in a project name
 MW_ZIP_STEM = re.compile(r"_(stls?|steps?)(\s*\(\d+\)|-\d+)?$", re.I)  # + browser dup suffix
-MW_MEMBER = re.compile(r"obj_\d+_.+\.(stl|step|stp|3mf|obj)$", re.I)
 _SEP = re.compile(r"[\s\-]+")
 
 
@@ -85,6 +87,85 @@ class UnsafeArchive(ProjectError):
 
 class NotMakerWorld(ProjectError):
     code = 2
+
+
+class PostProcessHeld(ProjectError):
+    """A 3mf in the import carries a non-empty post-processing script (a shell command the
+    slicer GUI would run). Nothing is imported until the user approves it explicitly."""
+    code = 3
+
+    def __init__(self, src_name: str, findings: list[dict], sha: str):
+        self.src_name, self.findings, self.sha = src_name, findings, sha
+        super().__init__(f"{src_name}: {held_summary(findings)}")
+
+
+SHOW_CMD = 200                       # characters of a script shown in one-line messages
+
+
+def clean_cmd(text: str, limit: int = SHOW_CMD) -> str:
+    """One printable line: control/format characters escaped, long text truncated."""
+    out = []
+    for ch in str(text):
+        if ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp"):
+            out.append(f"\\x{ord(ch):02x}" if ord(ch) < 0x100 else f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    s = "".join(out)
+    return s if len(s) <= limit else s[:limit] + "..."
+
+
+def held_summary(findings: list[dict]) -> str:
+    f = findings[0]
+    where = f["config"] if not f.get("file") else f"{f['file']}:{f['config']}"
+    more = f" (+{len(findings) - 1} more)" if len(findings) > 1 else ""
+    return f"post-processing script found in {where}: {clean_cmd(f['command'])}{more}"
+
+
+MAX_SCRIPT_TEXT = 20000
+
+
+def held_script_text(findings: list[dict]) -> str:
+    """Every script in full (capped), each headed by where it was found."""
+    parts = []
+    for f in findings:
+        where = f["config"] if not f.get("file") else f"{f['file']}:{f['config']}"
+        parts.append(f"# {where} ({f['key']})\n{f['command']}")
+    text = "\n\n".join(parts)
+    return text if len(text) <= MAX_SCRIPT_TEXT else text[:MAX_SCRIPT_TEXT] + "\n... (truncated)"
+
+
+def approve_command(src: Path, dest: Path) -> str:
+    """The exact `project create` command that approves a held file (home-relative paths)."""
+    import shlex
+
+    def q(p: Path) -> str:
+        p = Path(p)
+        try:
+            return "~/" + shlex.quote(str(p.relative_to(Path.home())))
+        except ValueError:
+            return shlex.quote(str(p))
+    return f"tulda project create {q(src)} --destination {q(dest)} --allow-post-process"
+
+
+def script_findings(root: Path, files: list[str]) -> list[dict]:
+    """Post-processing scripts in every .3mf among `files` (paths relative to root)."""
+    from .mesh import MeshError
+    from .threemf import find_post_process
+    out = []
+    for rel in files:
+        if not rel.lower().endswith(".3mf"):
+            continue
+        try:
+            found = find_post_process(root / rel)
+        except MeshError:
+            continue
+        shown = rel.split("/", 1)[1] if "/" in rel else rel     # without source/ or files/
+        out += [dict(f, file=None if rel.startswith("source/") else shown) for f in found]
+    return out
 
 
 # ---- naming ------------------------------------------------------------------------------
@@ -223,47 +304,53 @@ def _copy_member(z: zipfile.ZipFile, info: zipfile.ZipInfo, target: Path) -> int
     return n
 
 
-def zip_looks_mw(stem: str, paths: list[PurePosixPath]) -> bool:
+def _ext_list(exts) -> str:
+    return "/".join(sorted(exts))
+
+
+def classify_listing(paths: list[PurePosixPath]) -> tuple[bool, str]:
+    """Decide from a zip's (already safety-checked) file listing alone. -> (qualifies, reason)."""
+    if not paths:
+        return False, "zip is empty"
     models = [p for p in paths if p.suffix.lower() in MODEL_EXT]
-    if not models or any(p.suffix.lower() not in MODEL_EXT | COMPANION_EXT for p in paths):
-        return False
-    return bool(MW_ZIP_STEM.search(stem)) or all(MW_MEMBER.fullmatch(p.name) for p in models)
+    other = [p for p in paths if p.suffix.lower() not in MODEL_EXT | COMPANION_EXT]
+    if other:
+        shown = ", ".join(str(p) for p in other[:3]) + (f" (+{len(other) - 3} more)" if len(other) > 3 else "")
+        return False, (f"zip contains {len(other)} file(s) that are neither models nor readme/"
+                       f"image/PDF companions: {shown}")
+    if not models:
+        return False, f"zip contains no model file ({_ext_list(MODEL_EXT)})"
+    kinds = _ext_list({p.suffix.lower() for p in models})
+    extra = len(paths) - len(models)
+    return True, (f"zip with {len(models)} model file(s) ({kinds})"
+                  + (f" and {extra} companion file(s)" if extra else ""))
 
 
 def detect(src: Path) -> tuple[bool, str]:
-    """-> (qualifies, reason). Reads only; nothing is written outside a private temp dir."""
+    """-> (qualifies, reason). Reads only; never extracts anything. The reason is shown in the
+    watch log as `skip <file>: <reason>` and stored in the manifest."""
     ext = src.suffix.lower()
     if ext == ".3mf":
-        prov = provenance_of(src)
-        if prov is None:
-            return False, "not a readable 3mf"
-        return (True, "3mf with MakerWorld metadata") if is_mw_provenance(prov) \
-            else (False, "3mf without MakerWorld metadata (DesignModelId/Designer...)")
+        from .mesh import MeshError
+        from .threemf import read_provenance
+        try:
+            read_provenance(src)
+        except MeshError as e:
+            msg = str(e)
+            return False, msg if msg.startswith("not a readable 3mf") else f"not a readable 3mf: {msg}"
+        return True, "readable 3mf"
     if ext != ".zip":
         return False, "not a .3mf or .zip"
     try:
         z = zipfile.ZipFile(src)
     except (zipfile.BadZipFile, OSError) as e:
         return False, f"not a readable zip ({e})"
-    with z, tempfile.TemporaryDirectory(prefix="tulda-detect-") as td:
+    with z:
         try:
             members = _scan(z, Budget(), src.name)
         except UnsafeArchive as e:
             return False, f"unsafe archive: {e}"
-        for info, p in members:
-            if p.suffix.lower() == ".3mf":
-                tmp = Path(td) / "probe.3mf"
-                try:
-                    _copy_member(z, info, tmp)
-                except (ProjectError, OSError):
-                    continue
-                ok = is_mw_provenance(provenance_of(tmp))
-                tmp.unlink()
-                if ok:
-                    return True, "zip containing a 3mf with MakerWorld metadata"
-        if zip_looks_mw(src.stem, [p for _, p in members]):
-            return True, "zip of STL/STEP files in MakerWorld download layout"
-    return False, "zip without MakerWorld markers"
+    return classify_listing([p for _, p in members])
 
 
 # ---- create -------------------------------------------------------------------------------
@@ -366,8 +453,14 @@ def licence_note(name: str, models: list[dict]) -> str:
 
 
 def create_project(src: Path, dest: Path, force: bool = False,
-                   now: datetime | None = None) -> tuple[str, Path]:
-    """-> ("created" | "exists", project dir). Raises NotMakerWorld / UnsafeArchive / ProjectError.
+                   now: datetime | None = None, allow_post_process: bool = False) -> tuple[str, Path]:
+    """-> ("created" | "exists", project dir). Raises NotMakerWorld / UnsafeArchive /
+    PostProcessHeld / ProjectError.
+    Every 3mf that would be imported (bare, in the zip, or in a nested zip) is checked for a
+    non-empty post-processing script; one found stops the import (PostProcessHeld, nothing is
+    left in dest) unless `allow_post_process` (never implied by `force`). An approved import still
+    byte-copies the source and records the scripts and the approval in the manifest; tulda never
+    runs them.
     Builds in a hidden staging dir inside dest and renames it into place, so a failure or kill
     never leaves a half project that looks complete. The name choice and rename happen under
     DEST/.tulda-project.lock with a second sha256 check, so concurrent importers (the watch
@@ -403,13 +496,22 @@ def create_project(src: Path, dest: Path, force: bool = False,
                       and m["provenance"].get("title")), None) \
             or next((m["provenance"].get("title") for m in models
                      if m["provenance"] and m["provenance"].get("title")), None)
+        scripts = script_findings(staging, files)
+        if scripts and not allow_post_process:
+            raise PostProcessHeld(src.name, scripts, sha)
         name = base_name(title, src.stem)
         now = now or datetime.now(timezone.utc)
         manifest = {
             "tulda_project": 1, "name": name,
             "created_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "source": {"filename": src.name, "sha256": sha, "size": src.stat().st_size, "type": ext[1:]},
-            "detection": {"makerworld": ok, "reason": reason, "forced": bool(force and not ok)},
+            "detection": {"qualifies": ok, "reason": reason, "forced": bool(force and not ok),
+                          "makerworld_metadata": any(is_mw_provenance(m["provenance"]) for m in models)},
+            "post_process": {"present": bool(scripts), "approved": bool(scripts and allow_post_process),
+                             "findings": scripts,
+                             **({"note": "Approved by the user with --allow-post-process. tulda never "
+                                         "runs these scripts; a slicer GUI would run them after "
+                                         "exporting G-code."} if scripts else {})},
             "files": files, "skipped": skipped, "models": models,
             "note": "Self-reported metadata; the MakerWorld page is authoritative. Do not redistribute.",
         }
@@ -610,16 +712,128 @@ def is_partial(p: Path) -> bool:
     return any(p.with_name(p.name + s).exists() for s in PARTIAL_EXT)
 
 
+BASELINE_DIR = "watch-baselines"
+BASELINE_VERSION = 1
+
+
+def baseline_file(state_dir: Path, src_dir: Path) -> Path:
+    key = hashlib.sha256(str(Path(src_dir).resolve()).encode("utf-8", "surrogateescape")).hexdigest()
+    return Path(state_dir) / BASELINE_DIR / f"{key[:24]}.json"
+
+
+class Baseline:
+    """The backlog of a watched folder (`backlog = "ignore"`): every file that was already in it
+    the first time tulda could list it. Those files are never imported; only files that appear
+    later are.
+
+    Stored once per folder as <state dir>/watch-baselines/<hash of the folder path>.json:
+    {"path", "recorded", "files": {name: [size, inode]}}. A file matches its entry only while
+    name, size and inode are all unchanged; mtime is deliberately not used, because Taildrop
+    and archive tools can give a brand-new file an old mtime, and a download finished by
+    renaming a partial file arrives under a new name (or, replacing an old file, a new inode).
+    Entries whose file has gone are pruned, so a later file of the same name counts as new.
+    A folder the previous run already watched (before baselines existed) is "adopted" with an
+    empty baseline, so upgrading never changes what an existing folder imports."""
+
+    def __init__(self, state_dir: Path, src_dir: Path, adopt: bool = False, log=print):
+        self.path = baseline_file(state_dir, src_dir)
+        self.src_dir, self.adopt, self.log = Path(src_dir), adopt, log
+        self.files: dict | None = None            # None until loaded or recorded
+
+    def _load(self) -> tuple[dict, str | None] | None:
+        try:
+            data = json.loads(self.path.read_text("utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as e:
+            self.log(f"warning: baseline {self.path} unreadable ({e}); recording a new one")
+            return None
+        files = data.get("files") if isinstance(data, dict) else None
+        if not isinstance(files, dict):
+            self.log(f"warning: baseline {self.path} malformed; recording a new one")
+            return None
+        return ({k: v for k, v in files.items() if isinstance(v, list) and len(v) == 2},
+                data.get("recorded"))
+
+    def _save(self) -> None:
+        data = {"tulda_watch_baseline": BASELINE_VERSION, "path": str(self.src_dir),
+                "recorded": self.recorded, "files": self.files}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+
+    def ensure(self, entries: list[Path]) -> int | None:
+        """Load the baseline, or record it from this listing on first sight.
+        -> number of files put in a newly recorded (not adopted) baseline, else None."""
+        if self.files is not None:
+            return None
+        loaded = self._load()
+        if loaded is not None:
+            self.files, self.recorded = loaded
+            return None
+        self.recorded = datetime.now().astimezone().isoformat(timespec="seconds")
+        self.files = {}
+        if not self.adopt:
+            for p in entries:
+                try:
+                    st = p.lstat()
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode):
+                    self.files[p.name] = [st.st_size, st.st_ino]
+        try:
+            self._save()
+        except OSError as e:
+            self.log(f"warning: cannot save baseline {self.path}: {e}; it is kept in memory only")
+        if self.adopt:
+            self.log(f"backlog {self.src_dir}: watched before baselines existed; existing files "
+                     f"are handled as before")
+            return None
+        self.log(f"backlog {self.src_dir}: ignoring {len(self.files)} file(s) already there "
+                 f"(backlog = \"ignore\"); only files that appear from now on are imported")
+        return len(self.files)
+
+    def contains(self, p: Path, st: os.stat_result) -> bool:
+        rec = (self.files or {}).get(p.name)
+        return bool(rec) and rec[0] == st.st_size and rec[1] == st.st_ino
+
+    def prune(self, present: set) -> None:
+        if not self.files:
+            return
+        gone = [n for n in self.files if n not in present]
+        if gone:
+            for n in gone:
+                del self.files[n]
+            try:
+                self._save()
+            except OSError as e:
+                self.log(f"warning: cannot save baseline {self.path}: {e}")
+
+
 class Watcher:
     """Polls one directory (not recursive). A candidate (.3mf/.zip, not hidden, no partial
     sibling such as Firefox's NAME.part) is processed once its size and mtime are unchanged
     between two polls and it is at least `settle` seconds old (with --once, only the age test
-    applies). Each (path, size, mtime) is handled once per run; sha256 idempotency covers runs."""
+    applies). Each (path, size, mtime) is handled once per run; sha256 idempotency covers runs.
+    With a `baseline` (see Baseline), files that were there when the folder was first watched
+    are ignored."""
 
     def __init__(self, src_dir: Path, dest: Path, settle: float = 5.0, render: bool = False,
-                 log=print, clock=time.time, force: bool = False, include=None):
+                 log=print, clock=time.time, force: bool = False, include=None,
+                 baseline: Baseline | None = None, events=None):
         self.src_dir, self.dest, self.settle, self.render = Path(src_dir), Path(dest), settle, render
         self.force, self.include = force, list(include) if include else None
+        self.baseline = baseline
+        self.events = events        # callable(folder, file, outcome, project, reason, **extra)
+        self.held: set = set()      # sha256 of files already reported as held this run
         self.log, self.clock = log, clock
         self.last: dict = {}
         self.done: set = set()
@@ -627,6 +841,14 @@ class Watcher:
         self.tcc_blocked = False
         self.last_created: dict | None = None
         self.last_error: str | None = None
+
+    def _event(self, file: str, outcome: str, project: str | None, reason: str | None,
+               **extra) -> None:
+        if self.events is not None:
+            try:
+                self.events(self.src_dir.name, file, outcome, project, reason, **extra)
+            except Exception as e:      # activity reporting must never stop imports
+                self.log(f"warning: cannot record watch event: {e}")
 
     def wanted(self, p: Path) -> bool:
         if p.suffix.lower() not in (".3mf", ".zip"):
@@ -650,10 +872,16 @@ class Watcher:
         if self.list_error:
             self.log(f"ok: {self.src_dir} is listable again")
         self.list_error, self.tcc_blocked = None, False
+        if self.baseline is not None:
+            n = self.baseline.ensure(entries)
+            if n is not None:
+                self._event("", "backlog", None, f"{n} file(s) already in the folder when watching "
+                            f"began are ignored (backlog = \"ignore\")")
+            self.baseline.prune({p.name for p in entries})
         return [p for p in entries if self.wanted(p) and p.is_file()]
 
     def poll(self, once: bool = False, should_stop=lambda: False) -> dict:
-        counts = {"created": 0, "exists": 0, "skipped": 0, "errors": 0, "waiting": 0}
+        counts = {"created": 0, "exists": 0, "skipped": 0, "held": 0, "errors": 0, "waiting": 0}
         seen = set()
         found = self.candidates()
         if found is None:
@@ -670,6 +898,8 @@ class Watcher:
             seen.add(str(p))
             if key in self.done:
                 continue
+            if self.baseline is not None and self.baseline.contains(p, st):
+                continue                         # backlog: was there before watching began
             prev = self.last.get(str(p))
             self.last[str(p)] = key
             old = self.clock() - st.st_mtime >= self.settle
@@ -680,17 +910,31 @@ class Watcher:
             self.done.add(key)
             try:
                 state, proj = create_project(p, self.dest, force=self.force)
+            except PostProcessHeld as e:
+                counts["held"] += 1
+                if e.sha not in self.held:           # same content: reported once per run
+                    self.held.add(e.sha)
+                    why = held_summary(e.findings)
+                    cmd = approve_command(p, self.dest)
+                    self.log(f"held {p.name}: {why}; not imported. Review it; to approve: {cmd}")
+                    self._event(p.name, "held", None, why, script=held_script_text(e.findings),
+                                approve=cmd)
+                continue
             except NotMakerWorld as e:
                 counts["skipped"] += 1
-                self.log(f"skip {p.name}: {str(e).split(': ', 1)[-1].replace(' (use --force to import anyway)', '')}")
+                why = str(e).split(": ", 1)[-1].replace(" (use --force to import anyway)", "")
+                self.log(f"skip {p.name}: {why}")
+                self._event(p.name, "skipped", None, why)
                 continue
             except Exception as e:     # one bad file must not stop the watcher
                 counts["errors"] += 1
                 self.last_error = f"{p.name}: {e}"
                 self.log(f"error {p.name}: {e}")
+                self._event(p.name, "error", None, str(e))
                 continue
             counts[state] += 1
             self.log(f"{state} {proj.name} <- {p.name}")
+            self._event(p.name, state, proj.name, None)
             if state == "created":
                 self.last_created = {"project": proj.name, "source": p.name,
                                      "time": datetime.now().astimezone().isoformat(timespec="seconds")}
@@ -729,15 +973,31 @@ def cmd_project_create(args) -> int:
     dest = Path(args.destination).expanduser()
     _warn_dest(dest)
     code = 0
+    allow = bool(getattr(args, "allow_post_process", False))
     for f in args.files:
         src = Path(f).expanduser()
         try:
-            state, proj = create_project(src, dest, force=args.force)
+            state, proj = create_project(src, dest, force=args.force, allow_post_process=allow)
+        except PostProcessHeld as e:
+            print(f"error: {e}; nothing was imported.\n"
+                  f"Review the script below. tulda never runs it, but a slicer GUI would run it "
+                  f"after exporting G-code. If it looks legitimate:\n  "
+                  f"{approve_command(src.resolve(), dest.resolve())}\n"
+                  + "\n".join("  | " + clean_cmd(ln, 500)
+                              for ln in held_script_text(e.findings).splitlines()),
+                  file=sys.stderr)
+            code = code or e.code
+            continue
         except ProjectError as e:
             print(f"error: {e}", file=sys.stderr)
             code = code or e.code
             continue
         print(f"{state} {proj}" + (" (same source already imported)" if state == "exists" else ""))
+        if state == "created" and allow:
+            pp = json.loads((proj / MANIFEST).read_text("utf-8")).get("post_process") or {}
+            if pp.get("present"):
+                print(f"  post-processing script recorded as approved in {MANIFEST}; "
+                      f"tulda never runs it")
         if state == "created" and args.render:
             code = render_project(proj) or code
     return code
@@ -800,7 +1060,11 @@ def add_project_parsers(sub) -> None:
     c.add_argument("files", nargs="+", metavar="file")
     c.add_argument("--destination", "-d", required=True, metavar="DIR",
                    help="user-local projects directory (keep it out of public repos)")
-    c.add_argument("--force", action="store_true", help="import even without MakerWorld markers")
+    c.add_argument("--force", action="store_true", help="import even when detection says no "
+                   "(unreadable 3mf, zip with non-model files)")
+    c.add_argument("--allow-post-process", action="store_true",
+                   help="approve importing a 3mf that carries a post-processing script (shell "
+                   "command a slicer GUI runs after export); --force does not imply this")
     c.add_argument("--render", action="store_true",
                    help="also render .3mf/.scad/.stl into the renders root (off by default)")
     c.set_defaults(fn=cmd_project_create)
@@ -837,5 +1101,5 @@ def add_project_parsers(sub) -> None:
     w.add_argument("--render", action=argparse.BooleanOptionalAction, default=None,
                    help="render new projects (off by default; overrides the config)")
     w.add_argument("--force", action=argparse.BooleanOptionalAction, default=None,
-                   help="import files without MakerWorld markers too (off by default)")
+                   help="import files that detection would skip too (off by default)")
     w.set_defaults(fn=cmd_watch)

@@ -19,6 +19,7 @@ multi-plate filtering, texture/colorgroup extensions."""
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import zipfile
@@ -501,3 +502,89 @@ def _material_groups(model: Model, o: Obj):
         key = mats[pidx] if mats and 0 <= pidx < len(mats) else ("", DEFAULT_COLOR, 1.0)
         groups.setdefault(key, []).append(i)
     return groups
+
+
+# ---- embedded post-processing scripts --------------------------------------------------------
+
+# Slicer settings whose values are shell commands the slicer GUI runs after exporting G-code
+# (Bambu Studio / OrcaSlicer / PrusaSlicer "Post-processing scripts"). Print-host settings
+# (print_host, printhost_*) only name upload targets and are not commands.
+SCRIPT_KEYS = ("post_process",)
+MAX_CONFIG_SCAN = 64 * 1024 * 1024      # bytes of one *.config member scanned
+_XML_KV = re.compile(r"""<[^<>]*\bkey\s*=\s*["']({k})["'][^<>]*\bvalue\s*=\s*(["'])(.*?)\2"""
+                     r"""|<[^<>]*\bvalue\s*=\s*(["'])(.*?)\4[^<>]*\bkey\s*=\s*["']({k})["']""",
+                     re.S)
+_INI_KV = re.compile(r"^[ \t;#]*({k})[ \t]*=[ \t]*(.*?)[ \t]*$", re.M)
+
+
+def _json_hits(obj, path: str = "") -> list[tuple[str, str]]:
+    out = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in SCRIPT_KEYS:
+                vals = v if isinstance(v, list) else [v]
+                text = "\n".join(str(x) for x in vals if x is not None and str(x).strip())
+                if text.strip():
+                    out.append((k, text))
+            elif isinstance(v, (dict, list)):
+                out += _json_hits(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            out += _json_hits(v)
+    return out
+
+
+def config_post_process(data: bytes) -> list[tuple[str, str]]:
+    """[(key, command text)] for non-empty script settings in one *.config member, in any of the
+    formats slicers write: JSON (Bambu/Orca project and process settings), XML metadata
+    key/value (model_settings.config) or `key = value` lines (PrusaSlicer). A mention of a
+    script key that none of these parsers can read is reported as unparsed (conservative)."""
+    names = [k.encode() for k in SCRIPT_KEYS]
+    if not any(n in data for n in names):
+        return []
+    text = data.decode("utf-8", "replace").lstrip("﻿")
+    try:
+        return _json_hits(json.loads(text))
+    except ValueError:
+        pass
+    keys = "|".join(re.escape(k) for k in SCRIPT_KEYS)
+    hits, recognised = [], False
+    for m in re.compile(_XML_KV.pattern.format(k=keys), re.S).finditer(text):
+        recognised = True
+        key, val = (m.group(1), m.group(3)) if m.group(1) else (m.group(6), m.group(5))
+        val = html.unescape(val)
+        if val.strip():
+            hits.append((key, val))
+    for m in re.compile(_INI_KV.pattern.format(k=keys), re.M).finditer(text):
+        recognised = True
+        val = m.group(2).strip().strip('"')
+        if val:
+            hits.append((m.group(1), val.replace("\\n", "\n")))
+    if not recognised:
+        hits.append((SCRIPT_KEYS[0], "(present in a format tulda cannot parse; inspect the file)"))
+    return hits
+
+
+def find_post_process(path) -> list[dict]:
+    """[{"config": member name, "key": ..., "command": text}] for every non-empty
+    post-processing script setting in a 3mf's *.config members. Raises MeshError when the file
+    is not a readable zip."""
+    try:
+        z = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError) as e:
+        raise MeshError(f"not a readable 3mf: {e}") from e
+    out = []
+    with z:
+        for info in z.infolist():
+            if info.is_dir() or not info.filename.lower().endswith(".config"):
+                continue
+            try:
+                with z.open(info) as f:
+                    data = f.read(MAX_CONFIG_SCAN)
+            except (zipfile.BadZipFile, RuntimeError, NotImplementedError, OSError, EOFError) as e:
+                out.append({"config": info.filename, "key": SCRIPT_KEYS[0],
+                            "command": f"(member cannot be read: {e}; inspect the file)"})
+                continue
+            for key, cmd in config_post_process(data):
+                out.append({"config": info.filename, "key": key, "command": cmd})
+    return out

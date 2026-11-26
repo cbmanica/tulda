@@ -30,7 +30,7 @@ class Base(unittest.TestCase):
         os.symlink(cls.tmp / "outside.png", cls.root / "proj" / "link.png")
         os.symlink(cls.tmp / "outdir", cls.root / "linkdir")
         os.symlink(cls.root / "proj" / "a.png", cls.root / "proj" / "inner.png")
-        cls.srv = make_server(cls.root, "127.0.0.1", 0)
+        cls.srv = make_server(cls.root, "127.0.0.1", 0, watch_state_dir=cls.tmp / "state")
         cls.port = cls.srv.server_address[1]
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
 
@@ -51,6 +51,93 @@ class Base(unittest.TestCase):
         body = r.read()
         c.close()
         return r.status, body, r
+
+
+class WatchPage(Base):
+    """/_w/ and /api/watch: read-only watcher activity, attacker-controlled names escaped."""
+
+    EVIL = '<img src=x onerror=alert(1)>"\'&.zip'
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from tulda.watchevents import EventLog
+        sdir = cls.tmp / "state"
+        sdir.mkdir()
+        (sdir / "watch.json").write_text(json.dumps({
+            "pid": os.getpid(), "started": "2026-01-01T10:00:00+00:00", "mode": "config",
+            "last_poll": "2026-01-01T10:05:00+00:00",
+            "last_created": {"time": "2026-01-01T10:01:00+00:00", "project": "Tidy-Box",
+                             "source": "Tidy+Box.zip"},
+            "last_error": {"time": "2026-01-01T10:02:00+00:00",
+                           "message": "x.zip: cannot write /Users/you/secret/dir/x.zip"},
+            "dirs": [{"path": "/Users/you/inbox-example", "destination": "/Users/you/projects-example",
+                      "error": None, "totals": {"created": 1, "exists": 0, "skipped": 1, "errors": 1}}]}))
+        log = EventLog(sdir).append
+        log("inbox-example", "", "backlog", None, "3 file(s) already in the folder when watching began")
+        log("inbox-example", "Tidy+Box.zip", "created", "Tidy-Box", None)
+        log("inbox-example", cls.EVIL, "skipped", None, "zip contains 1 file(s): <script>x</script>")
+        log("inbox-example", "x.zip", "error", None, "cannot write /Users/you/secret/dir/x.zip")
+        log("inbox-example", "held.3mf", "held", None,
+            "post-processing script found in Metadata/project_settings.config: /usr/bin/fix",
+            script="# Metadata/project_settings.config (post_process)\n/usr/bin/fix </pre><script>alert(1)</script>",
+            approve="tulda project create ~/inbox-example/held.3mf --destination ~/projects-example "
+                    "--allow-post-process")
+        (sdir / "watch-events.jsonl").open("a").write("not json\n{\"outcome\": \"bogus\"}\n")
+
+    def test_page_lists_events_newest_first_escaped(self):
+        s, b, r = self.req("GET", "/_w/")
+        self.assertEqual(s, 200)
+        self.assertIn("script-src", r.getheader("Content-Security-Policy"))
+        html = b.decode()
+        self.assertNotIn("<img src=x", html)
+        self.assertNotIn("<script>x", html)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;&quot;&#x27;&amp;.zip", html)
+        self.assertIn("Watcher running", html)
+        i_err, i_skip, i_created = (html.index("cannot write"), html.index("&lt;img"),
+                                    html.index("<td class=f>Tidy+Box.zip</td>"))
+        self.assertLess(i_err, i_skip)
+        self.assertLess(i_skip, i_created)
+        self.assertIn("imported", html)
+        self.assertIn("backlog ignored", html)
+        self.assertNotIn("/Users/you", html)                 # absolute paths reduced to names
+        self.assertIn("inbox-example", html)
+        s, _, _ = self.req("GET", "/_w/extra")
+        self.assertEqual(s, 404)
+
+    def test_api_json(self):
+        s, b, _ = self.req("GET", "/api/watch")
+        self.assertEqual(s, 200)
+        d = json.loads(b)
+        self.assertEqual([e["outcome"] for e in d["events"]],
+                         ["held", "error", "skipped", "created", "backlog"])
+        self.assertEqual(d["events"][3]["project"], "Tidy-Box")
+        self.assertEqual(d["events"][1]["reason"], "cannot write x.zip")
+        self.assertIn("/usr/bin/fix", d["events"][0]["script"])           # held: shown verbatim
+        self.assertTrue(d["status"]["running"])
+        self.assertNotIn("/Users/you", b.decode())
+
+    def test_held_shows_script_escaped_and_approve_command(self):
+        html = self.req("GET", "/_w/")[1].decode()
+        self.assertIn("held (needs review)", html)
+        self.assertIn("/usr/bin/fix &lt;/pre&gt;&lt;script&gt;alert(1)&lt;/script&gt;", html)
+        self.assertNotIn("<script>alert", html)
+        self.assertIn("tulda project create ~/inbox-example/held.3mf --destination "
+                      "~/projects-example --allow-post-process", html)
+
+    def test_read_only(self):
+        for m in ("POST", "PUT", "DELETE"):
+            self.assertEqual(self.req(m, "/_w/")[0], 405)
+            self.assertEqual(self.req(m, "/api/watch")[0], 405)
+
+    def test_main_page_links_watcher(self):
+        s, b, _ = self.req("GET", "/")
+        self.assertIn(b'href="/_w/"', b)
+
+    def test_missing_state(self):
+        from tulda.watchevents import display_events, watcher_status
+        self.assertIsNone(watcher_status(self.tmp / "nope"))
+        self.assertEqual(display_events(self.tmp / "nope"), [])
 
 
 class HttpSafety(Base):

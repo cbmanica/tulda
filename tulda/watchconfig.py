@@ -9,16 +9,24 @@ add a watch target. The file is only ever read here, never written.
     interval = 5                  # seconds between polls
     settle = 5                    # minimum file age before import
     render = false                # renders become visible to everyone who can reach `serve`
-    force = false                 # import files without MakerWorld markers too
+    force = false                 # import files that detection would skip too
+    backlog = "ignore"            # "ignore": files already there when a folder is first
+                                  # watched are never imported; "import": they are
     # include = ["*.3mf", "*_stls.zip"]   # optional file-name globs on top of detection
 
     [[watch.dir]]
     path = "~/MakerWorld-inbox"
     destination = "~/makerworld-projects"
-    # settle / interval / render / force / include override [watch] for this entry
+    # settle / interval / render / force / include / backlog override [watch] for this entry
 
 Precedence: built-in defaults < [watch] < [[watch.dir]] entry < command-line flags.
-Unknown keys are errors (typos are caught, not ignored)."""
+Unknown keys are errors (typos are caught, not ignored).
+
+backlog: the first time a folder can be listed, the watcher records its current files (name,
+size, inode) in <state dir>/watch-baselines/ and, with "ignore" (the default), never imports
+them; only files that appear afterwards are. Adding ~/Downloads therefore does not import years
+of old downloads. A folder the watcher already watched before this existed keeps its old
+behaviour (see projects.Baseline)."""
 
 from __future__ import annotations
 
@@ -31,7 +39,9 @@ from pathlib import Path
 
 from .errors import ConfigError
 
-DEFAULTS = {"interval": 5.0, "settle": 5.0, "render": False, "force": False, "include": None}
+DEFAULTS = {"interval": 5.0, "settle": 5.0, "render": False, "force": False, "include": None,
+            "backlog": "ignore"}
+BACKLOG_VALUES = ("ignore", "import")
 SETTING_KEYS = set(DEFAULTS)
 WATCH_KEYS = SETTING_KEYS | {"dir"}
 ENTRY_KEYS = SETTING_KEYS | {"path", "destination"}
@@ -65,6 +75,7 @@ class WatchEntry:
     render: bool = False
     force: bool = False
     include: list | None = None
+    backlog: str = "ignore"
 
     @property
     def key(self) -> tuple:
@@ -90,11 +101,8 @@ def config_path(explicit=None) -> Path:
 
 
 def state_dir(explicit=None) -> Path:
-    v = explicit or os.environ.get("TULDA_STATE_DIR")
-    if v:
-        return Path(v).expanduser()
-    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
-    return Path(base) / "tulda"
+    from .watchevents import default_state_dir
+    return default_state_dir(explicit)
 
 
 def last_good_path(sdir: Path) -> Path:
@@ -136,6 +144,10 @@ def _settings(d: dict, where: str) -> dict:
             if any("/" in x for x in v):
                 raise WatchConfigError(f"{where}: include globs match file names only (no '/')")
             out[k] = list(v)
+        elif k == "backlog":
+            if v not in BACKLOG_VALUES:
+                raise WatchConfigError(f"{where}: backlog must be \"ignore\" or \"import\", got {v!r}")
+            out[k] = v
     return out
 
 
@@ -305,7 +317,8 @@ def doctor_report(cfg_path: Path, renders_root: Path, python: str,
     lines.append(f"    service interpreter (grant Full Disk Access to this if needed): {python}")
     for e in cfg.dirs:
         lines.append(f"  {e.path} -> {e.destination}  (interval {e.interval:g}s, settle "
-                     f"{e.settle:g}s, render {str(e.render).lower()}, force {str(e.force).lower()}"
+                     f"{e.settle:g}s, render {str(e.render).lower()}, force {str(e.force).lower()}, "
+                     f"backlog {e.backlog}"
                      + (f", include {','.join(e.include)}" if e.include else "") + ")")
         why = probe_dir(e.path)
         if why == "TCC":

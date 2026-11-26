@@ -18,7 +18,11 @@ from .catalog import Catalog, CatalogError, Filters, valid_day
 from .gallery import render_index
 from .viewer import THREE_VERSION, render_viewer
 from .items import (DATE_PREFIX, STATIC_PREFIX, VIEWER_PREFIX, GROUP_ID, GROUP_PREFIX, RESERVED_DIRS, group_fields,  # noqa: F401
-                    is_project_dir, read_item)
+                    WATCH_PREFIX, is_project_dir, read_item)
+from .watchevents import default_state_dir, display_events, watcher_status
+from .watchpage import render_watch_page
+
+WATCH_EVENTS_SHOWN = 300
 
 
 ALLOWED_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -236,6 +240,16 @@ class Handler(BaseHTTPRequestHandler):
                 lim = PAGE_SIZE
             groups, nxt = cat.list_groups(f, lim, (q.get("cursor") or [None])[0])
             return self._json({"groups": groups, "next": nxt, "has_more": nxt is not None}, head)
+        if route == "/api/watch":
+            sdir = self.server.watch_state_dir
+            return self._json({"status": watcher_status(sdir),
+                               "events": display_events(sdir, WATCH_EVENTS_SHOWN)}, head)
+        if gparts and gparts[0] == WATCH_PREFIX:
+            if len(gparts) != 1:
+                return self._send(404, b"not found\n", head=head)
+            sdir = self.server.watch_state_dir
+            return self._send_page(render_watch_page(watcher_status(sdir),
+                                                     display_events(sdir, WATCH_EVENTS_SHOWN)), head)
         if route == "/search":
             f = parse_filters(q)
             return self._page({"kind": "search", "q": f.q or ""}, f, head)
@@ -317,7 +331,7 @@ class Server(ThreadingHTTPServer):
 
 
 def make_server(root: Path, host: str, port: int, allowed_hosts=(), verbose=False,
-                catalog: Catalog | None = None, log=print) -> Server:
+                catalog: Catalog | None = None, log=print, watch_state_dir: Path | None = None) -> Server:
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     srv = Server((host, port), Handler)
@@ -325,6 +339,8 @@ def make_server(root: Path, host: str, port: int, allowed_hosts=(), verbose=Fals
     srv.verbose = verbose
     srv.log = log
     srv.sync_min_interval = 2.0
+    # The watcher's state dir (watch.json, watch-events.jsonl): read only, for /_w/.
+    srv.watch_state_dir = Path(watch_state_dir) if watch_state_dir else default_state_dir()
     srv.catalog = catalog or Catalog(root, log=log)
     if catalog is None:
         srv.catalog.sync()

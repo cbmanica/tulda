@@ -2,6 +2,7 @@
 
 import errno
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -80,6 +81,7 @@ include = ["*.3mf"]
             "[watch]\nsettle = -1\n": "settle must be >= 0",
             '[watch]\nsettle = "5"\n': "must be a number",
             "[watch]\nrender = 1\n": "true or false",
+            '[watch]\nbacklog = "skip"\n': 'backlog must be "ignore" or "import"',
             "[watch]\ninclude = []\n": "include",
             '[watch]\ninclude = ["a/b.zip"]\n': "file names only",
             "watch = 3\n": "must be a table",
@@ -110,11 +112,14 @@ class FromConfig(unittest.TestCase):
     def setUp(self):
         self.d = tmpdir()
         self.addCleanup(shutil.rmtree, self.d)
+        env = mock.patch.dict(os.environ, {"TULDA_STATE_DIR": str(self.d / "state")})
+        env.start()
+        self.addCleanup(env.stop)
         self.inbox, self.dest = self.d / "inbox", self.d / "projects"
         self.inbox.mkdir()
         self.cfg = self.d / "config.toml"
-        self.cfg.write_text(f'[watch]\nsettle = 0\n[[watch.dir]]\npath = "{self.inbox}"\n'
-                            f'destination = "{self.dest}"\n')
+        self.cfg.write_text(f'[watch]\nsettle = 0\nbacklog = "import"\n[[watch.dir]]\n'
+                            f'path = "{self.inbox}"\ndestination = "{self.dest}"\n')
 
     def run_cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -132,10 +137,11 @@ class FromConfig(unittest.TestCase):
         self.assertTrue((self.dest / "Example-Box-v2-final" / "tulda-project.json").is_file())
 
     def test_include_and_force(self):
-        write_zip(self.inbox / "plain.zip", {"a.stl": b"solid"})
+        write_zip(self.inbox / "plain.zip", {"a.stl": b"solid", "setup.sh": b"echo"})
         write_3mf(self.inbox / "a.3mf")
         self.cfg.write_text(f'[watch]\nsettle = 0\n[[watch.dir]]\npath = "{self.inbox}"\n'
-                            f'destination = "{self.dest}"\nforce = true\ninclude = ["*.ZIP"]\n')
+                            f'destination = "{self.dest}"\nforce = true\ninclude = ["*.ZIP"]\n'
+                            f'backlog = "import"\n')
         code, out, _ = self.run_cli("watch", "--from-config", "--config", str(self.cfg), "--once")
         self.assertEqual(code, 0, out)
         self.assertIn("created plain <- plain.zip", out)
@@ -151,6 +157,89 @@ class FromConfig(unittest.TestCase):
         code, _, err = self.run_cli("watch", str(self.inbox))
         self.assertNotEqual(code, 0)
         self.assertIn("--destination", err)
+
+
+class Backlog(unittest.TestCase):
+    def setUp(self):
+        from tulda import watchd
+        self.watchd = watchd
+        self.d = tmpdir()
+        self.addCleanup(shutil.rmtree, self.d)
+        self.inbox, self.dest, self.sdir = self.d / "inbox", self.d / "projects", self.d / "state"
+        self.inbox.mkdir()
+        self.cfg = self.d / "config.toml"
+        self.logs = []
+
+    def config(self, extra=""):
+        self.cfg.write_text(f'[watch]\nsettle = 0\n[[watch.dir]]\npath = "{self.inbox}"\n'
+                            f'destination = "{self.dest}"\n{extra}')
+
+    def run_daemon(self, ticks=3):
+        now = [time.time() + 10]
+        dm = self.watchd.WatchDaemon(self.cfg, self.sdir, log=self.logs.append, clock=lambda: now[0])
+        dm.start()
+        for _ in range(ticks):
+            now[0] += 6
+            dm.tick()
+        return dm
+
+    def test_default_and_override(self):
+        self.config()
+        self.assertEqual(wc.load(self.cfg).dirs[0].backlog, "ignore")
+        self.config('backlog = "import"\n')
+        self.assertEqual(wc.load(self.cfg).dirs[0].backlog, "import")
+
+    def test_new_folder_backlog_not_imported(self):
+        write_3mf(self.inbox / "old.3mf")
+        self.config()
+        self.run_daemon()
+        self.assertFalse(self.dest.exists())
+        self.assertTrue(self.watchd.read_state(self.sdir)[self.watchd.BASELINE_MARK])
+
+    def test_import_option_imports_backlog(self):
+        write_3mf(self.inbox / "old.3mf")
+        self.config('backlog = "import"\n')
+        self.run_daemon()
+        self.assertTrue(any(m.startswith("created Example-Box") for m in self.logs))
+
+    def test_folder_from_pre_baseline_state_is_adopted(self):
+        write_3mf(self.inbox / "a.3mf")
+        self.config()
+        self.sdir.mkdir()
+        (self.sdir / "watch.json").write_text(json.dumps(
+            {"pid": 1, "dirs": [{"path": str(self.inbox), "error": None}]}))
+        self.run_daemon()
+        self.assertTrue(any(m.startswith("created Example-Box") for m in self.logs))
+
+    def test_state_from_baseline_version_or_error_is_not_adopted(self):
+        write_3mf(self.inbox / "a.3mf")
+        self.config()
+        self.sdir.mkdir()
+        for prior in ({"dirs": [{"path": str(self.inbox), "error": None}], "backlog_baselines": 1},
+                      {"dirs": [{"path": str(self.inbox), "error": "cannot list"}]}):
+            self.assertEqual(self.watchd.adoptable_dirs(prior), set())
+        (self.sdir / "watch.json").write_text(json.dumps(
+            {"dirs": [{"path": str(self.inbox), "error": "macOS privacy (TCC)"}]}))
+        self.run_daemon()
+        self.assertFalse(self.dest.exists())
+
+    def test_once_records_baseline_and_imports_nothing(self):
+        write_3mf(self.inbox / "old.3mf")
+        self.config()
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = cli.main(["watch", "--from-config", "--config", str(self.cfg), "--once",
+                             "--state-dir", str(self.sdir)])
+        self.assertEqual(code, 0)
+        self.assertIn("ignoring 1 file(s)", out.getvalue())
+        self.assertFalse(self.dest.exists())
+
+    def test_check_config_shows_backlog(self):
+        self.config()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(cli.main(["watch", "--check-config", str(self.cfg)]), 0)
+        self.assertIn("backlog ignore", out.getvalue())
 
 
 class Doctor(unittest.TestCase):
@@ -322,10 +411,12 @@ class DaemonState(unittest.TestCase):
 
     def test_state_file(self):
         from tulda import watchd
-        write_3mf(self.inbox / "a.3mf")
         now = [time.time() + 10]
         dm = watchd.WatchDaemon(self.cfg, self.sdir, log=self.logs.append, clock=lambda: now[0])
         dm.start()
+        dm.tick()                                      # records the (empty) backlog baseline
+        write_3mf(self.inbox / "a.3mf")                # arrives after watching began
+        now[0] += 6
         dm.tick()
         now[0] += 6
         dm.tick()
@@ -531,8 +622,9 @@ class Fallback(unittest.TestCase):
         self.assertEqual((self.sdir / "watch-config.last-good.toml").read_text(), self.good)
 
     def test_valid_reload_keeps_memory_of_handled_files(self):
-        write_3mf(self.inbox / "a.3mf")
         dm = self.daemon()
+        self.tick(dm)
+        write_3mf(self.inbox / "a.3mf")
         self.tick(dm, 3)
         created = [m for m in self.logs if m.startswith("created")]
         self.assertEqual(len(created), 1)

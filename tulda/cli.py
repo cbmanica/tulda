@@ -183,7 +183,8 @@ def cmd_info(args) -> int:
     import json
     from .items import PROVENANCE_CAVEAT, clean_provenance, provenance_lines
     from .mesh import MeshError
-    from .threemf import read_provenance
+    from .projects import clean_cmd
+    from .threemf import find_post_process, read_provenance
     code = 0
     for f in args.files:
         src = Path(f).expanduser()
@@ -201,8 +202,10 @@ def cmd_info(args) -> int:
             print(f"error: {src.name}: {e}", file=sys.stderr)
             code = 1
             continue
+        scripts = find_post_process(src)
         if args.json:
-            print(json.dumps({"source": src.name, "provenance": prov}, ensure_ascii=False))
+            print(json.dumps({"source": src.name, "provenance": prov, "post_process": scripts},
+                             ensure_ascii=False))
             continue
         print(src.name)
         for k, v in provenance_lines(clean_provenance(prov)):
@@ -210,6 +213,11 @@ def cmd_info(args) -> int:
         for k in ("origin", "design_model_id", "design_profile_id", "design_region", "application"):
             if prov.get(k):
                 print(f"  {k}: {prov[k]}")
+        for sc in scripts:
+            print(f"  WARNING: post-processing script in {sc['config']} ({sc['key']}); a slicer "
+                  f"GUI runs it after exporting G-code, tulda never does:")
+            for ln in sc["command"].splitlines() or [""]:
+                print(f"    | {clean_cmd(ln, 500)}")
     if code == 0 and not args.json:
         print(f"note: {PROVENANCE_CAVEAT}")
     return code

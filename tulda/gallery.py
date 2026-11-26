@@ -82,7 +82,7 @@ font-size:22px;padding:8px 14px;cursor:pointer}
 @media (max-width:600px){.pair{flex-direction:column;overflow:auto}.pair img{max-height:36vh}.grp{padding:0 8px}}
 </style></head><body>
 <header><div class="top"><h1><a href="/">tulda</a></h1>
-<form class="s" action="/search" method="get" role="search"><input type="search" name="q" id="q" placeholder="Search requests, sources, tags" aria-label="Search" maxlength="100"><button class="btn" type="submit">Search</button></form></div>
+<form class="s" action="/search" method="get" role="search"><input type="search" name="q" id="q" placeholder="Search requests, sources, tags" aria-label="Search" maxlength="100"><button class="btn" type="submit">Search</button></form><a class="btn" href="/_w/">Watcher</a></div>
 <nav id="nav" aria-label="Projects"></nav><details class="dates" id="dates"><summary>Browse by date (UTC)</summary><div id="dbody"></div></details>
 <div class="chips" id="chips"></div></header>
 <main><a class="btn" id="fresh" href="" hidden>New renders: reload</a>
