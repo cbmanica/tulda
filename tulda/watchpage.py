@@ -66,6 +66,9 @@ def _events_html(events: list[dict], anchors: dict | None = None) -> str:
         detail = _e(ev.get("project") if oc in ("created", "exists") else ev.get("reason"))
         if oc in ("created", "exists") and (anchors or {}).get(ev.get("project")):
             detail = f'<a href="#{_e(anchors[ev["project"]])}">{detail}</a>'
+        if isinstance(ev.get("repeats"), int) and ev["repeats"] > 0:
+            n = ev["repeats"]
+            detail += f' <span class=m>(reported again {n} more time{"" if n == 1 else "s"})</span>'
         if oc == "held":
             detail += ("<details open><summary>Post-processing script (review before approving; "
                        "tulda never runs it)</summary>"

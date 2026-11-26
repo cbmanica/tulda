@@ -748,6 +748,21 @@ def baseline_file(state_dir: Path, src_dir: Path) -> Path:
     return Path(state_dir) / BASELINE_DIR / f"{key[:24]}.json"
 
 
+def _write_json_600(path: Path, data: dict) -> None:
+    """Atomic JSON write, mode 600."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 class Baseline:
     """The backlog of a watched folder (`backlog = "ignore"`): every file that was already in it
     the first time tulda could list it. Those files are never imported; only files that appear
@@ -783,19 +798,9 @@ class Baseline:
                 data.get("recorded"))
 
     def _save(self) -> None:
-        data = {"tulda_watch_baseline": BASELINE_VERSION, "path": str(self.src_dir),
-                "recorded": self.recorded, "files": self.files}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=1)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, self.path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
-            raise
+        _write_json_600(self.path, {"tulda_watch_baseline": BASELINE_VERSION,
+                                    "path": str(self.src_dir), "recorded": self.recorded,
+                                    "files": self.files})
 
     def ensure(self, entries: list[Path]) -> int | None:
         """Load the baseline, or record it from this listing on first sight.
@@ -845,20 +850,100 @@ class Baseline:
                 self.log(f"warning: cannot save baseline {self.path}: {e}")
 
 
+HANDLED_DIR = "watch-handled"
+HANDLED_VERSION = 1
+HANDLED_OUTCOMES = ("created", "exists", "skipped", "held")
+
+
+def handled_file(state_dir: Path, src_dir: Path, dest: Path) -> Path:
+    raw = f"{Path(src_dir).resolve()}\0{Path(dest).resolve()}".encode("utf-8", "surrogateescape")
+    return Path(state_dir) / HANDLED_DIR / f"{hashlib.sha256(raw).hexdigest()[:24]}.json"
+
+
+class Handled:
+    """Files of a watched folder that already got a final outcome (created / exists / skipped /
+    held), kept across restarts so a restart does not handle (and report) them again.
+
+    Stored per (folder, destination) as <state dir>/watch-handled/<hash>.json:
+    {"path", "destination", "files": {name: [size, mtime_ns, inode, outcome, force]}}. A file
+    matches only while name, size, mtime and inode are all unchanged, so a changed or replaced
+    file is handled again. A "skipped" entry recorded without force does not match once force
+    is on. Errors are never recorded (they are retried after a restart). Entries whose file has
+    gone are pruned. An unreadable store is logged and started afresh: at worst a file is
+    reported once more, never lost."""
+
+    def __init__(self, state_dir: Path, src_dir: Path, dest: Path, log=print):
+        self.path = handled_file(state_dir, src_dir, dest)
+        self.src_dir, self.dest, self.log = Path(src_dir), Path(dest), log
+        self.files: dict | None = None            # None until loaded
+        self.warned = False
+
+    def _load(self) -> None:
+        if self.files is not None:
+            return
+        self.files = {}
+        try:
+            data = json.loads(self.path.read_text("utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as e:
+            self.log(f"warning: handled-files record {self.path} unreadable ({e}); starting afresh")
+            return
+        files = data.get("files") if isinstance(data, dict) else None
+        if not isinstance(files, dict):
+            self.log(f"warning: handled-files record {self.path} malformed; starting afresh")
+            return
+        self.files = {k: v for k, v in files.items()
+                      if isinstance(k, str) and isinstance(v, list) and len(v) == 5}
+
+    def _save(self) -> None:
+        try:
+            _write_json_600(self.path, {"tulda_watch_handled": HANDLED_VERSION,
+                                        "path": str(self.src_dir), "destination": str(self.dest),
+                                        "files": self.files})
+        except OSError as e:
+            if not self.warned:
+                self.log(f"warning: cannot save {self.path}: {e}; kept in memory only")
+            self.warned = True
+
+    def contains(self, p: Path, st: os.stat_result, force: bool = False) -> bool:
+        self._load()
+        rec = self.files.get(p.name)
+        if not rec or rec[:3] != [st.st_size, st.st_mtime_ns, st.st_ino]:
+            return False
+        return not (rec[3] == "skipped" and force and not rec[4])
+
+    def add(self, p: Path, st: os.stat_result, outcome: str, force: bool = False) -> None:
+        self._load()
+        self.files[p.name] = [st.st_size, st.st_mtime_ns, st.st_ino, outcome, bool(force)]
+        self._save()
+
+    def prune(self, present: set) -> None:
+        self._load()
+        gone = [n for n in self.files if n not in present]
+        if gone:
+            for n in gone:
+                del self.files[n]
+            self._save()
+
+
 class Watcher:
     """Polls one directory (not recursive). A candidate (.3mf/.zip, not hidden, no partial
     sibling such as Firefox's NAME.part) is processed once its size and mtime are unchanged
     between two polls and it is at least `settle` seconds old (with --once, only the age test
-    applies). Each (path, size, mtime) is handled once per run; sha256 idempotency covers runs.
+    applies). Each (path, size, mtime) is handled once per run; with `handled` (see Handled) also
+    across runs, so a restart neither re-handles nor re-reports an unchanged file. Without it,
+    sha256 idempotency still makes a rerun report "exists" instead of importing twice.
     With a `baseline` (see Baseline), files that were there when the folder was first watched
     are ignored."""
 
     def __init__(self, src_dir: Path, dest: Path, settle: float = 5.0, render: bool = False,
                  log=print, clock=time.time, force: bool = False, include=None,
-                 baseline: Baseline | None = None, events=None):
+                 baseline: Baseline | None = None, events=None, handled: Handled | None = None):
         self.src_dir, self.dest, self.settle, self.render = Path(src_dir), Path(dest), settle, render
         self.force, self.include = force, list(include) if include else None
         self.baseline = baseline
+        self.handled = handled
         self.events = events        # callable(folder, file, outcome, project, reason, **extra)
         self.held: set = set()      # sha256 of files already reported as held this run
         self.log, self.clock = log, clock
@@ -876,6 +961,10 @@ class Watcher:
                 self.events(self.src_dir.name, file, outcome, project, reason, **extra)
             except Exception as e:      # activity reporting must never stop imports
                 self.log(f"warning: cannot record watch event: {e}")
+
+    def _handled(self, p: Path, st: os.stat_result, outcome: str) -> None:
+        if self.handled is not None and outcome in HANDLED_OUTCOMES:
+            self.handled.add(p, st, outcome, self.force)
 
     def wanted(self, p: Path) -> bool:
         if p.suffix.lower() not in (".3mf", ".zip"):
@@ -905,6 +994,8 @@ class Watcher:
                 self._event("", "backlog", None, f"{n} file(s) already in the folder when watching "
                             f"began are ignored (backlog = \"ignore\")")
             self.baseline.prune({p.name for p in entries})
+        if self.handled is not None:
+            self.handled.prune({p.name for p in entries})
         return [p for p in entries if self.wanted(p) and p.is_file()]
 
     def poll(self, once: bool = False, should_stop=lambda: False) -> dict:
@@ -927,6 +1018,9 @@ class Watcher:
                 continue
             if self.baseline is not None and self.baseline.contains(p, st):
                 continue                         # backlog: was there before watching began
+            if self.handled is not None and self.handled.contains(p, st, self.force):
+                self.done.add(key)               # handled by an earlier run, unchanged
+                continue
             prev = self.last.get(str(p))
             self.last[str(p)] = key
             old = self.clock() - st.st_mtime >= self.settle
@@ -939,6 +1033,7 @@ class Watcher:
                 state, proj = create_project(p, self.dest, force=self.force)
             except PostProcessHeld as e:
                 counts["held"] += 1
+                self._handled(p, st, "held")
                 if e.sha not in self.held:           # same content: reported once per run
                     self.held.add(e.sha)
                     why = held_summary(e.findings)
@@ -949,6 +1044,7 @@ class Watcher:
                 continue
             except NotMakerWorld as e:
                 counts["skipped"] += 1
+                self._handled(p, st, "skipped")
                 why = str(e).split(": ", 1)[-1].replace(" (use --force to import anyway)", "")
                 self.log(f"skip {p.name}: {why}")
                 self._event(p.name, "skipped", None, why)
@@ -960,6 +1056,7 @@ class Watcher:
                 self._event(p.name, "error", None, str(e))
                 continue
             counts[state] += 1
+            self._handled(p, st, state)
             self.log(f"{state} {proj.name} <- {p.name}")
             self._event(p.name, state, proj.name, None)
             if state == "created":
