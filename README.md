@@ -70,6 +70,45 @@ members. To print it without rendering:
     tulda info model.3mf            # Licence: <licence>, Designer: <designer>, Title: <title>, ...
     tulda info --json model.3mf
 
+### Project folders for MakerWorld downloads
+
+For `.3mf`/`.zip` files you have **already downloaded yourself** (browser or Bambu Studio).
+tulda never downloads, never contacts MakerWorld and never builds a MakerWorld URL.
+
+    tulda project create ~/Downloads/<model>.3mf --destination ~/makerworld-projects
+    tulda project create <thing>_stls.zip -d ~/makerworld-projects [--force] [--render]
+    tulda watch ~/Downloads --destination ~/makerworld-projects [--once] [--interval 5] [--settle 5]
+
+Each project is `<destination>/<name>/` with `source/<original file>` (a copy; the original is
+never moved or deleted), `files/` (zip contents: model, image, PDF and text files only),
+`tulda-project.json` (source file name, sha256, time, self-reported licence/designer/title/
+DesignModelId per 3mf, skipped members) and `LICENCE-NOTE.txt`. The name comes from the 3mf
+`Title` or the file stem: brackets, quotes, slashes and other punctuation become `-`; Unicode
+letters (for example CJK titles) are kept; clashes get `-2`, `-3`. Importing the same file
+(same sha256) again reports `exists` and creates nothing.
+
+What counts as a MakerWorld download: a 3mf whose metadata has `DesignModelId`,
+`DesignProfileId`, `DesignRegion` or `Designer`; a zip containing such a 3mf; or a zip made only of
+STL/STEP/3MF/OBJ files whose name ends in `_stls`/`_steps` or whose members are all
+`obj_<n>_<name>.<ext>` (inferred from MakerWorld's STL download; may change). Anything else is
+skipped; `project create --force` imports it anyway. Zips are checked before anything is
+written: absolute or `..` paths, symlinks and encrypted members are refused, as are more than
+2000 members, more than 2 GiB uncompressed, or suspicious compression ratios; nested zips are
+unpacked one level deep.
+
+`tulda watch` polls (no fswatch), waits until a file's size and mtime are stable and it is at
+least `--settle` seconds old, ignores `.crdownload`/`.part`/`.download`/`.tmp` files (and files
+with a `NAME.part` sibling), logs `created`/`exists`/`skip`/`error` per file and keeps going on
+errors. `--render` (off by default) also renders `.3mf`/`.scad`/`.stl` into the renders root; it is
+off because rendering is slow and because the gallery shows renders to everyone who can reach
+`tulda serve`.
+
+Licences: MakerWorld's default Standard Digital File License forbids sharing, hosting or
+distributing the files or derivatives. Keep the destination user-local. tulda warns (and changes
+nothing) when the destination is inside a git work tree and not ignored; add the suggested
+`.gitignore` line before committing. The licence metadata is self-reported; the model's
+MakerWorld page is authoritative. Not legal advice.
+
 ### Catalog, navigation and management
 
 A SQLite catalog at `<renders root>/.tulda/catalog.db` (never served over HTTP) indexes the

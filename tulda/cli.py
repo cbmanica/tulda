@@ -1,4 +1,4 @@
-"""tulda command line: render, doctor, adapters, serve."""
+"""tulda command line: render, doctor, adapters, serve, project, watch."""
 
 from __future__ import annotations
 
@@ -325,6 +325,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_manage_parsers(sub, common)
     from .service import add_service_parser
     add_service_parser(sub)
+    from .projects import add_project_parsers
+    add_project_parsers(sub)
     return p
 
 
