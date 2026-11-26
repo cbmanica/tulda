@@ -486,8 +486,8 @@ class MigrationV4(unittest.TestCase):
         raw.execute("INSERT INTO renders(path,project,file,group_id,mtime) VALUES('p/x.png','p','x.png','20261124T100000Z-x',1)")
         raw.close()
         cat = Catalog(root, log=lambda m: None)
-        self.assertEqual(cat.stats()["schema_version"], 4)
-        self.assertEqual(cm.SCHEMA_VERSION, 4)
+        self.assertEqual(cat.stats()["schema_version"], cm.SCHEMA_VERSION)
+        self.assertGreaterEqual(cm.SCHEMA_VERSION, 4)
         g = cat.get_group("20261124T100000Z-x")
         self.assertTrue(g["starred"])
         self.assertEqual((g["items"][0]["kind"], g["items"][0]["info"], g["items"][0]["viewer_url"]),

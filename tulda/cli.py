@@ -154,6 +154,39 @@ def cmd_doctor(args) -> int:
     return 3 if bad else 0
 
 
+def cmd_info(args) -> int:
+    """Print a .3mf's self-reported provenance metadata (no network, nothing written)."""
+    import json
+    from .items import PROVENANCE_CAVEAT, clean_provenance, provenance_lines
+    from .mesh import MeshError
+    from .threemf import read_provenance
+    code = 0
+    for f in args.files:
+        src = Path(f).expanduser()
+        if src.suffix.lower() != ".3mf" or not src.is_file():
+            print(f"error: {src.name}: not a .3mf file", file=sys.stderr)
+            code = 2
+            continue
+        try:
+            prov = read_provenance(src)
+        except MeshError as e:
+            print(f"error: {src.name}: {e}", file=sys.stderr)
+            code = 1
+            continue
+        if args.json:
+            print(json.dumps({"source": src.name, "provenance": prov}, ensure_ascii=False))
+            continue
+        print(src.name)
+        for k, v in provenance_lines(clean_provenance(prov)):
+            print(f"  {k + ':':10} {v}")
+        for k in ("origin", "design_model_id", "design_profile_id", "design_region", "application"):
+            if prov.get(k):
+                print(f"  {k}: {prov[k]}")
+    if code == 0 and not args.json:
+        print(f"note: {PROVENANCE_CAVEAT}")
+    return code
+
+
 def resolve_hosts(explicit, tailscale: bool):
     """-> (hosts, auto) where auto maps 'lan'/'tailscale' to the auto-detected IP
     (None when not found). Explicit hosts replace the LAN default; --tailscale adds.
@@ -262,6 +295,10 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("doctor", help="check adapters and environment")
     common(d)
     d.set_defaults(fn=cmd_doctor)
+    i = sub.add_parser("info", help="print a .3mf's self-reported licence/designer/title metadata")
+    i.add_argument("files", nargs="+", metavar="file")
+    i.add_argument("--json", action="store_true", help="one JSON object per file")
+    i.set_defaults(fn=cmd_info)
     a = sub.add_parser("adapters", help="list adapters")
     common(a)
     a.set_defaults(fn=cmd_adapters)

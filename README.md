@@ -57,6 +57,19 @@ sidecar `info`: print time, layers, filament g/m per filament, extrusion per `; 
 and explicit yes/no for supports, brim, skirt and prime tower ("No supports needed" when none).
 The group page shows it as a text card. It slices with the settings embedded in the 3mf.
 
+Provenance: for every `.3mf` source, whatever views are rendered, the sidecar records the
+file's self-reported `<metadata>` from its root model (`Title`, `Designer`, `License`,
+`Copyright`/`CopyRight`, `Origin`, `DesignModelId`, `DesignProfileId`, `DesignRegion`,
+`Application`) under `provenance`. Item cards and the group page show Licence, Designer and
+Title; an empty licence shows as "unknown (not recorded in file)", which does not mean
+unlicensed. A `DesignModelId` adds "Source: MakerWorld model" (`FMI_...` ids: "Parametric Model
+Maker"). No MakerWorld URL is built or fetched; the metadata is self-reported and the model's
+MakerWorld page is authoritative. Parsing is stdlib-only and refuses DTDs/entities and oversized
+members. To print it without rendering:
+
+    tulda info model.3mf            # Licence: <licence>, Designer: <designer>, Title: <title>, ...
+    tulda info --json model.3mf
+
 ### Catalog, navigation and management
 
 A SQLite catalog at `<renders root>/.tulda/catalog.db` (never served over HTTP) indexes the

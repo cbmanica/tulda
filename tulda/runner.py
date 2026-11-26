@@ -213,6 +213,9 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
         }
         if view:
             sidecar["view"] = view
+        prov = source_provenance(src)
+        if prov is not None:
+            sidecar["provenance"] = prov
         if term.kind != "image":
             sidecar["kind"] = term.kind
             info = steps[-1].get("render_info")
@@ -239,6 +242,19 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
         return png
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def source_provenance(src: Path) -> dict | None:
+    """Self-reported licence/designer metadata of a .3mf source (None for other types).
+    Unreadable metadata never fails the render: it is recorded as an error string."""
+    if src.suffix.lower() != ".3mf":
+        return None
+    from .mesh import MeshError
+    from .threemf import read_provenance
+    try:
+        return read_provenance(src)
+    except MeshError as e:
+        return {"error": str(e)[:300]}
 
 
 def publish_frames(src: Path, dest: Path) -> Path:

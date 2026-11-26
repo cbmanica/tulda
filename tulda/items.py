@@ -9,6 +9,8 @@ import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .threemf import PROVENANCE_KEYS
+
 MAX_SIDECAR = 256 * 1024
 GROUP_ID = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 # /_g/<group id>/ and /_d/<date>/ are routes; project directories of these names are not listed.
@@ -21,6 +23,11 @@ RESERVED_DIRS = {GROUP_PREFIX, DATE_PREFIX, VIEWER_PREFIX, STATIC_PREFIX}
 RENDER_EXTS = (".png", ".glb", ".htm")
 KINDS = ("image", "mesh", "turntable", "slice")
 MAX_INFO = 24 * 1024
+PROVENANCE_KINDS = ("makerworld", "parametric")
+PROVENANCE_CAVEAT = ("Metadata is self-reported by the file and may be missing or wrong; "
+                     "the model's MakerWorld page is authoritative.")
+PROVENANCE_CAVEAT_SHORT = "self-reported; the MakerWorld page is authoritative"
+UNKNOWN_LICENCE = "unknown (not recorded in file)"
 
 
 def _strs(v, limit=50) -> list[str]:
@@ -29,6 +36,31 @@ def _strs(v, limit=50) -> list[str]:
 
 def _text(v, limit=300):
     return v[:limit] if isinstance(v, str) else None
+
+
+def clean_provenance(v) -> dict | None:
+    """A sidecar's `provenance` object reduced to known string fields (or None)."""
+    if not isinstance(v, dict) or v.get("error"):
+        return None
+    out = {k: _text(v.get(k), 500) or None for k in PROVENANCE_KEYS}
+    out["kind"] = v.get("kind") if v.get("kind") in PROVENANCE_KINDS else None
+    return out
+
+
+def provenance_lines(p: dict | None) -> list[list[str]]:
+    """[[label, value]] shown on cards and the group page. Plain text: the page renders it with
+    textContent. An empty licence is "unknown", never "unlicensed". No MakerWorld URL is built."""
+    if not p:
+        return []
+    lines = [["Licence", p.get("license") or UNKNOWN_LICENCE]]
+    for key, label in (("designer", "Designer"), ("title", "Title"), ("copyright", "Copyright")):
+        if p.get(key):
+            lines.append([label, p[key]])
+    if p.get("kind") == "parametric":
+        lines.append(["Source", "MakerWorld model (Parametric Model Maker)"])
+    elif p.get("kind") == "makerworld":
+        lines.append(["Source", "MakerWorld model"])
+    return lines
 
 
 def utc_day(ts: float) -> str:
@@ -120,4 +152,5 @@ def read_item(root: Path, pdir: Path, png: Path) -> dict | None:
                                and isinstance(steps[-1], dict) else {}).get("tool_version")),
         "source_sha256": _text(meta.get("source_sha256"), 80),
         "view": _text(meta.get("view"), 40), **group_fields(meta, st.st_mtime),
+        "provenance": clean_provenance(meta.get("provenance")),
     }

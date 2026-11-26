@@ -61,6 +61,10 @@ background:#8884;color:var(--acc);text-decoration:none;font-size:34px;font-weigh
 font-size:13px;line-height:1.35}.sl b{display:block;font-size:14px;margin-bottom:3px}.sl .y{color:#c2410c;font-weight:600}.sl .n{color:var(--acc);font-weight:600}
 .card img{display:block;width:100%;aspect-ratio:4/3;object-fit:contain;background:#8884}
 .card .m{padding:6px 8px;font-size:12px;color:var(--mut);overflow-wrap:anywhere}.card .m b{color:var(--fg)}
+.prov{margin:4px 0 0;font-size:12px;color:var(--mut);overflow-wrap:anywhere}.prov .pk{color:var(--mut)}.prov .pv{color:var(--fg)}
+.prov .cav{font-size:11px;font-style:italic;margin-top:2px}
+.provs{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 10px}.provs .prov{margin:0;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);flex:1 1 240px}
+.provs h3{font-size:13px;margin:0 0 3px;color:var(--fg);overflow-wrap:anywhere}
 .badge{position:absolute;top:6px;left:6px;background:var(--acc);color:#fff;font-size:12px;font-weight:600;
 padding:1px 8px;border-radius:10px}
 .empty{color:var(--mut);padding:24px 0}
@@ -147,6 +151,14 @@ function sliceBody(i){const s=i.info||{},sp=s.supports||{},a=s.adhesion||{},yn=b
  t.append(el('div','','brim '+yn(a.brim)+' | skirt '+yn(a.skirt)+' | prime tower '+yn(a.prime_tower)));
  (s.filaments||[]).forEach(f=>t.append(el('div','',(f.type||'filament '+f.id)+(f.color?' '+f.color:'')+': '+(f.used_g!=null?f.used_g+' g':'')+(f.used_m!=null?' / '+f.used_m+' m':''))));
  return t}
+// provenance: plain-text [label, value] lines from the server (self-reported 3mf metadata)
+function provBlock(lines,cav,head){const d=el('div','prov');if(head)d.append(el('h3','',head));
+ lines.forEach(([k,v])=>{const r=el('div','');r.append(el('span','pk',k+': '),el('span','pv',v));d.append(r)});
+ d.append(el('div','cav',cav));return d}
+function groupProv(g){const seen=new Set(),w=el('div','provs');
+ g.items.forEach(i=>{if(!i.prov||!i.prov.length)return;const k=(i.source||'')+'\n'+(i.source_sha256||'');
+  if(seen.has(k))return;seen.add(k);w.append(provBlock(i.prov,D.prov_caveat,i.source||i.file))});
+ return seen.size?w:null}
 function card(i){const c=el('div','card');c._i=i;c.tabIndex=0;c.setAttribute('role','button');
  if(i.kind==='mesh'){const t=link('t3d','3D',i.viewer_url);t.append(el('small','','open interactive viewer'));
   t.tabIndex=-1;t.onclick=e=>e.stopPropagation();c.append(t)}
@@ -155,6 +167,7 @@ function card(i){const c=el('div','card');c._i=i;c.tabIndex=0;c.setAttribute('ro
  if(i.view)c.append(el('span','badge',i.view+(i.kind==='turntable'&&i.info&&i.info.frames?' ('+i.info.frames+')':'')));
  const m=el('div','m');m.append(el('b','',i.source||i.file),el('div','',i.adapter+' / '+i.stage+(ctx.project?'':' / '+i.project)));
  if(i.tag)m.append(tagLink(i.tag,'src'));
+ if(i.prov&&i.prov.length)m.append(provBlock(i.prov,D.prov_caveat_short));
  c.append(m);const go=()=>viewable(i)?(location.href=i.viewer_url):i.kind==='slice'?(location.href=i.url):compare?pick(i):openCard(c);c.onclick=go;
  c.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();go()}};return c}
 function buildBody(root,g){if(root._built)return;root._built=true;const b=root.querySelector('.bd');
@@ -177,6 +190,7 @@ function groupEl(g,first){
  if(g.sources.length){const r=el('div','src');g.sources.forEach(x=>r.append(el('span','',x)));b.append(r)}
  if(g.cmd&&single)b.append(el('div','cmd',g.cmd));
  if(g.notes)b.append(el('div','note',g.notes));
+ const pv=groupProv(g);if(pv)b.append(pv);
  root._g=g;
  if(single){buildBody(root,g);return root}
  const open=g.id in fold?!!fold[g.id]:first;
@@ -228,8 +242,10 @@ nav();chips();dates();addGroups(loaded,!ctx.q);
 
 def render_index(data: dict) -> str:
     """data: ctx, groups, next, facets, dates, filters, qs, rev (see server.page_data)."""
+    from .items import PROVENANCE_CAVEAT, PROVENANCE_CAVEAT_SHORT
     ctx = data["ctx"]
-    blob = json.dumps(data)
+    blob = json.dumps({**data, "prov_caveat": PROVENANCE_CAVEAT,
+                       "prov_caveat_short": PROVENANCE_CAVEAT_SHORT})
     blob = blob.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     title = {"project": f" - {ctx.get('project')}", "group": f" - request {ctx.get('group')}",
              "day": f" - {ctx.get('day')}", "search": " - search"}.get(ctx["kind"], "")

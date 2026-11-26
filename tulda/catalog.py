@@ -27,7 +27,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .errors import TuldaError
-from .items import GROUP_ID, RENDER_EXTS, is_project_dir, read_item, render_url, viewer_url
+from .items import (GROUP_ID, RENDER_EXTS, clean_provenance, is_project_dir, provenance_lines,
+                    read_item, render_url, viewer_url)
 
 TAG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 DAY_RE = re.compile(r"^(\d{4})-(\d{2})(?:-(\d{2}))?$")
@@ -137,7 +138,13 @@ def _m4(c: sqlite3.Connection) -> None:
     c.execute("ALTER TABLE renders ADD COLUMN info TEXT")
 
 
-MIGRATIONS = [_m1, _m2, _m3, _m4]
+def _m5(c: sqlite3.Connection) -> None:
+    """Provenance: the sidecar's `provenance` object (self-reported 3mf metadata: licence,
+    designer, title, MakerWorld ids) as JSON. Backfilled by the forced re-sync after upgrade."""
+    c.execute("ALTER TABLE renders ADD COLUMN provenance TEXT")
+
+
+MIGRATIONS = [_m1, _m2, _m3, _m4, _m5]
 SCHEMA_VERSION = len(MIGRATIONS)
 
 
@@ -372,7 +379,8 @@ class Catalog:
                     affected.add(old[0])
                 c.execute("""INSERT INTO renders(path,project,file,group_id,seq,adapter,stage,view,source,
                     source_type,source_sha256,tool_version,git_sha,git_dirty,has_sidecar,size,mtime,
-                    sidecar_mtime,created_utc,kind,info,missing) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
+                    sidecar_mtime,created_utc,kind,info,provenance,missing)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
                     ON CONFLICT(path) DO UPDATE SET group_id=excluded.group_id, seq=excluded.seq,
                     adapter=excluded.adapter, stage=excluded.stage, view=excluded.view,
                     source=excluded.source, source_type=excluded.source_type,
@@ -380,14 +388,16 @@ class Catalog:
                     git_sha=excluded.git_sha, git_dirty=excluded.git_dirty,
                     has_sidecar=excluded.has_sidecar, size=excluded.size, mtime=excluded.mtime,
                     sidecar_mtime=excluded.sidecar_mtime, created_utc=excluded.created_utc,
-                    kind=excluded.kind, info=excluded.info, missing=0""",
+                    kind=excluded.kind, info=excluded.info, provenance=excluded.provenance, missing=0""",
                           (path, it["project"], it["file"], it["group_id"], it["seq"], it["adapter"],
                            it["stage"], it["view"], it["source"], it["source_type"], it["source_sha256"],
                            it["tool_version"], it["git_sha"],
                            None if it["git_dirty"] is None else int(it["git_dirty"]),
                            1 if it["json_url"] else 0, it["size"], it["mtime"], it["sidecar_mtime"],
                            it["created_utc"], it["kind"],
-                           json.dumps(it["info"], separators=(",", ":")) if it["info"] else None))
+                           json.dumps(it["info"], separators=(",", ":")) if it["info"] else None,
+                           json.dumps(it["provenance"], separators=(",", ":"))
+                           if it.get("provenance") else None))
                 groups.setdefault(it["group_id"], it)
             for gid, it in groups.items():
                 created = it["group_created_utc"]
@@ -673,6 +683,7 @@ class Catalog:
                 "group_id": r["group_id"], "seq": r["seq"], "size": r["size"],
                 "tag": source_tag(r["source"]), "kind": r["kind"],
                 "info": _load_info(r["info"]),
+                "prov": provenance_lines(clean_provenance(_load_info(r["provenance"]))),
                 "viewer_url": viewer_url(r["project"], r["file"]) if r["kind"] in ("mesh", "turntable") else None}
 
     def get_render(self, project: str, stem: str) -> dict | None:

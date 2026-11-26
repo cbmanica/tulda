@@ -301,6 +301,106 @@ def filament_color(cfg: Config, extruder: int) -> tuple[str, str]:
     return PALETTE[(extruder - 1) % len(PALETTE)], "palette"
 
 
+def main_model_name(z: zipfile.ZipFile) -> str:
+    """The root model part named by `_rels/.rels` (default `3D/3dmodel.model`)."""
+    main = "3D/3dmodel.model"
+    try:
+        rels = _read(z, "_rels/.rels", 1 << 20).decode("utf-8", "replace")
+        m = re.search(r'Target="([^"]+)"[^>]*Type="[^"]*3dmodel"|Type="[^"]*3dmodel"[^>]*Target="([^"]+)"', rels)
+        if m:
+            main = (m.group(1) or m.group(2)).lstrip("/")
+    except MeshError:
+        pass
+    return main
+
+
+# ---- provenance (self-reported <metadata> of the root model) ------------------------------
+
+# 3mf metadata name -> provenance key. Bambu writes both "Copyright" and "CopyRight" (one of them
+# often empty); the first non-empty one wins.
+PROVENANCE_FIELDS = {"Title": "title", "Designer": "designer", "License": "license",
+                     "Origin": "origin", "Copyright": "copyright", "CopyRight": "copyright",
+                     "DesignModelId": "design_model_id", "DesignProfileId": "design_profile_id",
+                     "DesignRegion": "design_region", "Application": "application"}
+PROVENANCE_KEYS = ("title", "designer", "license", "copyright", "origin", "design_model_id",
+                   "design_profile_id", "design_region", "application")
+MAX_META_VALUE = 500               # characters kept per field
+MAX_META_SCAN = 256 * 1024 * 1024  # uncompressed bytes of the root model streamed for metadata
+_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _clean(v: str | None) -> str | None:
+    v = _CTRL.sub("", v or "").strip()
+    return v[:MAX_META_VALUE] or None
+
+
+def source_kind(design_model_id: str | None) -> str | None:
+    """'parametric' for Parametric Model Maker outputs (FMI_ ids), 'makerworld' for other
+    MakerWorld design ids, None when there is no id. Never used to build a URL."""
+    if not design_model_id:
+        return None
+    return "parametric" if design_model_id.startswith("FMI_") else "makerworld"
+
+
+def read_provenance(path) -> dict:
+    """Self-reported provenance of a .3mf: {key: str | None} for PROVENANCE_KEYS plus `kind`
+    (see source_kind). Bambu writes metadata both before <resources> and after <build>, so the
+    whole root model is streamed, dropping finished elements (flat memory); DTDs/entities are
+    refused and the uncompressed size is capped (declared and actual). Raises MeshError when
+    the file is not a readable 3mf."""
+    try:
+        z = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError) as e:
+        raise MeshError(f"not a readable 3mf: {e}") from e
+    out: dict = dict.fromkeys(PROVENANCE_KEYS)
+    with z:
+        name = main_model_name(z)
+        try:
+            info = z.getinfo(name)
+        except KeyError:
+            raise MeshError(f"missing {name} in 3mf") from None
+        if info.file_size > MAX_META_SCAN:
+            raise MeshError(f"{name} is {info.file_size:,} bytes uncompressed (limit {MAX_META_SCAN:,})")
+        parser = ET.XMLPullParser(events=("start", "end"))
+        stack: list = []
+        read = 0
+        tail = b""
+        try:
+            with z.open(info) as f:
+                while read < MAX_META_SCAN:
+                    chunk = f.read(min(256 * 1024, MAX_META_SCAN - read))
+                    if not chunk:
+                        break
+                    probe = tail + chunk          # catch markers split across chunks
+                    if b"<!DOCTYPE" in probe or b"<!ENTITY" in probe:
+                        raise MeshError(f"{name}: DTD/entity declarations are not accepted")
+                    tail = chunk[-16:]
+                    read += len(chunk)
+                    parser.feed(chunk)
+                    for ev, el in parser.read_events():
+                        if ev == "start":
+                            stack.append(el)
+                            continue
+                        stack.pop()
+                        if len(stack) == 1 and _local(el.tag) == "metadata":
+                            key = PROVENANCE_FIELDS.get(el.get("name") or "")
+                            if key and not out[key]:
+                                out[key] = _clean(el.text)
+                        if stack:                 # drop finished elements: memory stays flat
+                            stack[-1].remove(el)
+                if read >= MAX_META_SCAN and f.read(1):
+                    raise MeshError(f"{name} exceeds {MAX_META_SCAN:,} bytes uncompressed")
+                parser.close()
+        except ET.ParseError as e:
+            # a truncated or malformed head: keep what was read before the error
+            if not any(out.values()):
+                raise MeshError(f"{name}: malformed XML ({e})") from e
+        except (zipfile.BadZipFile, OSError, EOFError, RuntimeError) as e:
+            raise MeshError(f"{name}: unreadable ({e})") from e
+    out["kind"] = source_kind(out["design_model_id"])
+    return out
+
+
 def load(path) -> Scene:
     """Read a .3mf into a Scene: one Part per mesh instance (per material)."""
     try:
@@ -308,14 +408,7 @@ def load(path) -> Scene:
     except (zipfile.BadZipFile, OSError) as e:
         raise MeshError(f"not a readable 3mf: {e}") from e
     with z:
-        main = "3D/3dmodel.model"
-        try:
-            rels = _read(z, "_rels/.rels", 1 << 20).decode("utf-8", "replace")
-            m = re.search(r'Target="([^"]+)"[^>]*Type="[^"]*3dmodel"|Type="[^"]*3dmodel"[^>]*Target="([^"]+)"', rels)
-            if m:
-                main = (m.group(1) or m.group(2)).lstrip("/")
-        except MeshError:
-            pass
+        main = main_model_name(z)
         model = Model()
         _parse_model(z, model, main, True)
         # production-extension component files
