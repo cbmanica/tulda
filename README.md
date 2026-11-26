@@ -214,8 +214,20 @@ renders so the pages stay fast with thousands of groups. PNGs and sidecars remai
 of truth; the DB is rebuilt automatically if missing or corrupt, and also holds your stars,
 tags, title edits, notes and trash flags. Design notes: [docs/PLAN.md](docs/PLAN.md).
 
-Web: two tabs at the top of every page, **Gallery** (everything below; the search box sits in
-its header, since search is a filter of the gallery) and **Watcher** (above). Group cards fold/unfold (newest open, state remembered per browser, "Expand
+Web: three tabs at the top of every page, **Gallery** (everything below; the search box sits in
+its header, since search is a filter of the gallery), **Projects** and **Watcher** (above).
+
+**Projects** (`/_p/`; JSON at `/api/projects`) lists every project: each folder of the renders
+root with renders in untrashed requests (name linking to its gallery page, a thumbnail of its
+newest PNG render, render and request counts, newest render time and that request's trigger,
+manual/web/watch), plus the project folders (holding `tulda-project.json`) in the
+`[[watch.dir]] destination`s and `[projects] default_destination` of the user config. A folder
+with the same name as a renders project adds its source, shown as `<destination name>/<folder>`
+(folder names only, never an absolute path), and its creation time; one with no renders yet is
+listed as "no renders yet". `?sort=date` (default: newest activity first, i.e. newest render,
+else creation time) or `?sort=name` (case-insensitive). Plain links and server-rendered HTML,
+so it works without JavaScript; times are UTC without it. `_p` is reserved, like `_g`, `_d`,
+`_v`, `_s` and `_w`: a renders folder of that name is not listed. Group cards fold/unfold (newest open, state remembered per browser, "Expand
 all"/"Collapse all"); "Load more requests"; `/_d/2026-11/` and `/_d/2026-11-24/` (UTC dates,
 picker under "Browse by date"); `/search?q=`; chips filter by adapter, stage, view, tag,
 starred, "show trash". JSON: `/api/groups`, `/api/dates`, `/api/latest`. Apart from the
@@ -455,7 +467,10 @@ supported; `func(ctx) -> Result`.
   fixed local-time script, and
   anyone who can reach the server can see the names of files dropped into watched folders and
   of imported projects.
-- Gallery and Watcher pages send `script-src` with sha256 hashes of their two fixed inline
+- `/_p/` and `/api/projects` read the catalog and list the folders of the configured project
+  destinations (names and manifest creation times only). Names are untrusted and HTML-escaped;
+  the page's only script is the fixed local-time script.
+- Gallery, Projects and Watcher pages send `script-src` with sha256 hashes of their two fixed inline
   scripts (the gallery script and the local-time script) and no `'unsafe-inline'`, so no other
   inline script can run; page data is a non-executed JSON block. The 3D viewer page keeps its own
   policy (same-origin modules from `/_s/`).

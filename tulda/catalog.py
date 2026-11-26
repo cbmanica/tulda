@@ -823,6 +823,34 @@ class Catalog:
             self._cache_put(key, hit)
         return hit
 
+    def project_summary(self) -> list[dict]:
+        """One row per project with present renders in untrashed groups (what its gallery page
+        shows): render and request counts, newest render mtime, the trigger of that render's
+        request, and the newest PNG (image or turntable poster) for a thumbnail. Cached per
+        catalog revision. Unordered; the caller sorts."""
+        key = ("projects", self.rev())
+        hit = self._cache.get(key)
+        if hit is None:
+            live = ("FROM renders r JOIN groups g ON g.id=r.group_id "
+                    "WHERE r.missing=0 AND g.trashed_utc IS NULL")
+            newest = ("SELECT project, file, trigger FROM (SELECT r.project, r.file, g.trigger, "
+                      "ROW_NUMBER() OVER (PARTITION BY r.project ORDER BY r.mtime DESC, r.file DESC) rn "
+                      f"{live}{{}}) WHERE rn=1")
+            with self.conn() as c:
+                rows = {r[0]: {"name": r[0], "renders": r[1], "requests": r[2], "mtime": r[3],
+                               "trigger": None, "thumb": None}
+                        for r in c.execute("SELECT r.project, count(*), count(DISTINCT r.group_id), "
+                                           f"max(r.mtime) {live} GROUP BY r.project")}
+                for r in c.execute(newest.format("")):
+                    if r[0] in rows:
+                        rows[r[0]]["trigger"] = r[2]
+                for r in c.execute(newest.format(" AND lower(r.file) LIKE '%.png'")):
+                    if r[0] in rows:
+                        rows[r[0]]["thumb"] = render_url(r[0], r[1])
+            hit = list(rows.values())
+            self._cache_put(key, hit)
+        return [dict(r) for r in hit]
+
     def _cache_put(self, key, val) -> None:
         with self._init_lock:
             self._cache = {k: v for k, v in self._cache.items() if k[0] != key[0]}
