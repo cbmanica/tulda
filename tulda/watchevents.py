@@ -110,10 +110,31 @@ def _read_lines(p: Path) -> list[dict]:
     return out
 
 
+def collapse_repeats(recs: list[dict]) -> list[dict]:
+    """Oldest-first records with repeated "exists" events folded away: an "exists" whose
+    previous event for the same folder and file was "created" or "exists" of the same project
+    adds one to that event's "repeats" count instead of being listed. Watchers without the
+    handled-files record (projects.Handled) reported an unchanged file again on every restart.
+    Only the returned list changes; the event file is never rewritten."""
+    out, last = [], {}
+    for r in recs:
+        k = (r.get("dir"), r.get("file"))
+        prev = last.get(k)
+        if (r.get("outcome") == "exists" and prev is not None
+                and prev.get("outcome") in ("created", "exists")
+                and prev.get("project") == r.get("project")):
+            prev["repeats"] = prev.get("repeats", 0) + 1
+            continue
+        r = dict(r)
+        last[k] = r
+        out.append(r)
+    return out
+
+
 def read_events(state_dir: Path, limit: int = 200) -> list[dict]:
-    """Newest first, at most `limit`."""
+    """Newest first, at most `limit`, repeats collapsed (collapse_repeats)."""
     recs = _read_lines(Path(state_dir) / OLD_EVENTS_NAME) + _read_lines(Path(state_dir) / EVENTS_NAME)
-    return list(reversed(recs))[:max(0, limit)]
+    return list(reversed(collapse_repeats(recs)))[:max(0, limit)]
 
 
 def redact(text) -> str | None:
@@ -135,6 +156,8 @@ def display_events(state_dir: Path, limit: int = 200) -> list[dict]:
         ev = {"time": _s(r.get("time")), "dir": _s(r.get("dir")), "file": _s(r.get("file")),
               "outcome": r["outcome"], "project": _s(r.get("project")),
               "reason": _s(r.get("reason")) if held else redact(_s(r.get("reason")))}
+        if isinstance(r.get("repeats"), int) and r["repeats"] > 0:
+            ev["repeats"] = r["repeats"]
         if held:
             ev["script"] = None if r.get("script") is None else str(r["script"])[:MAX_SCRIPT]
             ev["approve"] = None if r.get("approve") is None else str(r["approve"])[:MAX_FIELD * 4]

@@ -158,7 +158,12 @@ going on errors. With `--from-config` it also appends each outcome to
 `~/.local/state/tulda/watch-events.jsonl` (capped at 512 KiB, one older generation kept), which
 `tulda serve` shows in its "Watcher" tab (`/_w/`; JSON at `/api/watch`): newest
 first, with the watcher's running status and last poll. Folder and file names only; absolute
-paths in error text are reduced to their last component. `--render` (off by default) also renders `.3mf`/`.scad`/`.stl` into the renders root; it is
+paths in error text are reduced to their last component. With `--from-config` a file that got
+an outcome (anything but an error) is also remembered in `~/.local/state/tulda/watch-handled/`
+(name, size, mtime, inode; per folder and destination), so a restart does not handle or report
+it again; a new, changed or replaced file still is. Repeated `exists` events of one file from
+older versions are folded into one row ("reported again N more times") on the page; the event
+file is not rewritten. `--render` (off by default) also renders `.3mf`/`.scad`/`.stl` into the renders root; it is
 off because rendering is slow and because the gallery shows renders to everyone who can reach
 `tulda serve`.
 

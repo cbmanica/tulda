@@ -683,6 +683,74 @@ class BacklogBaseline(unittest.TestCase):
                          ["created Tidy-Box <- Tidy+Box.zip"])
 
 
+class HandledAcrossRuns(unittest.TestCase):
+    """projects.Handled: a restarted watcher neither re-handles nor re-reports unchanged files."""
+
+    def setUp(self):
+        self.d = tmpdir()
+        self.addCleanup(shutil.rmtree, self.d)
+        self.inbox, self.dest, self.sdir = self.d / "inbox", self.d / "projects", self.d / "state"
+        self.inbox.mkdir()
+        self.logs, self.events = [], []
+
+    def run_watcher(self, force=False):
+        h = projects.Handled(self.sdir, self.inbox, self.dest, log=self.logs.append)
+        w = Watcher(self.inbox, self.dest, settle=5, log=self.logs.append, force=force,
+                    clock=lambda: time.time() + 100, handled=h,
+                    events=lambda *a, **k: self.events.append(a[1:3]))
+        return w.run(once=True)
+
+    def test_held_file_reported_once_across_restarts(self):
+        src = self.inbox / "Thing.3mf"
+        src.write_bytes(threemf_with_config(PP))
+        self.assertEqual(self.run_watcher(force=True)["held"], 1)
+        self.assertEqual(self.run_watcher(force=True)["held"], 0)
+        self.assertEqual(self.events, [("Thing.3mf", "held")])
+        self.assertEqual([p for p in self.dest.iterdir() if not p.name.startswith(".")]
+                         if self.dest.exists() else [], [])   # the hold itself is unchanged
+
+    def test_other_destination_is_handled_separately(self):
+        write_3mf(self.inbox / "a.3mf")
+        self.assertEqual(self.run_watcher()["created"], 1)
+        self.assertEqual(self.run_watcher()["exists"], 0)
+        self.dest = self.d / "elsewhere"
+        self.assertEqual(self.run_watcher()["created"], 1)
+
+    def test_without_record_rerun_still_idempotent(self):
+        write_3mf(self.inbox / "a.3mf")
+        w = Watcher(self.inbox, self.dest, settle=5, log=self.logs.append,
+                    clock=lambda: time.time() + 100)
+        self.assertEqual(w.run(once=True)["created"], 1)
+        self.assertFalse((self.sdir / projects.HANDLED_DIR).exists())
+
+
+class CollapseRepeats(unittest.TestCase):
+    """Event files written before projects.Handled hold one "exists" per restart; the Watcher
+    page folds them into the first event without rewriting the file."""
+
+    def test_collapse(self):
+        from tulda import watchevents, watchpage
+        sdir = tmpdir()
+        self.addCleanup(shutil.rmtree, sdir)
+        ev = lambda f, o, p, t: {"time": t, "dir": "inbox", "file": f, "outcome": o,
+                                 "project": p, "reason": None}
+        recs = [ev("a.zip", "created", "A", "2026-01-01T00:00:00Z"),
+                ev("a.zip", "exists", "A", "2026-01-01T01:00:00Z"),
+                ev("b.zip", "skipped", None, "2026-01-01T01:30:00Z"),
+                ev("a.zip", "exists", "A", "2026-01-01T02:00:00Z"),
+                ev("c.zip", "exists", "A", "2026-01-01T03:00:00Z"),   # other file: kept
+                ev("a.zip", "exists", "B", "2026-01-01T04:00:00Z")]   # other project: kept
+        raw = "".join(json.dumps(r) + "\n" for r in recs)
+        (sdir / watchevents.EVENTS_NAME).write_text(raw)
+        shown = watchevents.display_events(sdir)
+        self.assertEqual([(e["file"], e["outcome"], e.get("repeats")) for e in shown],
+                         [("a.zip", "exists", None), ("c.zip", "exists", None),
+                          ("b.zip", "skipped", None), ("a.zip", "created", 2)])
+        self.assertEqual((sdir / watchevents.EVENTS_NAME).read_text(), raw)   # file untouched
+        html = watchpage.render_watch_page(None, shown)
+        self.assertIn("reported again 2 more times", html)
+
+
 @unittest.skipUnless(shutil.which("git"), "git not installed")
 class GitWarning(unittest.TestCase):
     def setUp(self):

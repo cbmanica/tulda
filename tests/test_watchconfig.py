@@ -14,7 +14,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from tests.test_projects import MW, write_3mf, write_zip
+from tests.test_projects import MW, threemf_bytes, write_3mf, write_zip
 from tulda import cli, projects, watchconfig as wc
 from tulda.watchconfig import WatchConfigError
 
@@ -233,6 +233,82 @@ class Backlog(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("ignoring 1 file(s)", out.getvalue())
         self.assertFalse(self.dest.exists())
+
+    def events(self):
+        p = self.sdir / "watch-events.jsonl"
+        return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+
+    def test_restart_does_not_rereport_unchanged_file(self):
+        """Regression: every restart recorded another "exists" for the same imported zip."""
+        self.config()
+        self.run_daemon(1)                                    # empty folder: baseline recorded
+        write_zip(self.inbox / "Some+Thing.zip", {"Thing.3mf": threemf_bytes(MW)})
+        self.run_daemon()
+        self.assertEqual([(e["file"], e["outcome"]) for e in self.events()],
+                         [("", "backlog"), ("Some+Thing.zip", "created")])
+        for _ in range(3):                                    # service restarts
+            self.logs.clear()
+            self.run_daemon()
+            self.assertEqual(len(self.events()), 2, self.events())
+            self.assertFalse([m for m in self.logs if "Some+Thing.zip" in m], self.logs)
+        # a genuinely new file with the same content is still reported
+        shutil.copy(self.inbox / "Some+Thing.zip", self.inbox / "copy.zip")
+        self.run_daemon()
+        self.assertEqual(self.events()[-1]["file"], "copy.zip")
+        self.assertEqual(self.events()[-1]["outcome"], "exists")
+        self.assertEqual(len(self.events()), 3)
+
+    def test_restart_after_adoption_and_changed_file(self):
+        """Adopted (pre-baseline) folder: imported once, silent on restart, re-handled on change."""
+        f = write_zip(self.inbox / "a.zip", {"Thing.3mf": threemf_bytes(MW)})
+        self.config()
+        self.sdir.mkdir()
+        (self.sdir / "watch.json").write_text(json.dumps(
+            {"pid": 1, "dirs": [{"path": str(self.inbox), "error": None}]}))
+        self.run_daemon()
+        self.run_daemon()
+        self.assertEqual([e["outcome"] for e in self.events()], ["created"])
+        write_zip(f, {"Thing.3mf": threemf_bytes({**MW, "Title": "Changed"})})
+        os.utime(f, (time.time() - 60, time.time() - 60))
+        self.run_daemon()
+        self.assertEqual([(e["outcome"], e["project"]) for e in self.events()],
+                         [("created", "Example-Box-v2-final"), ("created", "Changed")])
+
+    def test_skips_not_rereported_but_errors_retried(self):
+        self.config()
+        self.run_daemon(1)
+        write_zip(self.inbox / "App.zip", {"App.app/x": b"x"})
+        (self.inbox / "bad.zip").write_bytes(b"not a zip")
+        with mock.patch.object(projects, "create_project", side_effect=OSError("disk full")):
+            self.run_daemon()
+        outcomes = sorted(e["outcome"] for e in self.events() if e["file"])
+        self.assertEqual(outcomes, ["error", "error"])
+        self.run_daemon()                                     # errors are retried
+        self.run_daemon()                                     # skips are not re-reported
+        outcomes = sorted(e["outcome"] for e in self.events() if e["file"])
+        self.assertEqual(outcomes, ["error", "error", "skipped", "skipped"])
+        # force turned on: an earlier skip is re-evaluated
+        self.config("force = true\n")
+        self.run_daemon()
+        self.assertEqual([e["outcome"] for e in self.events() if e["file"] == "App.zip"][-1],
+                         "created")
+
+    def test_handled_record_is_private_and_pruned(self):
+        self.config()
+        self.run_daemon(1)
+        f = write_zip(self.inbox / "a.zip", {"Thing.3mf": threemf_bytes(MW)})
+        self.run_daemon()
+        rec = projects.handled_file(self.sdir, self.inbox, self.dest)
+        self.assertEqual(oct(rec.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(list(json.loads(rec.read_text())["files"]), ["a.zip"])
+        f.unlink()
+        self.run_daemon(1)
+        self.assertEqual(json.loads(rec.read_text())["files"], {})
+        rec.write_text("{broken")                             # unreadable: started afresh
+        write_zip(self.inbox / "a.zip", {"Thing.3mf": threemf_bytes(MW)})
+        self.run_daemon()
+        self.assertTrue(any("unreadable" in m for m in self.logs))
+        self.assertEqual(self.events()[-1]["outcome"], "exists")
 
     def test_check_config_shows_backlog(self):
         self.config()

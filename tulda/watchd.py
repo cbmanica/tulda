@@ -11,6 +11,9 @@ Service behaviour (com.tulda.watch):
 - Every file handled (created / exists / skipped / error, plus one "backlog" entry when a folder's
   baseline is recorded) is appended to `<state dir>/watch-events.jsonl` (tulda.watchevents),
   which `tulda serve` shows at /_w/.
+- Files that got a final outcome (created / exists / skipped / held) are remembered per folder in
+  `<state dir>/watch-handled/` (projects.Handled), so a restart does not handle or report an
+  unchanged file again; a new, changed or replaced file still gets its event.
 - A small state file (`<state dir>/watch.json`: pid, config, last poll, last created, last
   error, per-directory status) lets `tulda service status watch` and `doctor` show health
   without parsing logs. It is never served over HTTP.
@@ -36,7 +39,7 @@ import time
 from pathlib import Path
 
 from . import watchconfig as wc
-from .projects import Baseline, Watcher, git_publish_warning
+from .projects import Baseline, Handled, Watcher, git_publish_warning
 from .timefmt import ts_key, utc_from_ts, utc_iso
 from .watchevents import EventLog
 
@@ -121,7 +124,9 @@ def make_watcher(e: wc.WatchEntry, log, clock=time.time, sdir: Path | None = Non
                  adopt: set = frozenset(), events=None) -> Watcher:
     return Watcher(e.path, e.destination, settle=e.settle, render=e.render, force=e.force,
                    include=e.include, log=log, clock=clock,
-                   baseline=make_baseline(e, log, sdir, adopt), events=events)
+                   baseline=make_baseline(e, log, sdir, adopt), events=events,
+                   handled=Handled(sdir, e.path, e.destination, log=log) if sdir is not None
+                   else None)
 
 
 class WatchLoop:
