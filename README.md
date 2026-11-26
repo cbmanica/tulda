@@ -89,9 +89,10 @@ letters (for example CJK titles) are kept; clashes get `-2`, `-3`. Importing the
 (same sha256) again reports `exists` and creates nothing.
 
 What counts as a MakerWorld download: a 3mf whose metadata has `DesignModelId`,
-`DesignProfileId`, `DesignRegion` or `Designer`; a zip containing such a 3mf; or a zip made only of
-STL/STEP/3MF/OBJ files whose name ends in `_stls`/`_steps` or whose members are all
-`obj_<n>_<name>.<ext>` (inferred from MakerWorld's STL download; may change). Anything else is
+`DesignProfileId`, `DesignRegion` or `Designer`; a zip containing such a 3mf; or a zip of
+STL/STEP/3MF/OBJ files (plus optional readme/licence text, PDFs, images or `.mtl`) whose name ends
+in `_stls`/`_steps` (a browser duplicate suffix like ` (1)` or `-2` is fine) or whose model files
+are all `obj_<n>_<name>.<ext>` (inferred from MakerWorld's STL download; may change). Anything else is
 skipped; `project create --force` imports it anyway. Zips are checked before anything is
 written: absolute or `..` paths, symlinks and encrypted members are refused, as are more than
 2000 members, more than 2 GiB uncompressed, or suspicious compression ratios; nested zips are

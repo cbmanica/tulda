@@ -100,6 +100,36 @@ class Detection(unittest.TestCase):
         self.assertFalse(detect(write_zip(self.d / "App_stls.zip", {"a.stl": stl, "x.dylib": b"x"}))[0])
         self.assertFalse(detect(write_zip(self.d / "app.zip", {"App.app/Contents/x": b"x"}))[0])
 
+    def test_zip_stl_layout_variants(self):
+        stl = b"solid x\nendsolid x\n"
+        yes = {
+            "Thing_stls (1).zip": {"a.stl": stl},           # Chrome duplicate download
+            "Thing_stls(2).zip": {"a.stl": stl},            # Firefox
+            "Thing_stls-2.zip": {"a.stl": stl},             # Safari
+            "Thing_STEPS.zip": {"a.step": b"ISO"},
+            "T_stls.zip": {"a.stl": stl, "README.md": "x", "LICENSE.txt": "x", "pic.jpg": b"x"},
+            "objs.zip": {"obj_1_A.obj": b"v", "obj_1_A.mtl": b"m", "notes.txt": "x"},
+            "nest.zip": {"Thing/obj_1_A.stl": stl, "Thing/obj_2_B.stl": stl},
+        }
+        for name, members in yes.items():
+            with self.subTest(name):
+                self.assertTrue(detect(write_zip(self.d / name, members))[0])
+        no = {
+            "only_docs_stls.zip": {"README.md": "x", "pic.png": b"x"},   # no mesh at all
+            "T_stls.zip.zip": {"a.stl": stl, "run.sh": b"x"},
+            "Thing_stls_v2.zip": {"a.stl": stl},           # suffix is not a dup counter
+            "Thing_stls (x).zip": {"a.stl": stl},
+            "mixed.zip": {"obj_1_A.stl": stl, "b.stl": stl},
+            "T2_stls.zip": {"a.stl": stl, "x.exe": b"x"},
+        }
+        for name, members in no.items():
+            with self.subTest(name):
+                self.assertFalse(detect(write_zip(self.d / name, members))[0])
+
+    def test_base_name_strips_dup_suffix(self):
+        self.assertEqual(base_name(None, "Kitty(Designer)_stls (1)"), "Kitty-Designer")
+        self.assertEqual(base_name(None, "Kitty_steps-3"), "Kitty")
+
     def test_force(self):
         src = write_zip(self.d / "misc.zip", {"a.stl": b"solid"})
         with self.assertRaises(NotMakerWorld):

@@ -23,9 +23,11 @@ MakerWorld detection (conservative; `--force` overrides for `project create`):
   * .3mf: root-model metadata has DesignModelId, DesignProfileId, DesignRegion or Designer.
     Application=BambuStudio alone does not count (that is every Studio project).
   * .zip: contains such a .3mf (not looked for inside nested zips), or looks like MakerWorld's
-    STL/STEP download: every file member is a mesh/CAD file (.stl/.step/.stp/.3mf/.obj) AND
-    either the zip stem ends in _stls/_steps or every member is named obj_<n>_<name>.<ext>.
-    This was inferred from one observed download and may change; it is deliberately narrow so
+    STL/STEP download: at least one mesh/CAD member (.stl/.step/.stp/.3mf/.obj), every other
+    member a harmless companion (readme/licence text, PDF, images, .mtl), AND either the zip
+    stem ends in _stls/_steps (a browser duplicate suffix such as " (1)" or "-2" is allowed
+    after it) or every mesh/CAD member is named obj_<n>_<name>.<ext>.
+    This was inferred from observed downloads and may change; it is deliberately narrow so
     that app bundles and other zips in a Downloads folder are skipped."""
 
 from __future__ import annotations
@@ -58,8 +60,9 @@ STALE_STAGING = 24 * 3600            # staging dirs older than this are leftover
 LICENCE_NOTE = "LICENCE-NOTE.txt"
 KEEP_EXT = {".3mf", ".scad", ".stl", ".step", ".stp", ".obj", ".amf", ".ply", ".f3d", ".iges",
             ".igs", ".dxf", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".txt",
-            ".md", ".json", ".csv"}
+            ".md", ".json", ".csv", ".mtl"}
 MODEL_EXT = {".stl", ".step", ".stp", ".3mf", ".obj"}
+COMPANION_EXT = {".txt", ".md", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mtl"}
 RENDER_EXT = {".3mf", ".scad", ".stl"}
 PARTIAL_EXT = {".crdownload", ".part", ".partial", ".download", ".tmp", ".opdownload"}
 MAX_FILES = 2000                     # members per archive (nested members included)
@@ -67,7 +70,7 @@ MAX_TOTAL = 2 * 1024 ** 3            # uncompressed bytes per archive (nested in
 MAX_RATIO = 200                      # compression ratio refused for members above RATIO_MIN
 RATIO_MIN = 16 * 1024 ** 2
 MAX_NAME = 80                        # characters in a project name
-MW_ZIP_STEM = re.compile(r"_(stls?|steps?)$", re.I)
+MW_ZIP_STEM = re.compile(r"_(stls?|steps?)(\s*\(\d+\)|-\d+)?$", re.I)  # + browser dup suffix
 MW_MEMBER = re.compile(r"obj_\d+_.+\.(stl|step|stp|3mf|obj)$", re.I)
 _SEP = re.compile(r"[\s\-]+")
 
@@ -221,9 +224,10 @@ def _copy_member(z: zipfile.ZipFile, info: zipfile.ZipInfo, target: Path) -> int
 
 
 def zip_looks_mw(stem: str, paths: list[PurePosixPath]) -> bool:
-    if not paths or any(p.suffix.lower() not in MODEL_EXT for p in paths):
+    models = [p for p in paths if p.suffix.lower() in MODEL_EXT]
+    if not models or any(p.suffix.lower() not in MODEL_EXT | COMPANION_EXT for p in paths):
         return False
-    return bool(MW_ZIP_STEM.search(stem)) or all(MW_MEMBER.fullmatch(p.name) for p in paths)
+    return bool(MW_ZIP_STEM.search(stem)) or all(MW_MEMBER.fullmatch(p.name) for p in models)
 
 
 def detect(src: Path) -> tuple[bool, str]:
