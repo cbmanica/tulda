@@ -72,7 +72,8 @@ def cmd_render(args) -> int:
         if not src.is_file():
             raise TuldaError(f"no such file: {src}")
     views = parse_views(args.view, args.views)
-    group = make_group(args.title, srcs, request_command(args, [f.name for f in srcs]))
+    group = make_group(args.title, srcs, request_command(args, [f.name for f in srcs]),
+                       trigger=args.trigger, note=args.note)
     code = 0
     ok_any = False
     seq = 0
@@ -339,6 +340,13 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--project")
     r.add_argument("--keep", action="store_true", help="keep intermediates in build/ beside the renders root")
     r.add_argument("--port", type=int, help="port used in the printed URL")
+    from .items import MAX_NOTE, TRIGGERS
+    r.add_argument("--trigger", choices=TRIGGERS, default="manual",
+                   help="how this render was started, recorded in the sidecar and shown as a badge "
+                        "(default manual; the web Render button passes web, the watcher watch)")
+    r.add_argument("--note", metavar="TEXT",
+                   help=f"short free-text note shown on the request page, e.g. who ran it "
+                        f"(one line, at most {MAX_NOTE} chars)")
     common(r)
     r.set_defaults(fn=cmd_render)
     d = sub.add_parser("doctor", help="check adapters and environment")

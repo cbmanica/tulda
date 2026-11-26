@@ -23,6 +23,18 @@ else the first file's name), optional human title, source list and the command, 
 in each sidecar (`group_id`, `group_title`, `group_sources`, `request_cmd`, `seq`, `view`).
 Sidecars without a `group_id` (older renders) are shown as ungrouped, one group per UTC day (`legacy-YYYYMMDD`).
 
+Each request also records how it was started (`trigger` in the sidecar and catalog), shown as a
+small badge on cards, request pages and the Watcher tab: `manual` (a direct `tulda render`, the
+default), `web` (the Watcher tab's Render button) or `watch` (the watcher with `render = true`).
+`--trigger` sets it explicitly; `--note "rendered by assistant"` adds one line of free text shown
+on the request page. Renders made before triggers were recorded show no badge (unknown); the
+`trigger` chip (or `?trigger=web`, `?trigger=unknown`) filters by it.
+
+Times: everything is stored in UTC (`...Z`). Pages show each time as a `<time>` element whose
+text is UTC ("2026-11-26 15:22 UTC") and a small script rewrites it to the browser's own time
+zone (hover for the exact UTC); with JavaScript off you see UTC. Date pages and the date picker
+group by UTC date. Older watcher logs with local offsets are still read correctly.
+
 Renders live under `$TULDA_RENDERS`, `--renders-root`, or `[defaults] renders_root`
 in config, default `~/.local/share/tulda/renders`, laid out as
 `<project>/<UTC-stamp>-<adapter>[-<view>]-<name>.png` with a `.json` sidecar (adapter,
@@ -420,9 +432,14 @@ supported; `func(ctx) -> Result`.
   refused. Only png, jpg, svg, json, stl files are served.
 - `/_w/` and `/api/watch` read the watcher's `watch.json` and `watch-events.jsonl` from the
   state dir and list the project folders of the watch destinations. File names there come
-  from downloads and are untrusted: every value is HTML-escaped, the page has no script, and
+  from downloads and are untrusted: every value is HTML-escaped, the page's only script is the
+  fixed local-time script, and
   anyone who can reach the server can see the names of files dropped into watched folders and
   of imported projects.
+- Gallery and Watcher pages send `script-src` with sha256 hashes of their two fixed inline
+  scripts (the gallery script and the local-time script) and no `'unsafe-inline'`, so no other
+  inline script can run; page data is a non-executed JSON block. The 3D viewer page keeps its own
+  policy (same-origin modules from `/_s/`).
 - Config files execute commands as you; treat `tulda.toml` like a Makefile.
 
 ## Bambu Studio and licensing

@@ -109,7 +109,9 @@ def cmd_group(args) -> int:
     if a == "show":
         print(f"id       {gid}\ntitle    {g['title']}\nauto     {g['auto_title']}\ncreated  {g['created']}"
               f"\nstarred  {g['starred']}\ntrashed  {g['trashed']}\ntags     {', '.join(g['tags'])}"
-              f"\nnotes    {g['notes'] or ''}\nsources  {', '.join(g['sources'])}\ncommand  {g['cmd'] or ''}")
+              f"\nnotes    {g['notes'] or ''}\nsources  {', '.join(g['sources'])}\ncommand  {g['cmd'] or ''}"
+              f"\ntrigger  {g.get('trigger') or 'unknown'}"
+              + (f" ({g['trigger_note']})" if g.get("trigger_note") else ""))
         for i in g["items"]:
             print(f"  {i['project']}/{i['file']}  ({i['adapter']}/{i['stage']}{'/' + i['view'] if i['view'] else ''})")
     elif a == "rename":

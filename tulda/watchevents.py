@@ -2,13 +2,14 @@
 
 `<state dir>/watch-events.jsonl`, one JSON object per line, mode 600:
 
-    {"time": "2026-01-01T12:00:00+00:00", "dir": "<watched folder name>", "file": "<file name>",
+    {"time": "2026-01-01T12:00:00Z", "dir": "<watched folder name>", "file": "<file name>",
      "outcome": "created" | "exists" | "skipped" | "held" | "error" | "backlog",
      "project": "<project folder name>" | null, "reason": "<text>" | null,
      "script": "<full post-processing script text>", "approve": "<CLI command>"}   (held only)
 
 "held" means a 3mf in the file carries a post-processing script: nothing was imported, and
-`approve` is the `tulda project create ... --allow-post-process` command (home-relative paths)
+`time` is UTC with a `Z` suffix; files written before that hold local-offset times
+(`...-08:00`), which readers parse too (timefmt.parse_ts). `approve` is the `tulda project create ... --allow-post-process` command (home-relative paths)
 for the user to run after reviewing `script`.
 
 Capped: when the file passes MAX_BYTES it is renamed to watch-events.1.jsonl (one older
@@ -25,8 +26,9 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import datetime
 from pathlib import Path
+
+from .timefmt import utc_iso
 
 EVENTS_NAME = "watch-events.jsonl"
 OLD_EVENTS_NAME = "watch-events.1.jsonl"
@@ -65,7 +67,7 @@ class EventLog:
     def append(self, folder: str, file: str, outcome: str, project: str | None = None,
                reason: str | None = None, script: str | None = None,
                approve: str | None = None) -> None:
-        rec = {"time": datetime.now().astimezone().isoformat(timespec="seconds"),
+        rec = {"time": utc_iso(),
                "dir": _clip(folder), "file": _clip(file), "outcome": outcome,
                "project": _clip(project), "reason": _clip(reason)}
         if script is not None:

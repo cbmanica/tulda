@@ -40,10 +40,10 @@ import sys
 import threading
 import time
 from collections import deque
-from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 from .items import RESERVED_DIRS
+from .timefmt import utc_iso
 from .watchevents import redact
 
 # Same values as projects.MANIFEST / projects.RENDER_EXT (a test keeps them equal). Not imported:
@@ -334,7 +334,7 @@ def cli_render(project: dict, f: dict, renders_root: Path, timeout: float = REND
     """`tulda render FILE --project FOLDER --title TITLE --views ...` in a subprocess: the exact
     CLI path. -P keeps the current directory off sys.path; cwd is the renders root."""
     argv = [sys.executable, "-P", "-m", "tulda", "render", f"--project={project['folder']}",
-            f"--title={project['title']}", f"--views={VIEWS[f['ext']]}",
+            f"--title={project['title']}", f"--views={VIEWS[f['ext']]}", "--trigger=web",
             f"--renders-root={renders_root}", "--", str(f["path"])]
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -424,7 +424,7 @@ class RenderQueue:
 
 
 def _now() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+    return utc_iso()
 
 
 def wait_idle(q: RenderQueue, timeout: float = 5.0) -> bool:

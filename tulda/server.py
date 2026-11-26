@@ -20,15 +20,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .catalog import Catalog, CatalogError, Filters, valid_day
-from .gallery import render_index
+from .gallery import GALLERY_JS, render_index
+from .timefmt import LOCAL_HASH, script_hash
 from .viewer import THREE_VERSION, render_viewer
 from .items import (DATE_PREFIX, STATIC_PREFIX, VIEWER_PREFIX, GROUP_ID, GROUP_PREFIX, RESERVED_DIRS, group_fields,  # noqa: F401
-                    WATCH_PREFIX, is_project_dir, read_item)
+                    TRIGGERS, WATCH_PREFIX, is_project_dir, read_item)
 from .watchevents import default_state_dir, display_events, watcher_status
 from .watchpage import RESULT_CODES, render_watch_page
 from . import webrender
 
 WATCH_EVENTS_SHOWN = 300
+GALLERY_HASH = script_hash(GALLERY_JS)
 
 
 ALLOWED_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -54,6 +56,13 @@ STATIC_FILES = {
 
 PAGE_SIZE = 20
 
+# Gallery and watcher pages: inline scripts are allowed only by sha256 hash (no 'unsafe-inline',
+# no same-origin script files): the gallery script and the local-time script. Both are fixed
+# strings; page data travels in a non-executed application/json block.
+PAGE_SCRIPT_SRC = " ".join((GALLERY_HASH, LOCAL_HASH))
+PAGE_CSP = ("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
+            f"script-src {PAGE_SCRIPT_SRC}; connect-src 'self'; form-action 'self'; frame-ancestors 'none'")
+
 
 def _vals(q: dict, key: str, pat=re.compile(r"^[^\x00-\x1f]{1,100}$")) -> list[str]:
     return [v for v in q.get(key, []) if pat.match(v)][:10]
@@ -64,6 +73,7 @@ def parse_filters(q: dict, project: str | None = None, day: str | None = None) -
     qv = (q.get("q") or [None])[0]
     return Filters(project=project, adapters=_vals(q, "adapter"), stages=_vals(q, "stage"),
                    views=_vals(q, "view"), tags=[t.lower() for t in _vals(q, "tag")],
+                   triggers=[t for t in _vals(q, "trigger") if t in (*TRIGGERS, "unknown")],
                    starred=(q.get("starred") or [""])[0] not in ("", "0"),
                    trash=(q.get("trash") or [""])[0] not in ("", "0"),
                    q=qv[:100] if qv else None, day=day)
@@ -76,7 +86,8 @@ def filters_qs(f: Filters) -> str:
     if f.day:
         p.append(("day", f.day))
     p += [("adapter", v) for v in f.adapters] + [("stage", v) for v in f.stages] + \
-         [("view", v) for v in f.views] + [("tag", v) for v in f.tags]
+         [("view", v) for v in f.views] + [("tag", v) for v in f.tags] + \
+         [("trigger", v) for v in f.triggers]
     if f.starred:
         p.append(("starred", "1"))
     if f.trash:
@@ -135,6 +146,11 @@ class Handler(BaseHTTPRequestHandler):
         if getattr(self.server, "verbose", False):
             super().log_message(fmt, *args)
 
+    def log_date_time_string(self):
+        """Request-log timestamps in UTC (the stdlib default is the server's local zone)."""
+        from .timefmt import utc_iso
+        return utc_iso()
+
     # -- helpers
     def _send(self, status: int, body: bytes = b"", ctype="text/plain; charset=utf-8",
               head=False, extra=None, referrer="no-referrer"):
@@ -152,9 +168,7 @@ class Handler(BaseHTTPRequestHandler):
     def _send_page(self, html: str, head: bool, viewer: bool = False, referrer: str = "no-referrer"):
         # The viewer page also loads same-origin ES modules (/_s/) and fetches the GLB.
         csp = ("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
-               "script-src 'self' 'unsafe-inline'; connect-src 'self'" if viewer else
-               "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
-               "script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'")
+               "script-src 'self' 'unsafe-inline'; connect-src 'self'" if viewer else PAGE_CSP)
         return self._send(200, html.encode(), "text/html; charset=utf-8", head, {
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Content-Security-Policy": csp, "X-Frame-Options": "DENY"}, referrer=referrer)
@@ -199,6 +213,7 @@ class Handler(BaseHTTPRequestHandler):
                 "page_size": PAGE_SIZE, "facets": cat.facets(),
                 "dates": cat.dates(f.trash), "rev": rev, "qs": filters_qs(f),
                 "filters": {"adapter": f.adapters, "stage": f.stages, "view": f.views, "tag": f.tags,
+                            "trigger": f.triggers,
                             "starred": f.starred, "trash": f.trash}}
         return self._send_page(render_index(data), head)
 

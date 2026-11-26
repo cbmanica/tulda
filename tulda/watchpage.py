@@ -1,8 +1,9 @@
 """/_w/: watcher page: status (watch.json), imported projects with Render buttons, events.
 
 Every value shown comes from file names in watched folders or from error text, so it is
-attacker-controlled: everything goes through html.escape, nothing is inserted as markup and the
-page has no script. The Render buttons are plain HTML forms (POST /api/render with an opaque
+attacker-controlled: everything goes through html.escape and nothing is inserted as markup. The
+only script is timefmt.LOCAL_JS (allowed by hash), which turns the UTC <time> elements into the
+browser's local time; with JavaScript off they read as UTC. The Render buttons are plain HTML forms (POST /api/render with an opaque
 file id and the per-process token; the server answers 303 back to this page), so they work
 without JavaScript. See webrender.py for what may be rendered."""
 
@@ -11,7 +12,9 @@ from __future__ import annotations
 import urllib.parse
 from html import escape
 
+from .gallery import trigger_badge
 from .tabs import CSS as TAB_CSS, tabs_html
+from .timefmt import LOCAL_SCRIPT, time_html
 
 # ?r=<code> after a POST: a fixed message per code (never text from the request).
 RESULT_CODES = {"queued": "Render queued.", "duplicate": "Already queued or rendering.",
@@ -33,23 +36,24 @@ def _status_html(st: dict | None) -> str:
         return "<p class=m>No watcher state found (the watcher has not run on this machine, or " \
                "it uses another state directory).</p>"
     run = "running" if st["running"] else "not running"
-    rows = [("Process", f"{run}, started {st.get('started') or '-'}"),
-            ("Config", (st.get("mode") or "-")
-             + (f": {st['reason']}" if st.get("reason") else "")),
-            ("Last poll", st.get("last_poll") or "-")]
+    # (label, cell HTML): every piece escaped here; times become <time> elements
+    rows = [("Process", f"{_e(run)}, started {time_html(st.get('started'))}"),
+            ("Config", _e((st.get("mode") or "-") + (f": {st['reason']}" if st.get("reason") else ""))),
+            ("Last poll", time_html(st.get("last_poll")))]
     lc = st.get("last_created")
-    rows.append(("Last import", f"{lc['time']}  {lc['project']} ← {lc['file']}" if lc else "-"))
+    rows.append(("Last import", f"{time_html(lc['time'])}  {_e(lc['project'])} ← {_e(lc['file'])}"
+                 if lc else "-"))
     le = st.get("last_error")
-    rows.append(("Last error", f"{le['time']}  {le['message']}" if le else "-"))
+    rows.append(("Last error", f"{time_html(le['time'])}  {_e(le['message'])}" if le else "-"))
     for d in st.get("dirs") or []:
         t = d["totals"]
         rows.append((f"Folder {d['dir']}",
-                     f"→ {d['destination']}: created {t['created']}, exists {t['exists']}, "
-                     f"skipped {t['skipped']}, held {t.get('held', 0)}, errors {t['errors']}"
-                     + (f"; problem: {d['problem']}" if d.get("problem") else "")))
+                     _e(f"→ {d['destination']}: created {t['created']}, exists {t['exists']}, "
+                        f"skipped {t['skipped']}, held {t.get('held', 0)}, errors {t['errors']}"
+                        + (f"; problem: {d['problem']}" if d.get("problem") else ""))))
     cls = "ok" if st["running"] else "bad"
     return (f'<p class="st {cls}">Watcher {_e(run)}</p><table class=kv>'
-            + "".join(f"<tr><th>{_e(k)}</th><td>{_e(v)}</td></tr>" for k, v in rows) + "</table>")
+            + "".join(f"<tr><th>{_e(k)}</th><td>{v}</td></tr>" for k, v in rows) + "</table>")
 
 
 def _events_html(events: list[dict], anchors: dict | None = None) -> str:
@@ -67,7 +71,7 @@ def _events_html(events: list[dict], anchors: dict | None = None) -> str:
                        "tulda never runs it)</summary>"
                        f"<pre>{_e(ev.get('script'))}</pre></details>"
                        f"<div class=m>Approve after review:</div><pre class=cmd>{_e(ev.get('approve'))}</pre>")
-        out.append(f'<tr class="o-{_e(oc)}"><td class=t>{_e(ev.get("time"))}</td>'
+        out.append(f'<tr class="o-{_e(oc)}"><td class=t>{time_html(ev.get("time"))}</td>'
                    f'<td>{_e(ev.get("dir"))}</td><td class=f>{_e(ev.get("file"))}</td>'
                    f'<td class=oc>{_e(OUTCOME_LABEL.get(oc, oc))}</td><td>{detail}</td></tr>')
     out.append("</tbody></table>")
@@ -86,8 +90,9 @@ def _file_row(f: dict, token: str) -> str:
     cells = [f'<td class=f>{_e(f["file"])}</td>']
     jobline = ""
     if st in ("done", "failed"):
+        when = f" ({time_html(job['finished'])})" if job.get("finished") else ""
         jobline = (f'<div class={"ok" if st == "done" else "bad"}>last web render {_e(JOB_LABEL[st])}'
-                   f'{": " + _e(job.get("message")) if job.get("message") else ""}</div>')
+                   f'{": " + _e(job.get("message")) if job.get("message") else ""}{when}</div>')
     missing = f.get("missing_views") or []
     if st in ("queued", "rendering"):
         state = f'<span class=busy>{_e(JOB_LABEL[st])}</span>'
@@ -106,7 +111,7 @@ def _file_row(f: dict, token: str) -> str:
         for g in f["rendered"][:3]:
             label = g.get("title") or g["id"]
             links.append(f'<div><a class=ok href="/_g/{_e(urllib.parse.quote(g["id"], safe=""))}/">rendered: '
-                         f'{_e(label)}</a> <span class=m>({_e(", ".join(g.get("views") or []) or "no views")}'
+                         f'{_e(label)}</a> {trigger_badge(g.get("trigger"))} <span class=m>({_e(", ".join(g.get("views") or []) or "no views")}'
                          f'{", trashed" if g.get("trashed") else ""})</span></div>')
         if len(f["rendered"]) > 3:
             links.append(f'<div class=m>+{len(f["rendered"]) - 3} more</div>')
@@ -125,13 +130,13 @@ def _projects_html(projects: list[dict] | None, token: str) -> str:
                 "(<code>[[watch.dir]] destination</code>).</p>")
     out = []
     for p in projects:
-        sub = [f"in {p['destination']}"]
+        sub = [_e(f"in {p['destination']}")]
         if p["title"] != p["folder"]:
-            sub.insert(0, f"folder {p['folder']}")
+            sub.insert(0, _e(f"folder {p['folder']}"))
         if p.get("created"):
-            sub.append(f"imported {p['created']}")
+            sub.append(f"imported {time_html(p['created'])}")
         out.append(f'<section class=proj id="{_e(p["anchor"])}"><h3>{_e(p["title"])}</h3>'
-                   f'<div class=m>{_e(" | ".join(sub))}</div>')
+                   f'<div class=m>{" | ".join(sub)}</div>')
         if not p["files"]:
             out.append("<p class=m>No .3mf/.stl/.scad files to render.</p></section>")
             continue
@@ -171,6 +176,8 @@ pre{{white-space:pre-wrap;word-break:break-all;margin:4px 0;padding:6px 8px;bord
 .rb{{padding:6px 14px;min-height:36px;border:1px solid var(--acc);border-radius:16px;background:var(--acc);color:#fff;font:inherit;font-size:14px;cursor:pointer}}
 .rb:focus-visible{{outline:2px solid var(--acc);outline-offset:2px}}
 .note{{padding:8px 12px;border:1px solid var(--acc);border-radius:8px;margin:0 0 12px}}
+.trg{{font-size:11px;padding:0 7px;border-radius:9px;border:1px dashed var(--mut);color:var(--mut);white-space:nowrap}}
+.trg-web{{border-style:solid;border-color:#3b82f6;color:#3b82f6}}.trg-watch{{border-style:solid;border-color:#a855f7;color:#a855f7}}
 </style></head><body>
 {tabs_html("watcher")}
 <main>{note}
@@ -180,6 +187,7 @@ pre{{white-space:pre-wrap;word-break:break-all;margin:4px 0;padding:6px 8px;bord
 <h2>Activity (newest first)</h2>
 <div class=wrap>{_events_html(events, anchors)}</div>
 <p class=m>Refreshes every {5 if busy else 30} s. Render buttons render one model file of an imported project
-(the only thing this server changes); everything else is read-only. JSON: <a href="/api/watch">/api/watch</a></p>
-</main></body></html>
+(the only thing this server changes); everything else is read-only. Times are shown in your browser's
+time zone (UTC without JavaScript). JSON: <a href="/api/watch">/api/watch</a></p>
+</main>{LOCAL_SCRIPT}</body></html>
 """

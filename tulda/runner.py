@@ -160,15 +160,21 @@ def slugify(text: str, default: str = "render") -> str:
 
 
 def make_group(title: str | None, sources: list[Path], command: str,
-               now: datetime | None = None) -> dict:
+               now: datetime | None = None, trigger: str = "manual",
+               note: str | None = None) -> dict:
     """A render request: id = UTC stamp + short slug (from the title, else the first
-    source's stem). Shared by every PNG the request produces."""
+    source's stem). Shared by every PNG the request produces. trigger: how it was started
+    (items.TRIGGERS); note: optional short free text (`--note`)."""
+    from .items import TRIGGERS, clean_note
+    if trigger not in TRIGGERS:
+        raise ConfigError(f"bad trigger {trigger!r}: use one of {', '.join(TRIGGERS)}")
     now = now or datetime.now(timezone.utc)
     names = [p.name for p in sources]
     slug = slugify(title or (sources[0].stem if sources else ""))
     return {"id": f"{now.strftime('%Y%m%dT%H%M%SZ')}-{slug}", "title": title or None,
             "sources": names, "command": command,
-            "created_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            "created_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "trigger": trigger, "trigger_note": clean_note(note)}
 
 
 def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path,
@@ -200,7 +206,8 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
             _atomic_write(proj_dir / f"{base}.fail.json", json.dumps(
                 {"schema": 1, "error": str(e), "code": e.code, "source": str(src),
                  "steps": steps, "created_utc": _now(),
-                 **({"group_id": group["id"], "view": view} if group else {})}, indent=2).encode())
+                 **({"group_id": group["id"], "view": view, "trigger": group.get("trigger")}
+                    if group else {})}, indent=2).encode())
             raise
         opts = option_values(reg, term, cli_opts)
         sidecar = {
@@ -227,6 +234,10 @@ def run_chain(reg: Registry, chain: list[Adapter], src: Path, renders_root: Path
             sidecar.update(group_id=group["id"], group_title=group.get("title"),
                            group_sources=group.get("sources"), request_cmd=group.get("command"),
                            group_created_utc=group.get("created_utc"), seq=seq)
+            if group.get("trigger"):
+                sidecar["trigger"] = group["trigger"]
+            if group.get("trigger_note"):
+                sidecar["trigger_note"] = group["trigger_note"]
         png = proj_dir / f"{base}{ext}"
         if term.kind == "turntable":
             frames = scratch / f"step{len(chain) - 1}-work" / "frames"

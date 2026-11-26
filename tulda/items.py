@@ -29,6 +29,24 @@ PROVENANCE_CAVEAT = ("Metadata is self-reported by the file and may be missing o
                      "the model's MakerWorld page is authoritative.")
 PROVENANCE_CAVEAT_SHORT = "self-reported; the MakerWorld page is authoritative"
 UNKNOWN_LICENCE = "unknown (not recorded in file)"
+# How a render request was started (sidecar `trigger`): a direct CLI run, the Watcher tab's
+# Render button, or the watcher's render=true. Renders made before this was recorded have none
+# (shown as unknown, never guessed). `trigger_note` is optional free text from `--note`.
+TRIGGERS = ("manual", "web", "watch")
+MAX_NOTE = 200
+_CTRL = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def clean_trigger(v) -> str | None:
+    return v if v in TRIGGERS else None
+
+
+def clean_note(v) -> str | None:
+    """A trigger note as one short plain-text line (control characters become spaces)."""
+    if not isinstance(v, str):
+        return None
+    v = " ".join(_CTRL.sub(" ", v).split())[:MAX_NOTE]
+    return v or None
 
 
 def _strs(v, limit=50) -> list[str]:
@@ -77,11 +95,13 @@ def group_fields(meta: dict, mtime: float) -> dict:
                 "group_sources": _strs(meta.get("group_sources")),
                 "request_cmd": _text(meta.get("request_cmd"), 1000),
                 "group_created_utc": _text(meta.get("group_created_utc"), 40),
-                "seq": meta["seq"] if isinstance(meta.get("seq"), int) else 0, "legacy": False}
+                "seq": meta["seq"] if isinstance(meta.get("seq"), int) else 0, "legacy": False,
+                "trigger": clean_trigger(meta.get("trigger")),
+                "trigger_note": clean_note(meta.get("trigger_note"))}
     day = utc_day(mtime)
     return {"group_id": f"legacy-{day.replace('-', '')}", "group_title": f"Earlier renders, {day}",
             "group_sources": [], "request_cmd": None, "group_created_utc": None,
-            "seq": 0, "legacy": True}
+            "seq": 0, "legacy": True, "trigger": None, "trigger_note": None}
 
 
 def render_url(project: str, file: str) -> str:

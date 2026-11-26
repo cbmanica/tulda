@@ -33,11 +33,11 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 
 from . import watchconfig as wc
 from .projects import Baseline, Watcher, git_publish_warning
+from .timefmt import ts_key, utc_from_ts, utc_iso
 from .watchevents import EventLog
 
 COUNT_KEYS = ("created", "exists", "skipped", "held", "errors", "waiting")
@@ -45,7 +45,7 @@ RETRY = 60.0               # seconds between re-tries of the real config while n
 
 
 def now_iso() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+    return utc_iso()
 
 
 def overrides_from_args(args) -> dict:
@@ -247,8 +247,7 @@ class WatchDaemon:
         self.sig_seen = self.signature()
         try:
             st = self.last_good.stat()
-            self.state["last_good"] = {"path": str(self.last_good), "saved": datetime.fromtimestamp(
-                st.st_mtime).astimezone().isoformat(timespec="seconds")}
+            self.state["last_good"] = {"path": str(self.last_good), "saved": utc_from_ts(st.st_mtime)}
         except OSError:
             pass
         self.load()
@@ -374,7 +373,7 @@ class WatchDaemon:
         for w, _, _ in self.loop.entries.values():
             if w.last_created and w.last_created != self.state["last_created"] and (
                     not self.state["last_created"]
-                    or w.last_created["time"] >= self.state["last_created"]["time"]):
+                    or ts_key(w.last_created["time"]) >= ts_key(self.state["last_created"]["time"])):
                 self.state["last_created"] = dict(w.last_created, dir=str(w.src_dir))
             err = w.list_error or w.last_error
             if err and err != (self.state["last_error"] or {}).get("message"):
@@ -448,7 +447,7 @@ class Stopper:
 
 
 def timestamped(m: str) -> None:
-    print(f"{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')} {m}", flush=True)
+    print(f"{utc_iso()} {m}", flush=True)
 
 
 def check_config(path: Path, overrides: dict | None = None) -> int:

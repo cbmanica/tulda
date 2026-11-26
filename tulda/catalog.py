@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .errors import TuldaError
-from .items import (GROUP_ID, RENDER_EXTS, clean_provenance, is_project_dir, provenance_lines,
+from .items import (GROUP_ID, RENDER_EXTS, TRIGGERS, clean_provenance, is_project_dir, provenance_lines,
                     read_item, render_url, viewer_url)
 
 TAG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -144,7 +144,15 @@ def _m5(c: sqlite3.Connection) -> None:
     c.execute("ALTER TABLE renders ADD COLUMN provenance TEXT")
 
 
-MIGRATIONS = [_m1, _m2, _m3, _m4, _m5]
+def _m6(c: sqlite3.Connection) -> None:
+    """Trigger: how a request was started (manual / web / watch, from the sidecars' `trigger`)
+    and its optional `--note`. NULL for renders made before it was recorded (shown as unknown).
+    Backfilled from the sidecars by the forced re-sync after upgrade."""
+    c.execute("ALTER TABLE groups ADD COLUMN trigger TEXT")
+    c.execute("ALTER TABLE groups ADD COLUMN trigger_note TEXT")
+
+
+MIGRATIONS = [_m1, _m2, _m3, _m4, _m5, _m6]
 SCHEMA_VERSION = len(MIGRATIONS)
 
 
@@ -164,6 +172,7 @@ class Filters:
     stages: list[str] = field(default_factory=list)
     views: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+    triggers: list[str] = field(default_factory=list)   # manual/web/watch, or unknown (= none recorded)
     starred: bool = False
     trash: bool = False            # include trashed groups
     trashed_only: bool = False
@@ -405,12 +414,13 @@ class Catalog:
                                                      if it["legacy"] else None)
                 if not day or not valid_day(day):
                     day = datetime.fromtimestamp(it["mtime"], timezone.utc).strftime("%Y-%m-%d")
-                c.execute("""INSERT INTO groups(id,title,sources,request_cmd,legacy,created_utc,day)
-                    VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,
-                    sources=excluded.sources, request_cmd=excluded.request_cmd, legacy=excluded.legacy,
-                    created_utc=COALESCE(excluded.created_utc, groups.created_utc), day=excluded.day""",
+                c.execute("""INSERT INTO groups(id,title,sources,request_cmd,legacy,created_utc,day,
+                    trigger,trigger_note) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                    title=excluded.title, sources=excluded.sources, request_cmd=excluded.request_cmd,
+                    legacy=excluded.legacy, created_utc=COALESCE(excluded.created_utc, groups.created_utc),
+                    day=excluded.day, trigger=excluded.trigger, trigger_note=excluded.trigger_note""",
                           (gid, it["group_title"], json.dumps(it["group_sources"]), it["request_cmd"],
-                           int(it["legacy"]), created, day))
+                           int(it["legacy"]), created, day, it.get("trigger"), it.get("trigger_note")))
             affected |= set(groups)
             for path in gone:
                 r = c.execute("SELECT group_id FROM renders WHERE path=?", (path,)).fetchone()
@@ -571,6 +581,13 @@ class Catalog:
         for t in f.tags:
             w.append(f"{alias}.id IN (SELECT group_id FROM tags WHERE tag=?)")
             a.append(t)
+        if f.triggers:
+            known = [t for t in f.triggers if t in TRIGGERS]
+            alts = [f"{alias}.trigger IN ({','.join('?' * len(known))})"] if known else []
+            a += known
+            if "unknown" in f.triggers:
+                alts.append(f"{alias}.trigger IS NULL")
+            w.append("(" + " OR ".join(alts) + ")" if alts else "0")
         if f.q is not None:
             toks = search_tokens(f.q)
             if not toks:
@@ -638,7 +655,7 @@ class Catalog:
                 chunk = shas[i:i + 400]
                 rows = c.execute(
                     "SELECT r.source_sha256 AS sha, r.group_id, r.project, r.view, g.title, "
-                    "g.user_title, g.trashed_utc, g.last_mtime FROM renders r "
+                    "g.user_title, g.trashed_utc, g.last_mtime, g.trigger FROM renders r "
                     "JOIN groups g ON g.id = r.group_id WHERE r.missing=0 AND r.source_sha256 IN "
                     f"({','.join('?' * len(chunk))}) ORDER BY g.last_mtime DESC, g.id DESC", chunk).fetchall()
                 for r in rows:
@@ -646,7 +663,8 @@ class Catalog:
                     g = next((x for x in lst if x["id"] == r["group_id"]), None)
                     if g is None:
                         g = {"id": r["group_id"], "title": r["user_title"] or r["title"],
-                             "project": r["project"], "views": [], "trashed": bool(r["trashed_utc"])}
+                             "project": r["project"], "views": [], "trashed": bool(r["trashed_utc"]),
+                             "trigger": r["trigger"]}
                         lst.append(g)
                     if r["view"] and r["view"] not in g["views"]:
                         g["views"].append(r["view"])
@@ -695,7 +713,8 @@ class Catalog:
                         "legacy": bool(r["legacy"]), "created": r["created_utc"], "day": r["day"],
                         "mtime": r["last_mtime"], "n_renders": r["n_renders"], "starred": bool(r["starred"]),
                         "trashed": r["trashed_utc"], "notes": r["notes"], "tags": tags[r["id"]],
-                        "auto_tags": autos[r["id"]],
+                        "auto_tags": autos[r["id"]], "trigger": r["trigger"],
+                        "trigger_note": r["trigger_note"],
                         "items": items[r["id"]]})
         return out
 
@@ -768,6 +787,9 @@ class Catalog:
                 out["tags"] = [[r[0], r[1]] for r in c.execute(
                     "SELECT tag, count(*) FROM tags WHERE group_id IN (SELECT id FROM groups WHERE n_renders>0) "
                     "GROUP BY tag ORDER BY tag")]
+                out["triggers"] = [[r[0] or "unknown", r[1]] for r in c.execute(
+                    "SELECT trigger, count(*) FROM groups WHERE n_renders>0 AND trashed_utc IS NULL "
+                    "GROUP BY trigger ORDER BY trigger IS NULL, trigger")]
                 out["trashed"] = c.execute(
                     "SELECT count(*) FROM groups WHERE n_renders>0 AND trashed_utc IS NOT NULL").fetchone()[0]
             self._cache_put(key, out)

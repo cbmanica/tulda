@@ -55,6 +55,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from .errors import TuldaError
+from .timefmt import utc_iso
 
 MANIFEST = "tulda-project.json"
 LOCK_NAME = ".tulda-project.lock"
@@ -692,7 +693,9 @@ def git_publish_warning(dest: Path) -> str | None:
 
 # ---- render (optional) ----------------------------------------------------------------------
 
-def render_project(proj: Path, log=print) -> int:
+def render_project(proj: Path, log=print, trigger: str = "manual") -> int:
+    """Render a project's model files through the CLI. trigger: "watch" from the watcher,
+    "manual" from `tulda project create/new --render`."""
     files = [proj / f for f in json.loads((proj / MANIFEST).read_text("utf-8"))["files"]
              if Path(f).suffix.lower() in RENDER_EXT]
     if not files:
@@ -701,7 +704,8 @@ def render_project(proj: Path, log=print) -> int:
     from .cli import main as cli_main
     log(f"render {proj.name}: {len(files)} file(s); note: renders are shown by `tulda serve` to "
         f"anyone who can reach it; keep third-party models off shared servers")
-    return cli_main(["render", *map(str, files), "--project", proj.name, "--title", proj.name])
+    return cli_main(["render", *map(str, files), "--project", proj.name, "--title", proj.name,
+                     "--trigger", trigger])
 
 
 # ---- watch ---------------------------------------------------------------------------------
@@ -779,7 +783,7 @@ class Baseline:
         if loaded is not None:
             self.files, self.recorded = loaded
             return None
-        self.recorded = datetime.now().astimezone().isoformat(timespec="seconds")
+        self.recorded = utc_iso()
         self.files = {}
         if not self.adopt:
             for p in entries:
@@ -937,10 +941,10 @@ class Watcher:
             self._event(p.name, state, proj.name, None)
             if state == "created":
                 self.last_created = {"project": proj.name, "source": p.name,
-                                     "time": datetime.now().astimezone().isoformat(timespec="seconds")}
+                                     "time": utc_iso()}
             if state == "created" and self.render and not should_stop():
                 try:
-                    render_project(proj, self.log)
+                    render_project(proj, self.log, trigger="watch")
                 except Exception as e:
                     self.log(f"error rendering {proj.name}: {e}")
         if not should_stop():
