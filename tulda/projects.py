@@ -441,8 +441,7 @@ def scad_template(stem: str, title: str) -> str:
 //
 // Axes: X = width, Y = depth, Z = height. Bed face at z = 0.
 // Print orientation: TODO (which face goes on the bed, and why; supports or none).
-// Material / profile: TODO (e.g. PETG; name the overlay, e.g. overlays/<material>.toml, if a print
-// target uses one).
+// Material / profile: TODO (material, slicer profile or settings this part assumes).
 //
 // part: "main" | add selectors here (e.g. "body", "lid") and thin wrapper files that only set `part`
 //       after including this file.
@@ -488,15 +487,6 @@ TODO: which face goes on the bed, supports, material and layer height.
 ## Notes
 
 -
-
-## Print target (optional)
-
-If the model is built with a print manifest, a target could look like:
-
-    [targets.{stem}]
-    scad = ["{stem}.scad"]
-    overlays = []             # e.g. overlays/<material>.toml
-    output = "build/{stem}.3mf"
 """
 
 

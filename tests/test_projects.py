@@ -376,7 +376,7 @@ class NewProject(unittest.TestCase):
         for want in ('part = "main";', "module main()", 'if (part == "main") main();', "// ---- parameters"):
             self.assertIn(want, scad)
         self.assertEqual(scad.count("{"), scad.count("}"))
-        self.assertIn("[targets.cable_clip_v2]", (proj / "README.md").read_text())
+        self.assertIn("`cable_clip_v2.scad`", (proj / "README.md").read_text())
         self.assertFalse(list(self.dest.glob(projects.STAGING_PREFIX + "*")))
         self.assertIsNone(projects.find_existing(self.dest, "0" * 64))   # no source: never matches
 

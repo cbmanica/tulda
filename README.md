@@ -118,10 +118,10 @@ creates `<destination>/Cable-Clip/` (same name sanitising and `-2`, `-3` collisi
 `project create`) with:
 
 - `cable_clip.scad`: a valid OpenSCAD starter (header comment for axes, print orientation and
-  material/overlay, `$fn`, a `part` selector, a `// ---- parameters` block, `module main()`
+  material/profile, `$fn`, a `part` selector, a `// ---- parameters` block, `module main()`
   with a placeholder cube, and the render call), so it renders as soon as it is created;
-- `README.md`: title, licence and print-orientation TODOs, a file table, "Parameters and why",
-  notes, and an optional print-manifest target stub;
+- `README.md`: title, licence and print-orientation TODOs, a file table, "Parameters and why"
+  and notes;
 - `tulda-project.json`: `origin = "own"`, empty `licence` and `designer` to fill in, no
   MakerWorld provenance.
 
